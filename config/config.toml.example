@@ -1,0 +1,18 @@
+[system]
+log_level = "info"
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[reminders]]
+name = "daily-standup"
+time = "09:30"
+days = ["mon", "tue", "wed", "thu", "fri"]
+message = "Time for the daily standup."
+webhook = "team"
+
+[[reminders]]
+name = "weekly-review"
+time = "17:00"
+days = ["fri"]
+message = "Don't forget the weekly review."
+webhook = "team"

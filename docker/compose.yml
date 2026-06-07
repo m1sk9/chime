@@ -1,0 +1,29 @@
+services:
+  chime:
+    image: ghcr.io/m1sk9/chime:latest
+    # For a local build, remove `image:` above and uncomment the block below.
+    # build:
+    #   context: ..
+    #   dockerfile: docker/Dockerfile
+    container_name: chime
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ../config/config.toml:/etc/chime/config.toml:ro
+    # Pick one of the two secret-injection strategies below:
+    # (A) Pass CHIME_WEBHOOK_<NAME> directly via a .env file.
+    env_file:
+      - ../config/.env
+    # (B) Use Docker secrets and pass the file path through <KEY>_FILE.
+    # secrets:
+    #   - chime_webhook_team
+    # environment:
+    #   CHIME_WEBHOOK_TEAM_FILE: /run/secrets/chime_webhook_team
+
+# secrets:
+#   chime_webhook_team:
+#     file: ../secrets/webhook_team

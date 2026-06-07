@@ -1,0 +1,29 @@
+[package]
+name = "chime"
+version = "0.0.0"
+edition = "2024"
+description = "IaC-Managed Discord Reminder"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/m1sk9/chime/"
+
+[dependencies]
+anyhow = "1.0.102"
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+chrono-tz = { version = "0.10.4", features = ["serde"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt", "time", "signal"] }
+toml = "1.1.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+url = "2.5.8"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt", "time", "signal", "test-util"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
