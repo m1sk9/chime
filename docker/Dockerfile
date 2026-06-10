@@ -3,6 +3,11 @@
 FROM rust:1-slim AS builder
 WORKDIR /build
 
+# aws-lc-sys (reqwest rustls backend) needs cmake + make to build its C sources.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake make \
+    && rm -rf /var/lib/apt/lists/*
+
 # Cache dependencies first.
 COPY Cargo.toml Cargo.lock* ./
 RUN mkdir src \
