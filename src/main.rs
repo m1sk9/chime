@@ -7,7 +7,6 @@ mod scheduler;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
@@ -21,25 +20,39 @@ use crate::scheduler::Scheduler;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/chime/config.toml";
 
-#[derive(Parser)]
-#[command(name = "chime", version)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Subcommand)]
 enum Command {
+    /// Run the scheduler daemon (no arguments).
+    Daemon,
     /// Exit 0 if the scheduler is ticking (heartbeat fresh), non-zero otherwise.
     Health,
 }
 
+fn parse_command() -> Result<Command, String> {
+    let mut args = std::env::args().skip(1); // skip argv[0]
+    match args.next().as_deref() {
+        None => Ok(Command::Daemon),
+        Some("health") => {
+            if args.next().is_some() {
+                return Err("`health` takes no arguments".to_string());
+            }
+            Ok(Command::Health)
+        }
+        Some(other) => Err(format!("unknown argument: {other}")),
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let cli = Cli::parse();
-    let result = match cli.command {
-        None => run_daemon().await,
-        Some(Command::Health) => run_health(),
+    let command = match parse_command() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            std::process::exit(2);
+        }
+    };
+    let result = match command {
+        Command::Daemon => run_daemon().await,
+        Command::Health => run_health(),
     };
     if let Err(e) = result {
         eprintln!("fatal: {e:#}");
