@@ -1,4 +1,4 @@
-# main.rs is the binary entrypoint: clap argument dispatch and process wiring,
+# main.rs is the binary entrypoint: argument dispatch and process wiring,
 # exercised via E2E rather than unit tests (the testable logic lives in the
 # library modules). Exclude it so coverage reflects the unit-testable code.
 ignore:
