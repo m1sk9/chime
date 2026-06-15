@@ -8,6 +8,7 @@ IaC-managed Discord webhook reminder. Reads a TOML schedule, runs as a long-live
 - Strict, fail-fast config validation (unknown fields, bad timezones, missing secrets — all rejected at startup).
 - Webhook URLs are kept out of `config.toml` and injected via environment variables (or `*_FILE` paths for Docker secrets).
 - Ships as a distroless container image to `ghcr.io/m1sk9/chime`.
+- Built-in liveness check (`chime health`) usable from a distroless `HEALTHCHECK` — no shell or extra client needed.
 
 ## Setup
 
@@ -154,6 +155,28 @@ chime is a long-running process, not a one-shot cron job. The main loop:
 > - The process is single-threaded (`tokio` current-thread runtime). It is cheap to leave running.
 > - A missed minute is a missed notification — there is no catch-up. If the host is asleep at 09:30 the 09:30 reminder will not fire when it wakes. This matches a cron-style mental model.
 > - Logs are line-delimited JSON on stdout. Capture them with whatever your supervisor exposes (`journalctl -u chime`, container log drivers, etc.).
+
+## Health check
+
+`docker ps` only tells you the process hasn't crashed — a hung scheduler loop looks identical to a healthy one. chime exposes a liveness signal that answers **"is the scheduler actually ticking?"**, not "did the last Discord send succeed?".
+
+How it works:
+
+- On every tick the daemon writes the current timestamp to a heartbeat file (default `/tmp/chime.heartbeat`, override with `CHIME_HEARTBEAT_PATH`). The write happens **before** any Discord request, so the signal is independent of network reachability.
+- The `chime health` subcommand reads that file's mtime and exits `0` when it is fresh — `now - mtime <= 2 * tick_interval_sec` — and non-zero with a one-line stderr message otherwise (stale, missing, or unreadable). It reads the tick interval from the same `CHIME_CONFIG`, and does **not** require any webhook env var.
+
+The container image already wires this into a `HEALTHCHECK` (exec-form, since distroless has no shell), so `docker ps` / `docker inspect` report health automatically. To set it explicitly in `docker-compose.yml`:
+
+```yaml
+healthcheck:
+  test: ["CMD", "/usr/local/bin/chime", "health"]
+  interval: 30s
+  timeout: 5s
+  start_period: 10s
+  retries: 3
+```
+
+Without Docker you can call `chime health` from any supervisor or monitoring probe — its exit code is the contract.
 
 ## LICENSE
 

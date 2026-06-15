@@ -1,36 +1,77 @@
 mod config;
+mod heartbeat;
 mod notifier;
 mod runtime;
 mod scheduler;
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 
 use crate::config::{Config, LogLevel};
+use crate::heartbeat::{check_liveness, heartbeat_path};
 use crate::notifier::Discord;
 use crate::runtime::resolve;
 use crate::scheduler::Scheduler;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/chime/config.toml";
 
+#[derive(Parser)]
+#[command(name = "chime", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Exit 0 if the scheduler is ticking (heartbeat fresh), non-zero otherwise.
+    Health,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    if let Err(e) = run().await {
+    let cli = Cli::parse();
+    let result = match cli.command {
+        None => run_daemon().await,
+        Some(Command::Health) => run_health(),
+    };
+    if let Err(e) = result {
         eprintln!("fatal: {e:#}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<()> {
+fn load_config() -> Result<Config> {
     let path = std::env::var("CHIME_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read config file at {path}"))?;
-    let cfg = Config::from_toml(&text).context("failed to parse config")?;
+    Config::from_toml(&text).context("failed to parse config")
+}
+
+/// Liveness check used by `HEALTHCHECK` / `healthcheck:`. Reads the heartbeat
+/// file's mtime and compares it against `2 * tick_interval`. This answers "is the
+/// scheduler ticking?", not "did the last Discord send succeed?".
+fn run_health() -> Result<()> {
+    let cfg = load_config()?;
+    let interval = cfg.system.tick_interval_sec.as_duration();
+    let path = heartbeat_path();
+    match check_liveness(&path, interval, SystemTime::now()) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn run_daemon() -> Result<()> {
+    let cfg = load_config()?;
     let run_cfg = resolve(cfg).context("failed to resolve runtime config")?;
 
     init_logging(run_cfg.log_level);

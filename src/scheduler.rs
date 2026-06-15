@@ -4,7 +4,7 @@ use chrono::{DateTime, Timelike, Utc};
 use chrono_tz::Tz;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::{MissedTickBehavior, interval};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use url::Url;
 
 use crate::notifier::Notifier;
@@ -51,6 +51,7 @@ impl<N: Notifier> Scheduler<N> {
     }
 
     async fn tick(&mut self, now: DateTime<Tz>) {
+        self.write_heartbeat();
         let current_minute = truncate_to_minute(&now);
         let mut to_fire: Vec<(String, Url, String)> = Vec::new();
         for r in &self.cfg.reminders {
@@ -72,6 +73,21 @@ impl<N: Notifier> Scheduler<N> {
                 Ok(()) => info!(reminder = %name, "reminder fired"),
                 Err(e) => error!(reminder = %name, error = %e, "failed to send reminder"),
             }
+        }
+    }
+
+    /// Write the liveness heartbeat. Called at the start of every tick, before any
+    /// network send, so the signal is independent of Discord reachability. A write
+    /// failure is logged and ignored: a persistent failure ages the mtime and the
+    /// `health` subcommand fails on its own, which is the detection path we want.
+    fn write_heartbeat(&self) {
+        let body = Utc::now().to_rfc3339();
+        if let Err(e) = std::fs::write(&self.cfg.heartbeat_path, body) {
+            warn!(
+                path = %self.cfg.heartbeat_path.display(),
+                error = %e,
+                "failed to write heartbeat"
+            );
         }
     }
 }
@@ -124,6 +140,16 @@ mod tests {
             .unwrap()
     }
 
+    fn hb_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "chime-test-sched-hb-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        p
+    }
+
     #[tokio::test]
     async fn fires_once_within_same_minute() {
         let count = Arc::new(AtomicUsize::new(0));
@@ -135,6 +161,7 @@ mod tests {
             interval: Duration::from_secs(30),
             timezone: Tokyo,
             reminders: vec![mk_run_reminder("daily", 9, 30)],
+            heartbeat_path: hb_path("fires_once"),
         };
         let mut scheduler = Scheduler::new(cfg, notifier);
 
@@ -156,6 +183,7 @@ mod tests {
             interval: Duration::from_secs(30),
             timezone: Tokyo,
             reminders: vec![mk_run_reminder("hourly", 9, 30)],
+            heartbeat_path: hb_path("fires_again"),
         };
         let mut scheduler = Scheduler::new(cfg, notifier);
 
@@ -176,11 +204,35 @@ mod tests {
             interval: Duration::from_secs(30),
             timezone: Tokyo,
             reminders: vec![mk_run_reminder("daily", 9, 30)],
+            heartbeat_path: hb_path("does_not_fire"),
         };
         let mut scheduler = Scheduler::new(cfg, notifier);
 
         scheduler.tick(at(9, 29, 30)).await;
         scheduler.tick(at(9, 31, 0)).await;
         assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn tick_writes_heartbeat() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let notifier = CountingNotifier { count };
+        let path = hb_path("writes");
+        let _ = std::fs::remove_file(&path);
+        let cfg = RunConfig {
+            log_level: LogLevel::Info,
+            interval: Duration::from_secs(30),
+            timezone: Tokyo,
+            // Off-schedule time: no reminder fires, but the heartbeat must still be written.
+            reminders: vec![mk_run_reminder("daily", 9, 30)],
+            heartbeat_path: path.clone(),
+        };
+        let mut scheduler = Scheduler::new(cfg, notifier);
+
+        scheduler.tick(at(0, 0, 0)).await;
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(!contents.is_empty());
+        let _ = std::fs::remove_file(&path);
     }
 }

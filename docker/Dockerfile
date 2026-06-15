@@ -21,4 +21,7 @@ RUN touch src/main.rs && cargo build --release
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /build/target/release/chime /usr/local/bin/chime
 USER nonroot:nonroot
+# distroless has no shell, so the healthcheck must use exec-form.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/chime", "health"]
 ENTRYPOINT ["/usr/local/bin/chime"]

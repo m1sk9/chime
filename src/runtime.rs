@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Timelike};
@@ -5,6 +6,7 @@ use chrono_tz::Tz;
 use url::Url;
 
 use crate::config::{Config, LogLevel, Message, TimeOfDay, WebhookRef, WeekdaySet};
+use crate::heartbeat::heartbeat_path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WebhookError {
@@ -53,6 +55,7 @@ pub struct RunConfig {
     pub interval: Duration,
     pub timezone: Tz,
     pub reminders: Vec<RunReminder>,
+    pub heartbeat_path: PathBuf,
 }
 
 pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
@@ -76,6 +79,7 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
         interval: cfg.system.tick_interval_sec.as_duration(),
         timezone: cfg.system.timezone,
         reminders,
+        heartbeat_path: heartbeat_path(),
     })
 }
 
