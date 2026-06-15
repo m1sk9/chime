@@ -119,6 +119,20 @@ mod tests {
     }
 
     #[test]
+    fn future_mtime_errors() {
+        // `now` earlier than the mtime: clock skew, treated as not-alive.
+        let path = temp_path("future");
+        std::fs::write(&path, "x").unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let now = mtime - Duration::from_secs(10);
+        assert!(matches!(
+            check_liveness(&path, Duration::from_secs(30), now),
+            Err(HealthError::FutureMtime)
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn heartbeat_path_default_and_override() {
         // One test so the shared env key is never raced by parallel cases.
         {
