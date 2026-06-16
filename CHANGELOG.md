@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/m1sk9/chime/compare/chime-v0.2.0...chime-v0.2.1) (2026-06-16)
+
+
+### Bug Fixes
+
+* **docker:** link statically against musl to drop glibc dependency ([#16](https://github.com/m1sk9/chime/issues/16)) ([875bb53](https://github.com/m1sk9/chime/commit/875bb536484dbc543422e5de3352f099663220a6)), closes [#15](https://github.com/m1sk9/chime/issues/15)
+
 ## [0.2.0](https://github.com/m1sk9/chime/compare/chime-v0.1.0...chime-v0.2.0) (2026-06-16)
 
 
