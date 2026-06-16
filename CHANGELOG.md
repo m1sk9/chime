@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.2.0](https://github.com/m1sk9/chime/compare/chime-v0.1.0...chime-v0.2.0) (2026-06-16)
+
+
+### Features
+
+* add liveness heartbeat and health subcommand ([#13](https://github.com/m1sk9/chime/issues/13)) ([cb635ff](https://github.com/m1sk9/chime/commit/cb635ff5cc3c47709859ccb4b2d9792f242f32a1))
+
+
+### Bug Fixes
+
+* **deps:** migrate reqwest to 0.13 (rustls/aws-lc-rs) ([#12](https://github.com/m1sk9/chime/issues/12)) ([18d2fbd](https://github.com/m1sk9/chime/commit/18d2fbd5451b0b23119fd66428012cdc0d447e5e))
+
+
+### Miscellaneous
+
+* **deps:** update codecov/codecov-action digest to 0fb7174 ([#11](https://github.com/m1sk9/chime/issues/11)) ([4f7c414](https://github.com/m1sk9/chime/commit/4f7c414af293c8c280f23dc9417cac4ad9b4a0d4))
+* **deps:** update docker/dockerfile docker tag to v1.24 ([#7](https://github.com/m1sk9/chime/issues/7)) ([b21c4df](https://github.com/m1sk9/chime/commit/b21c4df726f7ba5742021c738aeb4340a3e84ce3))
+* **deps:** update taiki-e/install-action digest to 15449e3 ([#6](https://github.com/m1sk9/chime/issues/6)) ([9f555d1](https://github.com/m1sk9/chime/commit/9f555d1ffa8ec4e3bf5eebe84762cecdfb8d70d2))
+* remove clap in favor of hand-rolled arg parsing ([#14](https://github.com/m1sk9/chime/issues/14)) ([2b34d34](https://github.com/m1sk9/chime/commit/2b34d34bc224d73a6544df1fea44c47838b1320c))
+
 ## 0.1.0 (2026-06-07)
 
 
