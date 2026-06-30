@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.2](https://github.com/m1sk9/chime/compare/chime-v0.2.1...chime-v0.2.2) (2026-06-25)
+
+
+### Miscellaneous
+
+* **deps:** update docker/dockerfile docker tag to v1.25 ([#21](https://github.com/m1sk9/chime/issues/21)) ([8139c85](https://github.com/m1sk9/chime/commit/8139c852f2964a45df36c61b3ed5cf15d759e6fe))
+* **deps:** update rust crate anyhow to v1.0.103 ([#22](https://github.com/m1sk9/chime/issues/22)) ([09906aa](https://github.com/m1sk9/chime/commit/09906aa57e2462ce707e045bfd8a212ccfd95be3))
+
+
+### CI
+
+* bump release-please-action to v5 for Node.js 24 runtime ([#18](https://github.com/m1sk9/chime/issues/18)) ([018bee4](https://github.com/m1sk9/chime/commit/018bee4bc4763e1814e61bc56ae0a300524a6171))
+
 ## [0.2.1](https://github.com/m1sk9/chime/compare/chime-v0.2.0...chime-v0.2.1) (2026-06-16)
 
 
