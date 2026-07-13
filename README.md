@@ -109,7 +109,16 @@ days = ["mon", "tue", "wed", "thu", "fri"]
                             # sun/mon/tue/wed/thu/fri/sat, or ["every"]
 message = "Time for standup."
 webhook = "team"            # logical name — resolved via env (see below)
+
+[[reminders]]
+name = "salary-day"
+time = "15:00"
+day_of_month = [18]         # 1..=31; e.g. [1, 15] for multiple days each month
+message = "Payday is here."
+webhook = "team"
 ```
+
+Each reminder schedules by **either** `days` (weekdays) **or** `day_of_month` (days of the month) — exactly one of the two, never both. `day_of_month` accepts a list of days in `1..=31`; a day that does not exist in a given month (e.g. `31` in February) is simply skipped that month.
 
 ### Webhook resolution
 
@@ -133,6 +142,8 @@ All of the following are rejected at startup with a descriptive error and a non-
 - Duplicate or empty reminder `name`
 - `time` not in `HH:MM` form, or hour > 23 / minute > 59
 - Empty `days`, or any unknown weekday string
+- Empty `day_of_month`, or any value outside `1..=31`
+- A reminder specifying neither or both of `days` / `day_of_month`
 - Empty `message`
 - Webhook env var unset, empty, or not a valid URL
 - Zero reminders defined
@@ -143,7 +154,7 @@ chime is a long-running process, not a one-shot cron job. The main loop:
 
 1. Tick on `tick_interval_sec` (with `MissedTickBehavior::Skip` — overdue ticks are collapsed, not replayed).
 2. Compute the current local time in the configured timezone.
-3. For each reminder, fire if the current hour and minute match and today is one of `days`.
+3. For each reminder, fire if the current hour and minute match and today matches its schedule — one of `days` (weekday), or one of `day_of_month` (day of the current month).
 4. Per-minute deduplication: each reminder fires at most once per matching minute, even if the tick interval is shorter than 60 seconds (e.g. with `tick_interval_sec = 30` you get exactly one POST per scheduled minute). The dedup record is updated **before** the HTTP request, so a send failure does not cause a retry within the same minute.
 5. SIGINT and SIGTERM both trigger a clean shutdown.
 

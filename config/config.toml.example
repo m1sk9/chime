@@ -16,3 +16,11 @@ time = "17:00"
 days = ["fri"]
 message = "Don't forget the weekly review."
 webhook = "team"
+
+[[reminders]]
+name = "salary-day"
+time = "15:00"
+day_of_month = [18]         # 1..=31; use e.g. [1, 15] for multiple days.
+                            # A reminder uses either `days` or `day_of_month`, never both.
+message = "Payday is here."
+webhook = "team"

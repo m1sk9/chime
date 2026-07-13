@@ -123,11 +123,11 @@ mod tests {
     }
 
     fn mk_run_reminder(name: &str, hour: u32, minute: u32) -> RunReminder {
-        use crate::config::{TimeOfDay, WeekdaySet};
+        use crate::config::{Schedule, TimeOfDay, WeekdaySet};
         RunReminder {
             name: name.to_string(),
             time: TimeOfDay { hour, minute },
-            days: WeekdaySet::try_from(vec!["every".to_string()]).unwrap(),
+            schedule: Schedule::Weekly(WeekdaySet::try_from(vec!["every".to_string()]).unwrap()),
             message: "ping".to_string(),
             webhook_url: Url::parse("https://example.com/hook").unwrap(),
         }
