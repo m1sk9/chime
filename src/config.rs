@@ -269,9 +269,7 @@ pub struct System {
 pub struct Reminder {
     pub name: ReminderName,
     pub time: TimeOfDay,
-    #[serde(default)]
     pub days: Option<WeekdaySet>,
-    #[serde(default)]
     pub day_of_month: Option<DayOfMonthSet>,
     pub message: Message,
     pub webhook: WebhookRef,

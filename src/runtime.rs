@@ -229,6 +229,26 @@ mod tests {
     }
 
     #[test]
+    fn resolve_builds_monthly_schedule() {
+        let _g = EnvGuard::set("CHIME_WEBHOOK_RESOLVE_MONTHLY", "https://example.com/hook");
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[reminders]]
+name = "salary-day"
+time = "15:00"
+day_of_month = [18]
+message = "Payday!"
+webhook = "resolve-monthly"
+"#;
+        let cfg = Config::from_toml(toml).unwrap();
+        let run = resolve(cfg).unwrap();
+        assert!(matches!(run.reminders[0].schedule, Schedule::Monthly(_)));
+    }
+
+    #[test]
     fn resolve_webhook_reads_env() {
         let _g = EnvGuard::set("CHIME_WEBHOOK_TEST_DIRECT", "https://example.com/hook");
         let r = WebhookRef::try_from("test-direct".to_string()).unwrap();
