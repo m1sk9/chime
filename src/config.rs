@@ -446,6 +446,16 @@ mod tests {
     }
 
     #[test]
+    fn non_empty_newtypes_display_inner_value() {
+        let n = ReminderName::try_from("standup".to_string()).unwrap();
+        assert_eq!(n.to_string(), "standup");
+        let m = Message::try_from("hello".to_string()).unwrap();
+        assert_eq!(format!("{m}"), "hello");
+        let w = WebhookRef::try_from("team".to_string()).unwrap();
+        assert_eq!(w.to_string(), "team");
+    }
+
+    #[test]
     fn non_empty_newtypes_reject_empty_and_whitespace() {
         assert!(ReminderName::try_from(String::new()).is_err());
         assert!(ReminderName::try_from("   ".to_string()).is_err());

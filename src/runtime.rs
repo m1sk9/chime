@@ -249,6 +249,65 @@ webhook = "resolve-monthly"
     }
 
     #[test]
+    fn resolve_reports_missing_webhook_with_reminder_name() {
+        let _g1 = EnvGuard::unset("CHIME_WEBHOOK_RESOLVE_NOHOOK");
+        let _g2 = EnvGuard::unset("CHIME_WEBHOOK_RESOLVE_NOHOOK_FILE");
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[reminders]]
+name = "orphan"
+time = "09:30"
+days = ["mon"]
+message = "hi"
+webhook = "resolve-nohook"
+"#;
+        let cfg = Config::from_toml(toml).unwrap();
+        assert!(matches!(
+            resolve(cfg),
+            Err(ResolveError::Webhook { name, .. }) if name == "orphan"
+        ));
+    }
+
+    #[test]
+    fn resolve_reports_schedule_error_with_reminder_name() {
+        // `from_toml` normally rejects a reminder with no schedule; clearing the
+        // fields afterwards exercises `resolve`'s own defensive check.
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[reminders]]
+name = "orphan"
+time = "09:30"
+days = ["mon"]
+message = "hi"
+webhook = "team"
+"#;
+        let mut cfg = Config::from_toml(toml).unwrap();
+        cfg.reminders[0].days = None;
+        cfg.reminders[0].day_of_month = None;
+        assert!(matches!(
+            resolve(cfg),
+            Err(ResolveError::Schedule { name, .. }) if name == "orphan"
+        ));
+    }
+
+    #[test]
+    fn env_guard_restores_previous_value_on_drop() {
+        let key = "CHIME_TEST_GUARD_RESTORE";
+        let _outer = EnvGuard::set(key, "original");
+        {
+            let _inner = EnvGuard::set(key, "override");
+            assert_eq!(std::env::var(key).unwrap(), "override");
+        }
+        assert_eq!(std::env::var(key).unwrap(), "original");
+    }
+
+    #[test]
     fn resolve_webhook_reads_env() {
         let _g = EnvGuard::set("CHIME_WEBHOOK_TEST_DIRECT", "https://example.com/hook");
         let r = WebhookRef::try_from("test-direct".to_string()).unwrap();
