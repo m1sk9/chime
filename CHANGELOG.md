@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/m1sk9/chime/compare/chime-v0.2.2...chime-v0.3.0) (2026-07-13)
+
+
+### Features
+
+* support day-of-month reminder scheduling ([#23](https://github.com/m1sk9/chime/issues/23)) ([dbd2665](https://github.com/m1sk9/chime/commit/dbd26657718ef929188ede49799197c0d04bf28d))
+
 ## [0.2.2](https://github.com/m1sk9/chime/compare/chime-v0.2.1...chime-v0.2.2) (2026-06-25)
 
 
