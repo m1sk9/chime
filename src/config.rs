@@ -14,6 +14,12 @@ pub enum ConfigError {
     NoReminders,
     #[error("duplicate reminder name: {0}")]
     DuplicateName(String),
+    #[error("reminder `{name}`: {source}")]
+    Schedule {
+        name: String,
+        #[source]
+        source: ScheduleError,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +38,22 @@ pub enum WeekdayError {
     Empty,
     #[error("unknown weekday: `{0}`")]
     Unknown(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DayOfMonthError {
+    #[error("day_of_month must not be empty")]
+    Empty,
+    #[error("day_of_month must be 1..=31, got {0}")]
+    OutOfRange(i64),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ScheduleError {
+    #[error("must specify exactly one of `days` or `day_of_month`")]
+    Missing,
+    #[error("`days` and `day_of_month` are mutually exclusive")]
+    Conflict,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -115,6 +137,42 @@ impl TryFrom<Vec<String>> for WeekdaySet {
         }
         Ok(WeekdaySet(bits))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "Vec<i64>")]
+pub struct DayOfMonthSet(u32);
+
+impl DayOfMonthSet {
+    pub fn contains(self, day: u32) -> bool {
+        (1..=31).contains(&day) && (self.0 & (1u32 << (day - 1))) != 0
+    }
+}
+
+impl TryFrom<Vec<i64>> for DayOfMonthSet {
+    type Error = DayOfMonthError;
+    fn try_from(days: Vec<i64>) -> Result<Self, Self::Error> {
+        if days.is_empty() {
+            return Err(DayOfMonthError::Empty);
+        }
+        let mut bits: u32 = 0;
+        for d in days {
+            if !(1..=31).contains(&d) {
+                return Err(DayOfMonthError::OutOfRange(d));
+            }
+            bits |= 1u32 << (d as u32 - 1);
+        }
+        Ok(DayOfMonthSet(bits))
+    }
+}
+
+/// A reminder fires on either weekdays or days of the month, never both.
+/// The exclusivity is resolved once via `Reminder::schedule` so the runtime
+/// carries a value that is correct by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Schedule {
+    Weekly(WeekdaySet),
+    Monthly(DayOfMonthSet),
 }
 
 macro_rules! non_empty_str {
@@ -211,9 +269,23 @@ pub struct System {
 pub struct Reminder {
     pub name: ReminderName,
     pub time: TimeOfDay,
-    pub days: WeekdaySet,
+    #[serde(default)]
+    pub days: Option<WeekdaySet>,
+    #[serde(default)]
+    pub day_of_month: Option<DayOfMonthSet>,
     pub message: Message,
     pub webhook: WebhookRef,
+}
+
+impl Reminder {
+    pub fn schedule(&self) -> Result<Schedule, ScheduleError> {
+        match (self.days, self.day_of_month) {
+            (Some(w), None) => Ok(Schedule::Weekly(w)),
+            (None, Some(d)) => Ok(Schedule::Monthly(d)),
+            (None, None) => Err(ScheduleError::Missing),
+            (Some(_), Some(_)) => Err(ScheduleError::Conflict),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -235,6 +307,10 @@ impl Config {
             if !seen.insert(r.name.as_str().to_string()) {
                 return Err(ConfigError::DuplicateName(r.name.as_str().to_string()));
             }
+            r.schedule().map_err(|source| ConfigError::Schedule {
+                name: r.name.as_str().to_string(),
+                source,
+            })?;
         }
         Ok(cfg)
     }
@@ -332,6 +408,42 @@ mod tests {
         assert!(matches!(
             WeekdaySet::try_from(vec!["funday".to_string()]),
             Err(WeekdayError::Unknown(_))
+        ));
+    }
+
+    #[test]
+    fn day_of_month_set_single_and_multiple() {
+        let single = DayOfMonthSet::try_from(vec![18]).unwrap();
+        assert!(single.contains(18));
+        assert!(!single.contains(17));
+
+        let multi = DayOfMonthSet::try_from(vec![1, 15, 31]).unwrap();
+        assert!(multi.contains(1));
+        assert!(multi.contains(15));
+        assert!(multi.contains(31));
+        assert!(!multi.contains(2));
+        // Days outside 1..=31 are never contained.
+        assert!(!multi.contains(0));
+        assert!(!multi.contains(32));
+    }
+
+    #[test]
+    fn day_of_month_set_empty_errors() {
+        assert!(matches!(
+            DayOfMonthSet::try_from(vec![]),
+            Err(DayOfMonthError::Empty)
+        ));
+    }
+
+    #[test]
+    fn day_of_month_set_out_of_range_errors() {
+        assert!(matches!(
+            DayOfMonthSet::try_from(vec![0]),
+            Err(DayOfMonthError::OutOfRange(0))
+        ));
+        assert!(matches!(
+            DayOfMonthSet::try_from(vec![32]),
+            Err(DayOfMonthError::OutOfRange(32))
         ));
     }
 
@@ -506,5 +618,72 @@ message = "a"
 webhook = "team"
 "#;
         assert!(matches!(Config::from_toml(t), Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn config_accepts_day_of_month() {
+        let t = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[reminders]]
+name = "salary-day"
+time = "15:00"
+day_of_month = [18]
+message = "Payday!"
+webhook = "team"
+"#;
+        let cfg = Config::from_toml(t).unwrap();
+        assert!(matches!(
+            cfg.reminders[0].schedule(),
+            Ok(Schedule::Monthly(_))
+        ));
+    }
+
+    #[test]
+    fn config_rejects_reminder_without_schedule() {
+        let t = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[reminders]]
+name = "x"
+time = "09:30"
+message = "a"
+webhook = "team"
+"#;
+        assert!(matches!(
+            Config::from_toml(t),
+            Err(ConfigError::Schedule {
+                source: ScheduleError::Missing,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn config_rejects_reminder_with_both_schedules() {
+        let t = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[reminders]]
+name = "x"
+time = "09:30"
+days = ["mon"]
+day_of_month = [1]
+message = "a"
+webhook = "team"
+"#;
+        assert!(matches!(
+            Config::from_toml(t),
+            Err(ConfigError::Schedule {
+                source: ScheduleError::Conflict,
+                ..
+            })
+        ));
     }
 }
