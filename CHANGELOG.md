@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.1](https://github.com/m1sk9/chime/compare/chime-v0.3.0...chime-v0.3.1) (2026-07-19)
+
+
+### Miscellaneous
+
+* **deps:** update rust crate anyhow to v1.0.104 ([#29](https://github.com/m1sk9/chime/issues/29)) ([686faa8](https://github.com/m1sk9/chime/commit/686faa83f11feb149c2f5956cded410a76bac98c))
+* **deps:** update rust crate serde to v1.0.229 ([#30](https://github.com/m1sk9/chime/issues/30)) ([a0096e8](https://github.com/m1sk9/chime/commit/a0096e88e673611c2129ddb12b117f6a4b69d001))
+* **deps:** update rust crate thiserror to v2.0.19 ([#31](https://github.com/m1sk9/chime/issues/31)) ([2b44586](https://github.com/m1sk9/chime/commit/2b44586ee6a3b761dfdb71c77870f6f9dc7c2fc1))
+* **deps:** update rust crate tokio to v1.52.4 ([#27](https://github.com/m1sk9/chime/issues/27)) ([1b695de](https://github.com/m1sk9/chime/commit/1b695de0b23ec7dc029f508e0768f80b5742524d))
+* **deps:** update rust crate tokio to v1.53.0 ([#28](https://github.com/m1sk9/chime/issues/28)) ([7377c5f](https://github.com/m1sk9/chime/commit/7377c5fe1fc06e6515f77c9e188c6d876b3c1312))
+* **deps:** update rust crate toml to v1.1.3 ([#25](https://github.com/m1sk9/chime/issues/25)) ([fe62cef](https://github.com/m1sk9/chime/commit/fe62cef81057f48d5d2122858038418968dc1f2b))
+
 ## [0.3.0](https://github.com/m1sk9/chime/compare/chime-v0.2.2...chime-v0.3.0) (2026-07-13)
 
 
