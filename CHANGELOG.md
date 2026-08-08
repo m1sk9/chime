@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.3](https://github.com/m1sk9/chime/compare/chime-v0.3.2...chime-v0.3.3) (2026-08-08)
+
+
+### Miscellaneous
+
+* **deps:** update rust crate thiserror to v2.0.20 ([#39](https://github.com/m1sk9/chime/issues/39)) ([e8107a3](https://github.com/m1sk9/chime/commit/e8107a38948bad9155b4088d82b8a72fe8801d3b))
+* **deps:** update swatinem/rust-cache action to v2.9.2 ([#37](https://github.com/m1sk9/chime/issues/37)) ([b972f1f](https://github.com/m1sk9/chime/commit/b972f1f02a58eee07c7602178ae1413c4f35439f))
+
 ## [0.3.2](https://github.com/m1sk9/chime/compare/chime-v0.3.1...chime-v0.3.2) (2026-07-31)
 
 
