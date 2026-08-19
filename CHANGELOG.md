@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.4](https://github.com/m1sk9/chime/compare/chime-v0.3.3...chime-v0.3.4) (2026-08-19)
+
+
+### Miscellaneous
+
+* **deps:** Bump quinn-proto from 0.11.14 to 0.11.16 ([#34](https://github.com/m1sk9/chime/issues/34)) ([5b031db](https://github.com/m1sk9/chime/commit/5b031dbf2d377023662409c752fecbf8ec675d06))
+
 ## [0.3.3](https://github.com/m1sk9/chime/compare/chime-v0.3.2...chime-v0.3.3) (2026-08-08)
 
 
