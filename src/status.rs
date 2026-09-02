@@ -40,9 +40,11 @@ pub enum StatusError {
 // Why not `deny_unknown_fields`: every other struct in chime rejects unknown keys,
 // but these mirror a third-party API. Statuspage adds fields without notice, and a
 // strict decoder would turn a harmless addition into a total outage of the feature.
+// Why not `#[serde(default)]` on `incidents`: a defaulted field makes every JSON
+// object decode, so a URL that is not a Statuspage instance would look like a page
+// with no incidents forever instead of failing the poll with a decode error.
 #[derive(Debug, Deserialize)]
 struct WireResponse {
-    #[serde(default)]
     incidents: Vec<WireIncident>,
 }
 
@@ -197,8 +199,13 @@ pub struct PageState {
 /// failure never causes the same update to be re-sent on the next poll — the same
 /// rule the reminder path follows.
 pub fn diff(state: &mut PageState, incidents: &[Incident], min_impact: Impact) -> Vec<StatusEvent> {
-    let current: HashSet<&str> = incidents.iter().map(|i| i.id.as_str()).collect();
-    state.seen.retain(|id, _| current.contains(id.as_str()));
+    // Prune only against a non-empty feed. A page may legitimately answer with an
+    // empty `incidents` array, and dropping the whole baseline there would re-report
+    // every one of the 50 incidents as new the moment the feed came back.
+    if !incidents.is_empty() {
+        let current: HashSet<&str> = incidents.iter().map(|i| i.id.as_str()).collect();
+        state.seen.retain(|id, _| current.contains(id.as_str()));
+    }
 
     let first_poll = !state.initialized;
     state.initialized = true;
@@ -555,7 +562,31 @@ mod tests {
     }
 
     #[test]
-    fn vanished_incidents_are_pruned_from_state() {
+    fn incidents_that_roll_out_of_the_feed_are_pruned_from_state() {
+        let a = mk_incident(
+            "a",
+            Impact::Minor,
+            vec![mk_update("a1", "investigating", "2026-09-01T10:00:00Z")],
+        );
+        let b = mk_incident(
+            "b",
+            Impact::Minor,
+            vec![mk_update("b1", "investigating", "2026-09-01T11:00:00Z")],
+        );
+        let mut state = baselined(&[a.clone(), b.clone()]);
+
+        // `a` aged out of the 50 most recent incidents; `b` is unchanged.
+        assert!(diff(&mut state, std::slice::from_ref(&b), Impact::None).is_empty());
+        assert_eq!(state.seen.len(), 1);
+
+        // `a` reappearing is treated as new, not as already-seen.
+        let events = diff(&mut state, &[a, b], Impact::None);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].incident_id, "a");
+    }
+
+    #[test]
+    fn an_empty_feed_keeps_the_baseline() {
         let baseline = vec![mk_incident(
             "a",
             Impact::Minor,
@@ -563,11 +594,8 @@ mod tests {
         )];
         let mut state = baselined(&baseline);
         assert!(diff(&mut state, &[], Impact::None).is_empty());
-        assert!(state.seen.is_empty());
-
-        // The incident reappearing is treated as new, not as already-seen.
-        let events = diff(&mut state, &baseline, Impact::None);
-        assert_eq!(events.len(), 1);
+        // The baseline survived, so the returning feed reports nothing.
+        assert!(diff(&mut state, &baseline, Impact::None).is_empty());
     }
 
     #[test]
@@ -703,6 +731,11 @@ mod tests {
         let msg = build_message(&page, &ev);
         assert!(msg.embeds[0].url.is_none());
         assert_eq!(msg.embeds[0].fields.len(), 2);
+    }
+
+    #[test]
+    fn json_without_an_incidents_array_is_not_a_statuspage_feed() {
+        assert!(serde_json::from_str::<WireResponse>(r#"{"error":"not found"}"#).is_err());
     }
 
     #[test]

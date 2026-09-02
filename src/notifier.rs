@@ -6,7 +6,7 @@ const MAX_ERROR_BODY: usize = 512;
 
 // Discord counts message limits in characters, not bytes, so every cap here is
 // applied over `chars()` — byte slicing would also split multi-byte UTF-8.
-const MAX_CONTENT: usize = 1900;
+const MAX_CONTENT: usize = 2000;
 const MAX_EMBED_TITLE: usize = 256;
 // Discord allows 4096 here. The lower cap is deliberate: a Statuspage postmortem
 // runs to thousands of characters, and the incident link is the authoritative
@@ -85,13 +85,20 @@ impl Embed {
         }
     }
 
+    // Why the emptiness guards: Discord rejects the whole payload with a 400 when
+    // `url` or `description` is present but empty, and both are filled from a
+    // third-party feed that is free to send `""`.
     pub fn with_url(mut self, url: &str) -> Self {
-        self.url = Some(url.to_string());
+        if !url.trim().is_empty() {
+            self.url = Some(url.to_string());
+        }
         self
     }
 
     pub fn with_description(mut self, description: &str) -> Self {
-        self.description = Some(truncate(description, MAX_EMBED_DESCRIPTION));
+        if !description.trim().is_empty() {
+            self.description = Some(truncate(description, MAX_EMBED_DESCRIPTION));
+        }
         self
     }
 
@@ -219,6 +226,13 @@ mod tests {
         let msg = DiscordMessage::embed(Embed::new("t", 1));
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(json, r#"{"embeds":[{"title":"t","color":1}]}"#);
+    }
+
+    #[test]
+    fn empty_description_and_url_are_omitted() {
+        let embed = Embed::new("t", 1).with_description("  ").with_url("");
+        assert!(embed.description.is_none());
+        assert!(embed.url.is_none());
     }
 
     #[test]
