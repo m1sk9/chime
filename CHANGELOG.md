@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.0](https://github.com/m1sk9/chime/compare/chime-v0.3.4...chime-v0.4.0) (2026-09-03)
+
+
+### Features
+
+* forward Atlassian Statuspage incidents to Discord webhooks ([#41](https://github.com/m1sk9/chime/issues/41)) ([0f7d1ba](https://github.com/m1sk9/chime/commit/0f7d1ba95b692812fd4a5bab4d334036d85a0f44))
+
+
+### Miscellaneous
+
+* **deps:** update docker/dockerfile docker tag to v1.27 ([#43](https://github.com/m1sk9/chime/issues/43)) ([f0b6aef](https://github.com/m1sk9/chime/commit/f0b6aefbff977aa328334ae210393a9b52c7bc78))
+* **deps:** update rust crate serde_json to v1.0.151 ([#45](https://github.com/m1sk9/chime/issues/45)) ([873dbf8](https://github.com/m1sk9/chime/commit/873dbf89e96cb690ea0789ecc412509efd475bc4))
+* **deps:** update rust crate toml to v1.1.5 ([#42](https://github.com/m1sk9/chime/issues/42)) ([f59f48e](https://github.com/m1sk9/chime/commit/f59f48eaf8beaa872b1448e3fbd10e52183dece7))
+* **deps:** update taiki-e/install-action digest to e67fa11 ([#20](https://github.com/m1sk9/chime/issues/20)) ([fbcf4ff](https://github.com/m1sk9/chime/commit/fbcf4ff632dc8f2af7cfda274c4fc59d28da68b3))
+
 ## [0.3.4](https://github.com/m1sk9/chime/compare/chime-v0.3.3...chime-v0.3.4) (2026-08-19)
 
 
