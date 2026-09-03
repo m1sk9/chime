@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -90,66 +91,45 @@ impl<N: Notifier, S: StatusSource> Scheduler<N, S> {
         }
     }
 
+    /// Poll at most one status page per tick.
+    ///
+    /// The heartbeat is written once, at the top of the tick, and `chime health`
+    /// calls it stale past `2 * tick_interval`. Polling every due page in one tick
+    /// would let N pages behind a network partition hold the tick for
+    /// `N * FETCH_TIMEOUT` and get the container restarted over someone else's
+    /// outage. One page per tick bounds that to a single fetch however many pages
+    /// are configured, and picking the most overdue one keeps them from staying in
+    /// the lockstep they start in — every page is due on the very first tick.
     async fn poll_status_pages(&mut self, now: DateTime<Tz>) {
-        let due: Vec<RunStatusPage> = self
-            .cfg
-            .status_pages
-            .iter()
-            .filter(|p| is_due(self.last_polled.get(&p.name), p.poll_interval, now))
-            .cloned()
-            .collect();
-        for page in due {
-            // Recorded before the request: a slow or failing page must wait out its
-            // own interval, not be retried on every tick.
-            self.last_polled.insert(page.name.clone(), now);
-            self.poll_page(&page).await;
-        }
+        let Some(index) = self.most_overdue(now) else {
+            return;
+        };
+        // Borrows are split by field rather than cloning the page: `poll_page` is a
+        // free function so `cfg`, `page_states`, `source` and `notifier` can be held
+        // at once.
+        let page = &self.cfg.status_pages[index];
+        // Recorded before the request: a slow or failing page must wait out its own
+        // interval, not be retried on every tick.
+        self.last_polled.insert(page.name.clone(), now);
+        let state = self.page_states.entry(page.name.clone()).or_default();
+        poll_page(&self.source, &self.notifier, page, state).await;
     }
 
-    async fn poll_page(&mut self, page: &RunStatusPage) {
-        let etag = self
-            .page_states
-            .get(&page.name)
-            .and_then(|s| s.etag.clone());
-        let fetched = match self.source.fetch(&page.api_url, etag.as_deref()).await {
-            Ok(f) => f,
-            Err(e) => {
-                // A status page being unreachable is not chime's outage to report:
-                // log it and try again next interval, never notify Discord.
-                warn!(status_page = %page.name, error = %e, "failed to poll status page");
-                return;
-            }
-        };
-        let (incidents, new_etag) = match fetched {
-            Fetched::NotModified => {
-                debug!(status_page = %page.name, "status page not modified");
-                return;
-            }
-            Fetched::Modified { incidents, etag } => (incidents, etag),
-        };
-
-        let events = {
-            let state = self.page_states.entry(page.name.clone()).or_default();
-            state.etag = new_etag;
-            diff(state, &incidents, page.min_impact)
-        };
-        for event in events {
-            let message = build_message(page, &event);
-            match self.notifier.send(&page.webhook_url, &message).await {
-                Ok(()) => info!(
-                    status_page = %page.name,
-                    incident = %event.incident_id,
-                    state = event.state.label(),
-                    "status update forwarded"
-                ),
-                Err(e) => error!(
-                    status_page = %page.name,
-                    incident = %event.incident_id,
-                    error = %e,
-                    "failed to forward status update"
-                ),
-            }
-        }
+    fn most_overdue(&self, now: DateTime<Tz>) -> Option<usize> {
+        self.cfg
+            .status_pages
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| is_due(self.last_polled.get(&p.name), p.poll_interval, now))
+            .min_by_key(|(i, p)| {
+                // Longest overdue first; declaration order settles a tie, so the
+                // choice is deterministic rather than hash-order dependent.
+                (
+                    Reverse(overdue_secs(self.last_polled.get(&p.name), now)),
+                    *i,
+                )
+            })
+            .map(|(i, _)| i)
     }
 
     /// Write the liveness heartbeat. Called at the start of every tick, before any
@@ -168,6 +148,51 @@ impl<N: Notifier, S: StatusSource> Scheduler<N, S> {
     }
 }
 
+async fn poll_page<N: Notifier, S: StatusSource>(
+    source: &S,
+    notifier: &N,
+    page: &RunStatusPage,
+    state: &mut PageState,
+) {
+    let etag = state.etag.clone();
+    let fetched = match source.fetch(&page.api_url, etag.as_deref()).await {
+        Ok(f) => f,
+        Err(e) => {
+            // A status page being unreachable is not chime's outage to report:
+            // log it and try again next interval, never notify Discord.
+            warn!(status_page = %page.name, error = %e, "failed to poll status page");
+            return;
+        }
+    };
+    let (incidents, new_etag) = match fetched {
+        Fetched::NotModified => {
+            debug!(status_page = %page.name, "status page not modified");
+            return;
+        }
+        Fetched::Modified { incidents, etag } => (incidents, etag),
+    };
+
+    state.etag = new_etag;
+    let events = diff(state, &incidents, page.min_impact);
+    for event in events {
+        let message = build_message(page, &event);
+        match notifier.send(&page.webhook_url, &message).await {
+            Ok(()) => info!(
+                status_page = %page.name,
+                incident = %event.incident_id,
+                state = event.state.label(),
+                "status update forwarded"
+            ),
+            Err(e) => error!(
+                status_page = %page.name,
+                incident = %event.incident_id,
+                error = %e,
+                "failed to forward status update"
+            ),
+        }
+    }
+}
+
 fn is_due(last: Option<&DateTime<Tz>>, poll_interval: Duration, now: DateTime<Tz>) -> bool {
     match last {
         None => true,
@@ -176,6 +201,14 @@ fn is_due(last: Option<&DateTime<Tz>>, poll_interval: Duration, now: DateTime<Tz
             // A clock stepping backwards must not park a page until it catches up.
             elapsed < 0 || elapsed >= poll_interval.as_secs() as i64
         }
+    }
+}
+
+/// A page that has never been polled outranks every page that has.
+fn overdue_secs(last: Option<&DateTime<Tz>>, now: DateTime<Tz>) -> i64 {
+    match last {
+        None => i64::MAX,
+        Some(previous) => now.signed_duration_since(*previous).num_seconds(),
     }
 }
 
@@ -487,6 +520,55 @@ mod tests {
         assert_eq!(source.calls(), 2);
         // The reminder still fired; the failing status page notified nothing.
         assert_eq!(notifier.sent(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_one_status_page_is_polled_per_tick() {
+        let source = FakeSource::empty();
+        let cfg = cfg_with(
+            "one_per_tick",
+            vec![],
+            vec![
+                mk_run_status_page("a", Duration::from_secs(60)),
+                mk_run_status_page("b", Duration::from_secs(60)),
+                mk_run_status_page("c", Duration::from_secs(60)),
+            ],
+        );
+        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), source.clone());
+
+        // All three are due on the first tick, but they are spread over three ticks.
+        scheduler.tick(at(9, 0, 0)).await;
+        assert_eq!(source.calls(), 1);
+        scheduler.tick(at(9, 0, 1)).await;
+        assert_eq!(source.calls(), 2);
+        scheduler.tick(at(9, 0, 2)).await;
+        assert_eq!(source.calls(), 3);
+        assert_eq!(scheduler.last_polled.len(), 3);
+
+        // None is due again until its interval elapses.
+        scheduler.tick(at(9, 0, 3)).await;
+        assert_eq!(source.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn the_most_overdue_page_is_polled_first() {
+        let cfg = cfg_with(
+            "overdue",
+            vec![],
+            vec![
+                mk_run_status_page("a", Duration::from_secs(60)),
+                mk_run_status_page("b", Duration::from_secs(60)),
+            ],
+        );
+        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::empty());
+        scheduler.last_polled.insert("a".to_string(), at(9, 0, 0));
+        scheduler.last_polled.insert("b".to_string(), at(8, 0, 0));
+
+        // Both are due, but `b` has waited an hour longer.
+        scheduler.tick(at(9, 5, 0)).await;
+
+        assert_eq!(scheduler.last_polled["b"], at(9, 5, 0));
+        assert_eq!(scheduler.last_polled["a"], at(9, 0, 0), "a waits its turn");
     }
 
     #[test]

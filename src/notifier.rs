@@ -7,6 +7,7 @@ const MAX_ERROR_BODY: usize = 512;
 // Discord counts message limits in characters, not bytes, so every cap here is
 // applied over `chars()` — byte slicing would also split multi-byte UTF-8.
 const MAX_CONTENT: usize = 2000;
+const MAX_USERNAME: usize = 80;
 const MAX_EMBED_TITLE: usize = 256;
 // Discord allows 4096 here. The lower cap is deliberate: a Statuspage postmortem
 // runs to thousands of characters, and the incident link is the authoritative
@@ -54,7 +55,7 @@ impl DiscordMessage {
     }
 
     pub fn with_identity(mut self, username: &str, avatar_url: Option<&str>) -> Self {
-        self.username = Some(truncate(username, 80));
+        self.username = Some(truncate(username, MAX_USERNAME));
         self.avatar_url = avatar_url.map(str::to_string);
         self
     }
@@ -85,12 +86,15 @@ impl Embed {
         }
     }
 
-    // Why the emptiness guards: Discord rejects the whole payload with a 400 when
-    // `url` or `description` is present but empty, and both are filled from a
-    // third-party feed that is free to send `""`.
+    // Why the guards: Discord rejects the whole payload with a 400 when `url` is
+    // present but empty or not an absolute http(s) URL, and when `description` is
+    // present but empty. Both are filled from a third-party feed that is free to
+    // send either. Dropping the link is a better failure than dropping the message.
     pub fn with_url(mut self, url: &str) -> Self {
-        if !url.trim().is_empty() {
-            self.url = Some(url.to_string());
+        let trimmed = url.trim();
+        let usable = Url::parse(trimmed).is_ok_and(|u| matches!(u.scheme(), "http" | "https"));
+        if usable {
+            self.url = Some(trimmed.to_string());
         }
         self
     }
@@ -136,6 +140,13 @@ pub struct EmbedFooter {
     pub text: String,
 }
 
+/// Cap an error response body before it is attached to an error. Discord and
+/// Statuspage both answer failures with pages that dwarf the useful part.
+pub(crate) fn error_body(bytes: &[u8]) -> String {
+    let end = bytes.len().min(MAX_ERROR_BODY);
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -174,15 +185,9 @@ impl Notifier for Discord {
             return Ok(());
         }
         let bytes = resp.bytes().await?;
-        let slice = if bytes.len() > MAX_ERROR_BODY {
-            &bytes[..MAX_ERROR_BODY]
-        } else {
-            &bytes[..]
-        };
-        let body = String::from_utf8_lossy(slice).into_owned();
         Err(NotifyError::Status {
             status: status.as_u16(),
-            body,
+            body: error_body(&bytes),
         })
     }
 }
@@ -233,6 +238,32 @@ mod tests {
         let embed = Embed::new("t", 1).with_description("  ").with_url("");
         assert!(embed.description.is_none());
         assert!(embed.url.is_none());
+    }
+
+    #[test]
+    fn a_url_discord_would_reject_is_dropped_rather_than_the_message() {
+        assert!(Embed::new("t", 1).with_url("/incidents/abc").url.is_none());
+        assert!(Embed::new("t", 1).with_url("stspg.io/abc").url.is_none());
+        assert!(
+            Embed::new("t", 1)
+                .with_url("javascript:alert(1)")
+                .url
+                .is_none()
+        );
+        assert_eq!(
+            Embed::new("t", 1).with_url(" https://stspg.io/abc ").url,
+            Some("https://stspg.io/abc".to_string())
+        );
+    }
+
+    #[test]
+    fn error_body_caps_the_response_without_panicking_mid_codepoint() {
+        // A cut inside a multi-byte codepoint becomes U+FFFD, so the result can be a
+        // few bytes over the cap; what matters is that the body stays bounded.
+        let long = "あ".repeat(1000);
+        let capped = error_body(long.as_bytes());
+        assert!(capped.len() < MAX_ERROR_BODY + 4);
+        assert_eq!(error_body(b"boom"), "boom");
     }
 
     #[test]

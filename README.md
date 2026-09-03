@@ -205,7 +205,7 @@ chime is a long-running process, not a one-shot cron job. The main loop:
 2. Compute the current local time in the configured timezone.
 3. For each reminder, fire if the current hour and minute match and today matches its schedule — one of `days` (weekday), or one of `day_of_month` (day of the current month).
 4. Per-minute deduplication: each reminder fires at most once per matching minute, even if the tick interval is shorter than 60 seconds (e.g. with `tick_interval_sec = 30` you get exactly one POST per scheduled minute). The dedup record is updated **before** the HTTP request, so a send failure does not cause a retry within the same minute.
-5. Poll any status page whose `poll_interval_sec` has elapsed, and forward incident updates not seen before.
+5. Poll **at most one** status page — the one most overdue among those whose `poll_interval_sec` has elapsed — and forward incident updates not seen before.
 6. SIGINT and SIGTERM both trigger a clean shutdown.
 
 Status page polling follows the same rules as reminders:
@@ -214,6 +214,7 @@ Status page polling follows the same rules as reminders:
 - The seen-record is written **before** the Discord request, so a failed send is not retried on the next poll.
 - A status page being unreachable is logged at `warn` and retried on its own interval. chime never posts about its own polling failures.
 - Because polling happens on the tick, an update is forwarded up to `poll_interval_sec` after Statuspage published it. The embed timestamp always shows the real publication time.
+- **One page is polled per tick**, so a tick costs a single request no matter how many pages are configured — a set of unreachable pages cannot stall the loop long enough for `chime health` to call the heartbeat stale. Configure at most `poll_interval_sec / tick_interval_sec` pages to keep every page on its nominal interval; beyond that they simply poll less often.
 
 > [!IMPORTANT]
 >

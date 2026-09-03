@@ -8,7 +8,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::config::Impact;
-use crate::notifier::{DiscordMessage, Embed};
+use crate::notifier::{DiscordMessage, Embed, error_body};
 use crate::runtime::RunStatusPage;
 
 /// Path appended to a status page base URL. `incidents.json` is used rather than
@@ -19,7 +19,6 @@ pub const INCIDENTS_PATH: &str = "api/v2/incidents.json";
 /// Deliberately shorter than the Discord timeout: this request runs inside the
 /// scheduler tick, so a slow status page must not delay a reminder past its minute.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_ERROR_BODY: usize = 512;
 
 const COLOR_RESOLVED: u32 = 0x57F287;
 const COLOR_CRITICAL: u32 = 0xED4245;
@@ -42,7 +41,10 @@ pub enum StatusError {
 // strict decoder would turn a harmless addition into a total outage of the feature.
 // Why not `#[serde(default)]` on `incidents`: a defaulted field makes every JSON
 // object decode, so a URL that is not a Statuspage instance would look like a page
-// with no incidents forever instead of failing the poll with a decode error.
+// with no incidents forever instead of failing the poll with a decode error. Only
+// `id`/`name` are required below — `impact` is optional for the same reason it is
+// parsed leniently: an absent severity must degrade to "Unknown", not silence the
+// page behind a decode error on every poll.
 #[derive(Debug, Deserialize)]
 struct WireResponse {
     incidents: Vec<WireIncident>,
@@ -52,7 +54,7 @@ struct WireResponse {
 struct WireIncident {
     id: String,
     name: String,
-    impact: String,
+    impact: Option<String>,
     shortlink: Option<String>,
     #[serde(default)]
     incident_updates: Vec<WireUpdate>,
@@ -161,7 +163,7 @@ impl WireIncident {
         Incident {
             id: self.id,
             name: self.name,
-            impact: Impact::from_wire(&self.impact),
+            impact: self.impact.as_deref().and_then(Impact::from_wire),
             link: self.shortlink,
             components: self.components.into_iter().map(|c| c.name).collect(),
             updates,
@@ -327,10 +329,9 @@ impl StatusSource for Statuspage {
         }
         if !status.is_success() {
             let bytes = resp.bytes().await?;
-            let end = bytes.len().min(MAX_ERROR_BODY);
             return Err(StatusError::Status {
                 status: status.as_u16(),
-                body: String::from_utf8_lossy(&bytes[..end]).into_owned(),
+                body: error_body(&bytes),
             });
         }
         let new_etag = resp
@@ -736,6 +737,14 @@ mod tests {
     #[test]
     fn json_without_an_incidents_array_is_not_a_statuspage_feed() {
         assert!(serde_json::from_str::<WireResponse>(r#"{"error":"not found"}"#).is_err());
+    }
+
+    #[test]
+    fn a_missing_wire_impact_does_not_fail_the_whole_feed() {
+        let json = r#"{"incidents":[{"id":"i","name":"n","incident_updates":[]}]}"#;
+        let parsed: WireResponse = serde_json::from_str(json).unwrap();
+        let incident = parsed.incidents.into_iter().next().unwrap().normalize();
+        assert!(incident.impact.is_none());
     }
 
     #[test]
