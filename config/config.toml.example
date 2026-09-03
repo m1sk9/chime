@@ -24,3 +24,23 @@ day_of_month = [18]         # 1..=31; use e.g. [1, 15] for multiple days.
                             # A reminder uses either `days` or `day_of_month`, never both.
 message = "Payday is here."
 webhook = "team"
+
+# Atlassian Statuspage instances to watch. chime polls each page's public
+# `/api/v2/incidents.json` and forwards new incident updates to Discord; it never
+# receives an inbound webhook, so no ports need to be exposed.
+[[status_pages]]
+name = "claude"                         # non-empty, unique within the file
+url = "https://status.claude.com"       # https only; the page's base URL
+webhook = "team"                        # logical name — resolved via env, as above
+display_name = "Claude Status"          # optional; shown as the Discord username
+                                        # (default: the `name` above)
+
+[[status_pages]]
+name = "proton"
+url = "https://status.proton.me"
+webhook = "team"
+display_name = "Proton Status"
+poll_interval_sec = 600                 # optional; 60..=3600 (default: 300)
+min_impact = "major"                    # optional; none | maintenance | minor |
+                                        # major | critical (default: none)
+avatar_url = "https://example.com/proton.png"   # optional

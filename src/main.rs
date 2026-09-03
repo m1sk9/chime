@@ -3,6 +3,7 @@ mod heartbeat;
 mod notifier;
 mod runtime;
 mod scheduler;
+mod status;
 
 use std::time::{Duration, SystemTime};
 
@@ -17,8 +18,14 @@ use crate::heartbeat::{check_liveness, heartbeat_path};
 use crate::notifier::Discord;
 use crate::runtime::resolve;
 use crate::scheduler::Scheduler;
+use crate::status::Statuspage;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/chime/config.toml";
+const USER_AGENT: &str = concat!(
+    "chime/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/m1sk9/chime)"
+);
 
 enum Command {
     /// Run the scheduler daemon (no arguments).
@@ -91,6 +98,7 @@ async fn run_daemon() -> Result<()> {
 
     info!(
         reminders = run_cfg.reminders.len(),
+        status_pages = run_cfg.status_pages.len(),
         interval_sec = run_cfg.interval.as_secs(),
         timezone = %run_cfg.timezone,
         "chime starting"
@@ -98,10 +106,12 @@ async fn run_daemon() -> Result<()> {
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
+        .user_agent(USER_AGENT)
         .build()
         .context("failed to build HTTP client")?;
-    let notifier = Discord::new(client);
-    let scheduler = Scheduler::new(run_cfg, notifier);
+    let notifier = Discord::new(client.clone());
+    let source = Statuspage::new(client);
+    let scheduler = Scheduler::new(run_cfg, notifier, source);
     scheduler
         .run()
         .await

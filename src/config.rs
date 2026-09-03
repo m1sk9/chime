@@ -5,15 +5,18 @@ use std::time::Duration;
 use chrono::Weekday;
 use chrono_tz::Tz;
 use serde::Deserialize;
+use url::Url;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(transparent)]
     Toml(#[from] toml::de::Error),
-    #[error("config has no reminders")]
-    NoReminders,
+    #[error("config defines neither `[[reminders]]` nor `[[status_pages]]`")]
+    NoSources,
     #[error("duplicate reminder name: {0}")]
     DuplicateName(String),
+    #[error("duplicate status page name: {0}")]
+    DuplicateStatusPageName(String),
     #[error("reminder `{name}`: {source}")]
     Schedule {
         name: String,
@@ -60,6 +63,22 @@ pub enum ScheduleError {
 pub enum IntervalError {
     #[error("tick_interval_sec must be 1..=60, got {0}")]
     OutOfRange(i64),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PollIntervalError {
+    #[error("poll_interval_sec must be 60..=3600, got {0}")]
+    OutOfRange(i64),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HttpsUrlError {
+    #[error("invalid url: {0}")]
+    Parse(#[from] url::ParseError),
+    #[error("url scheme must be https, got `{0}`")]
+    Scheme(String),
+    #[error("url must have a host")]
+    NoHost,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -210,6 +229,8 @@ macro_rules! non_empty_str {
 non_empty_str!(ReminderName, "name");
 non_empty_str!(Message, "message");
 non_empty_str!(WebhookRef, "webhook");
+non_empty_str!(StatusPageName, "name");
+non_empty_str!(DisplayName, "display_name");
 
 impl WebhookRef {
     pub fn env_key(&self) -> String {
@@ -242,6 +263,126 @@ impl TryFrom<i64> for TickInterval {
             return Err(IntervalError::OutOfRange(n));
         }
         Ok(TickInterval(Duration::from_secs(n as u64)))
+    }
+}
+
+/// Statuspage incident severity. Ordering is the filter contract for
+/// `min_impact`, so variants are declared least- to most-severe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Impact {
+    #[default]
+    None,
+    Maintenance,
+    Minor,
+    Major,
+    Critical,
+}
+
+impl Impact {
+    /// Why not derive this from `Deserialize`: config must reject typos, but the
+    /// Statuspage API may add severities we do not know. Wire values are parsed
+    /// leniently here and `None` lets the caller notify rather than drop silently.
+    pub fn from_wire(s: &str) -> Option<Impact> {
+        match s {
+            "none" => Some(Impact::None),
+            "maintenance" => Some(Impact::Maintenance),
+            "minor" => Some(Impact::Minor),
+            "major" => Some(Impact::Major),
+            "critical" => Some(Impact::Critical),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Impact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Impact::None => "None",
+            Impact::Maintenance => "Maintenance",
+            Impact::Minor => "Minor",
+            Impact::Major => "Major",
+            Impact::Critical => "Critical",
+        })
+    }
+}
+
+fn parse_https(s: &str) -> Result<Url, HttpsUrlError> {
+    let url = Url::parse(s.trim())?;
+    if url.scheme() != "https" {
+        return Err(HttpsUrlError::Scheme(url.scheme().to_string()));
+    }
+    if url.host_str().is_none() {
+        return Err(HttpsUrlError::NoHost);
+    }
+    Ok(url)
+}
+
+/// Base URL of an Atlassian Statuspage instance.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct StatusUrl(Url);
+
+impl StatusUrl {
+    pub fn as_url(&self) -> &Url {
+        &self.0
+    }
+
+    pub fn host(&self) -> &str {
+        self.0.host_str().unwrap_or_default()
+    }
+}
+
+impl TryFrom<String> for StatusUrl {
+    type Error = HttpsUrlError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        let mut url = parse_https(&s)?;
+        // `Url::join` replaces the final path segment unless the base path ends in
+        // `/`, so normalize once here instead of guessing at every call site.
+        if !url.path().ends_with('/') {
+            let path = format!("{}/", url.path());
+            url.set_path(&path);
+        }
+        Ok(StatusUrl(url))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct AvatarUrl(Url);
+
+impl AvatarUrl {
+    pub fn into_string(self) -> String {
+        self.0.into()
+    }
+}
+
+impl TryFrom<String> for AvatarUrl {
+    type Error = HttpsUrlError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        parse_https(&s).map(AvatarUrl)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "i64")]
+pub struct PollInterval(Duration);
+
+impl PollInterval {
+    pub fn as_duration(&self) -> Duration {
+        self.0
+    }
+}
+
+impl TryFrom<i64> for PollInterval {
+    type Error = PollIntervalError;
+    fn try_from(n: i64) -> Result<Self, Self::Error> {
+        // The floor is politeness, not a protocol limit: chime polls a third-party
+        // public endpoint indefinitely and has no business hammering it.
+        if !(60..=3600).contains(&n) {
+            return Err(PollIntervalError::OutOfRange(n));
+        }
+        Ok(PollInterval(Duration::from_secs(n as u64)))
     }
 }
 
@@ -286,19 +427,41 @@ impl Reminder {
     }
 }
 
+fn default_poll_interval() -> PollInterval {
+    PollInterval(Duration::from_secs(300))
+}
+
+/// An Atlassian Statuspage instance to watch. Incidents are pulled from its public
+/// `/api/v2/incidents.json`; chime never receives an inbound webhook.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusPage {
+    pub name: StatusPageName,
+    pub url: StatusUrl,
+    pub webhook: WebhookRef,
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_sec: PollInterval,
+    #[serde(default)]
+    pub min_impact: Impact,
+    pub display_name: Option<DisplayName>,
+    pub avatar_url: Option<AvatarUrl>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub system: System,
     #[serde(default)]
     pub reminders: Vec<Reminder>,
+    #[serde(default)]
+    pub status_pages: Vec<StatusPage>,
 }
 
 impl Config {
     pub fn from_toml(text: &str) -> Result<Config, ConfigError> {
         let cfg: Config = toml::from_str(text)?;
-        if cfg.reminders.is_empty() {
-            return Err(ConfigError::NoReminders);
+        if cfg.reminders.is_empty() && cfg.status_pages.is_empty() {
+            return Err(ConfigError::NoSources);
         }
         let mut seen = HashSet::new();
         for r in &cfg.reminders {
@@ -309,6 +472,14 @@ impl Config {
                 name: r.name.as_str().to_string(),
                 source,
             })?;
+        }
+        let mut seen_pages = HashSet::new();
+        for p in &cfg.status_pages {
+            if !seen_pages.insert(p.name.as_str().to_string()) {
+                return Err(ConfigError::DuplicateStatusPageName(
+                    p.name.as_str().to_string(),
+                ));
+            }
         }
         Ok(cfg)
     }
@@ -547,16 +718,186 @@ webhook = "team"
     }
 
     #[test]
-    fn config_rejects_empty_reminders() {
+    fn config_rejects_no_reminders_and_no_status_pages() {
         let t = r#"
 [system]
 tick_interval_sec = 30
 timezone = "Asia/Tokyo"
 "#;
+        assert!(matches!(Config::from_toml(t), Err(ConfigError::NoSources)));
+    }
+
+    #[test]
+    fn config_accepts_status_pages_without_reminders() {
+        let t = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[status_pages]]
+name = "claude"
+url = "https://status.claude.com"
+webhook = "team"
+"#;
+        let cfg = Config::from_toml(t).unwrap();
+        assert!(cfg.reminders.is_empty());
+        assert_eq!(cfg.status_pages.len(), 1);
+    }
+
+    #[test]
+    fn status_page_defaults_are_applied() {
+        let t = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[status_pages]]
+name = "claude"
+url = "https://status.claude.com"
+webhook = "team"
+"#;
+        let page = Config::from_toml(t).unwrap().status_pages.remove(0);
+        assert_eq!(
+            page.poll_interval_sec.as_duration(),
+            Duration::from_secs(300)
+        );
+        assert_eq!(page.min_impact, Impact::None);
+        assert!(page.display_name.is_none());
+        assert!(page.avatar_url.is_none());
+    }
+
+    #[test]
+    fn status_page_accepts_full_form() {
+        let t = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[status_pages]]
+name = "claude"
+url = "https://status.claude.com"
+webhook = "team"
+poll_interval_sec = 120
+min_impact = "major"
+display_name = "Claude Status"
+avatar_url = "https://example.com/claude.png"
+"#;
+        let page = Config::from_toml(t).unwrap().status_pages.remove(0);
+        assert_eq!(
+            page.poll_interval_sec.as_duration(),
+            Duration::from_secs(120)
+        );
+        assert_eq!(page.min_impact, Impact::Major);
+        assert_eq!(page.display_name.unwrap().as_str(), "Claude Status");
+    }
+
+    #[test]
+    fn config_rejects_duplicate_status_page_names() {
+        let t = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[status_pages]]
+name = "dup"
+url = "https://status.claude.com"
+webhook = "team"
+
+[[status_pages]]
+name = "dup"
+url = "https://status.proton.me"
+webhook = "team"
+"#;
         assert!(matches!(
             Config::from_toml(t),
-            Err(ConfigError::NoReminders)
+            Err(ConfigError::DuplicateStatusPageName(_))
         ));
+    }
+
+    #[test]
+    fn status_url_requires_https_and_host() {
+        assert!(matches!(
+            StatusUrl::try_from("http://status.claude.com".to_string()),
+            Err(HttpsUrlError::Scheme(_))
+        ));
+        assert!(matches!(
+            StatusUrl::try_from("ftp://status.claude.com".to_string()),
+            Err(HttpsUrlError::Scheme(_))
+        ));
+        assert!(StatusUrl::try_from("not a url".to_string()).is_err());
+    }
+
+    #[test]
+    fn status_url_normalizes_trailing_slash_for_join() {
+        // Without the trailing slash, `join` would drop the final path segment.
+        let u = StatusUrl::try_from("https://example.com/status".to_string()).unwrap();
+        assert_eq!(
+            u.as_url().join("api/v2/incidents.json").unwrap().as_str(),
+            "https://example.com/status/api/v2/incidents.json"
+        );
+        let u = StatusUrl::try_from("https://status.claude.com".to_string()).unwrap();
+        assert_eq!(
+            u.as_url().join("api/v2/incidents.json").unwrap().as_str(),
+            "https://status.claude.com/api/v2/incidents.json"
+        );
+        assert_eq!(u.host(), "status.claude.com");
+    }
+
+    #[test]
+    fn poll_interval_bounds() {
+        assert!(PollInterval::try_from(59).is_err());
+        assert!(PollInterval::try_from(3601).is_err());
+        assert_eq!(
+            PollInterval::try_from(60).unwrap().as_duration(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            PollInterval::try_from(3600).unwrap().as_duration(),
+            Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn impact_orders_least_to_most_severe() {
+        assert!(Impact::None < Impact::Maintenance);
+        assert!(Impact::Maintenance < Impact::Minor);
+        assert!(Impact::Minor < Impact::Major);
+        assert!(Impact::Major < Impact::Critical);
+    }
+
+    #[test]
+    fn impact_from_wire_is_lenient_but_config_is_strict() {
+        assert_eq!(Impact::from_wire("critical"), Some(Impact::Critical));
+        assert_eq!(Impact::from_wire("catastrophic"), None);
+
+        let t = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[status_pages]]
+name = "claude"
+url = "https://status.claude.com"
+webhook = "team"
+min_impact = "catastrophic"
+"#;
+        assert!(matches!(Config::from_toml(t), Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn config_rejects_unknown_status_page_field() {
+        let t = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[status_pages]]
+name = "claude"
+url = "https://status.claude.com"
+webhook = "team"
+provider = "statuspage"
+"#;
+        assert!(matches!(Config::from_toml(t), Err(ConfigError::Toml(_))));
     }
 
     #[test]

@@ -5,8 +5,11 @@ use chrono::{DateTime, Datelike, Timelike};
 use chrono_tz::Tz;
 use url::Url;
 
-use crate::config::{Config, LogLevel, Message, Schedule, ScheduleError, TimeOfDay, WebhookRef};
+use crate::config::{
+    Config, Impact, LogLevel, Message, Schedule, ScheduleError, TimeOfDay, WebhookRef,
+};
 use crate::heartbeat::heartbeat_path;
+use crate::status::INCIDENTS_PATH;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WebhookError {
@@ -38,6 +41,18 @@ pub enum ResolveError {
         #[source]
         source: ScheduleError,
     },
+    #[error("status page `{name}`: {source}")]
+    StatusPageWebhook {
+        name: String,
+        #[source]
+        source: WebhookError,
+    },
+    #[error("status page `{name}`: cannot build API url: {source}")]
+    StatusPageUrl {
+        name: String,
+        #[source]
+        source: url::ParseError,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -61,12 +76,28 @@ impl RunReminder {
     }
 }
 
+/// A status page with everything already resolved: the API endpoint is built, the
+/// webhook URL is read from the environment, and the Discord identity is settled.
+#[derive(Debug, Clone)]
+pub struct RunStatusPage {
+    pub name: String,
+    pub api_url: Url,
+    /// Shown in the embed footer, e.g. `status.claude.com`.
+    pub host: String,
+    pub webhook_url: Url,
+    pub poll_interval: Duration,
+    pub min_impact: Impact,
+    pub display_name: String,
+    pub avatar_url: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     pub log_level: LogLevel,
     pub interval: Duration,
     pub timezone: Tz,
     pub reminders: Vec<RunReminder>,
+    pub status_pages: Vec<RunStatusPage>,
     pub heartbeat_path: PathBuf,
 }
 
@@ -90,11 +121,44 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
             webhook_url,
         });
     }
+    let mut status_pages = Vec::with_capacity(cfg.status_pages.len());
+    for p in cfg.status_pages {
+        let name = p.name.as_str().to_string();
+        let webhook_url =
+            resolve_webhook(&p.webhook).map_err(|source| ResolveError::StatusPageWebhook {
+                name: name.clone(),
+                source,
+            })?;
+        let api_url =
+            p.url
+                .as_url()
+                .join(INCIDENTS_PATH)
+                .map_err(|source| ResolveError::StatusPageUrl {
+                    name: name.clone(),
+                    source,
+                })?;
+        let display_name = p
+            .display_name
+            .map(|d| d.as_str().to_string())
+            .unwrap_or_else(|| name.clone());
+        status_pages.push(RunStatusPage {
+            host: p.url.host().to_string(),
+            name,
+            api_url,
+            webhook_url,
+            poll_interval: p.poll_interval_sec.as_duration(),
+            min_impact: p.min_impact,
+            display_name,
+            avatar_url: p.avatar_url.map(|a| a.into_string()),
+        });
+    }
+
     Ok(RunConfig {
         log_level: cfg.system.log_level,
         interval: cfg.system.tick_interval_sec.as_duration(),
         timezone: cfg.system.timezone,
         reminders,
+        status_pages,
         heartbeat_path: heartbeat_path(),
     })
 }
@@ -156,6 +220,20 @@ mod test_support {
             schedule,
             message: format!("{name} message"),
             webhook_url: Url::parse("https://discord.example/webhook").unwrap(),
+        }
+    }
+
+    pub(crate) fn mk_run_status_page(name: &str, poll_interval: Duration) -> RunStatusPage {
+        RunStatusPage {
+            name: name.to_string(),
+            api_url: Url::parse(&format!("https://status.{name}.example/{INCIDENTS_PATH}"))
+                .unwrap(),
+            host: format!("status.{name}.example"),
+            webhook_url: Url::parse("https://discord.example/webhook").unwrap(),
+            poll_interval,
+            min_impact: Impact::None,
+            display_name: format!("{name} Status"),
+            avatar_url: None,
         }
     }
 }
@@ -293,6 +371,80 @@ webhook = "team"
         assert!(matches!(
             resolve(cfg),
             Err(ResolveError::Schedule { name, .. }) if name == "orphan"
+        ));
+    }
+
+    #[test]
+    fn resolve_builds_the_status_page_api_url() {
+        let _g = EnvGuard::set("CHIME_WEBHOOK_STATUS_TEAM", "https://example.com/hook");
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[status_pages]]
+name = "claude"
+url = "https://status.claude.com"
+webhook = "status-team"
+"#;
+        let cfg = Config::from_toml(toml).unwrap();
+        let run = resolve(cfg).unwrap();
+        let page = &run.status_pages[0];
+        assert_eq!(
+            page.api_url.as_str(),
+            "https://status.claude.com/api/v2/incidents.json"
+        );
+        assert_eq!(page.host, "status.claude.com");
+        assert_eq!(page.webhook_url.as_str(), "https://example.com/hook");
+        // `display_name` falls back to the logical name so a message is never anonymous.
+        assert_eq!(page.display_name, "claude");
+        assert_eq!(page.poll_interval, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn resolve_keeps_an_explicit_display_identity() {
+        let _g = EnvGuard::set("CHIME_WEBHOOK_STATUS_IDENT", "https://example.com/hook");
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[status_pages]]
+name = "claude"
+url = "https://status.claude.com"
+webhook = "status-ident"
+display_name = "Claude Status"
+avatar_url = "https://example.com/claude.png"
+min_impact = "major"
+"#;
+        let cfg = Config::from_toml(toml).unwrap();
+        let page = resolve(cfg).unwrap().status_pages.remove(0);
+        assert_eq!(page.display_name, "Claude Status");
+        assert_eq!(
+            page.avatar_url.as_deref(),
+            Some("https://example.com/claude.png")
+        );
+        assert_eq!(page.min_impact, Impact::Major);
+    }
+
+    #[test]
+    fn resolve_reports_missing_webhook_with_status_page_name() {
+        let _g1 = EnvGuard::unset("CHIME_WEBHOOK_STATUS_NOHOOK");
+        let _g2 = EnvGuard::unset("CHIME_WEBHOOK_STATUS_NOHOOK_FILE");
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[status_pages]]
+name = "orphan-page"
+url = "https://status.claude.com"
+webhook = "status-nohook"
+"#;
+        let cfg = Config::from_toml(toml).unwrap();
+        assert!(matches!(
+            resolve(cfg),
+            Err(ResolveError::StatusPageWebhook { name, .. }) if name == "orphan-page"
         ));
     }
 
