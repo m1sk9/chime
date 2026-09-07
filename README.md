@@ -217,6 +217,16 @@ Status page polling follows the same rules as reminders:
 - **One page is polled per tick**, so a tick costs a single request no matter how many pages are configured — a set of unreachable pages cannot stall the loop long enough for `chime health` to call the heartbeat stale. Configure at most `poll_interval_sec / tick_interval_sec` pages to keep every page on its nominal interval; beyond that they simply poll less often.
 - Requests are conditional (`If-None-Match`) and compressed (`Accept-Encoding: gzip`), so a page with no news usually costs a 304 with no body at all. An instance that returns **no `ETag`** — some Statuspage-compatible feeds are served from other infrastructure and do not — cannot be validated, so every poll downloads the whole feed. gzip keeps that in the single-digit kilobytes; nothing else is needed.
 
+### Knowing the poller is alive
+
+Once every hour the daemon logs one `status poll summary` line at `info`:
+
+```json
+{"message":"status poll summary","window_sec":3600,"pages":5,"polls":60,"not_modified":55,"updated":4,"failed":1,"forwarded":0}
+```
+
+Without it, a working poller is silent: a page with no news answers 304, that path only logs at `debug`, and quiet status pages can go days without an incident. The summary makes "nothing is happening" distinguishable from "the poller is dead" without reading the container's network counters. `failed` counts fetch failures in the window (each is also logged at `warn` as it happens), and `forwarded` counts Discord posts that succeeded. The line is omitted entirely when no `status_pages` are configured. Set `log_level = "debug"` for the per-poll detail.
+
 > [!IMPORTANT]
 >
 > Implications for non-Docker users:
