@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/m1sk9/chime/compare/chime-v0.4.0...chime-v0.5.0) (2026-09-07)
+
+
+### Features
+
+* log an hourly status poll summary and request gzip-compressed feeds ([#48](https://github.com/m1sk9/chime/issues/48)) ([49fec19](https://github.com/m1sk9/chime/commit/49fec1916536cc872b6474db0ef6e67b0375ce1a))
+
 ## [0.4.0](https://github.com/m1sk9/chime/compare/chime-v0.3.4...chime-v0.4.0) (2026-09-03)
 
 
