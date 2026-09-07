@@ -145,6 +145,8 @@ chime **polls** that endpoint — it does not receive an inbound webhook. Nothin
 
 Only Atlassian Statuspage is supported. A URL that is not a Statuspage instance fails at the first poll with `response is not an Atlassian Statuspage incidents feed` — this is logged, not fatal.
 
+A feed is read up to a hard 8 MB ceiling and refused past it with `status page body exceeded 8388608 bytes`. Real feeds measure 40-300 KB, so this only fires on a page that has gone wrong: responses are gzip-encoded, and gzip lets a small download expand into an arbitrarily large buffer, so the limit is on what is decompressed rather than on what is transferred. Like every other polling failure it is logged and retried on the next interval.
+
 The unit of notification is an **incident update**, not an incident: `Investigating → Identified → Monitoring → Resolved` produces four messages, each a separate post rather than an edit of the first. `min_impact` drops incidents below the given severity; an incident whose severity Statuspage reports with a value chime does not recognise is always forwarded rather than silently dropped.
 
 #### What it looks like in Discord
@@ -215,6 +217,17 @@ Status page polling follows the same rules as reminders:
 - A status page being unreachable is logged at `warn` and retried on its own interval. chime never posts about its own polling failures.
 - Because polling happens on the tick, an update is forwarded up to `poll_interval_sec` after Statuspage published it. The embed timestamp always shows the real publication time.
 - **One page is polled per tick**, so a tick costs a single request no matter how many pages are configured — a set of unreachable pages cannot stall the loop long enough for `chime health` to call the heartbeat stale. Configure at most `poll_interval_sec / tick_interval_sec` pages to keep every page on its nominal interval; beyond that they simply poll less often.
+- Requests are conditional (`If-None-Match`) and compressed (`Accept-Encoding: gzip`), so a page with no news usually costs a 304 with no body at all. An instance that returns **no `ETag`** — some Statuspage-compatible feeds are served from other infrastructure and do not — cannot be validated, so every poll downloads the whole feed. gzip keeps that in the single-digit kilobytes; nothing else is needed.
+
+### Knowing the poller is alive
+
+Once every hour the daemon logs one `status poll summary` line at `info`:
+
+```json
+{"timestamp":"2026-06-05T09:00:00.000000Z","level":"INFO","fields":{"message":"status poll summary","window_sec":3600,"pages":5,"polls":60,"not_modified":55,"updated":4,"failed":1,"forwarded":3,"send_failed":1},"target":"chime::scheduler"}
+```
+
+Without it, a working poller is silent: a page with no news answers 304, that path only logs at `debug`, and quiet status pages can go days without an incident. The summary makes "nothing is happening" distinguishable from "the poller is dead" without reading the container's network counters. `not_modified` and `updated` are HTTP outcomes — 304 and 200 — not a count of incidents that moved, so an instance that returns no `ETag` reports every poll as `updated` even when the feed is unchanged. `failed` counts fetch failures in the window (each is also logged at `warn` as it happens), `forwarded` counts Discord posts that succeeded, and `send_failed` counts those Discord rejected (each also logged at `error`) — a nonzero `send_failed` is the difference between a page with no news and a webhook that stopped accepting posts. The line is omitted entirely when no `status_pages` are configured. Set `log_level = "debug"` for the per-poll detail.
 
 > [!IMPORTANT]
 >

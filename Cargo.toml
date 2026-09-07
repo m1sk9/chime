@@ -11,8 +11,12 @@ repository = "https://github.com/m1sk9/chime/"
 anyhow = "1.0.102"
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
 chrono-tz = { version = "0.10.4", features = ["serde"] }
-reqwest = { version = "0.13.0", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.0", default-features = false, features = ["gzip", "json", "rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }
+# Already in the tree via reqwest's `json` feature; promoted to a direct dependency
+# so the incident feed can be parsed from a size-capped buffer instead of
+# `Response::json`, which buffers without a ceiling. Adds no new crate.
+serde_json = "1.0.151"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt", "time", "signal"] }
 toml = "1.1.2"
@@ -21,9 +25,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 url = "2.5.8"
 
 [dev-dependencies]
-# Already in the tree via reqwest's `json` feature; used only to assert the exact
-# webhook payload shape in tests. Not linked into the released binary.
-serde_json = "1.0.150"
 tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt", "time", "signal", "test-util"] }
 
 [profile.release]

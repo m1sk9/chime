@@ -13,6 +13,53 @@ use crate::notifier::{DiscordMessage, Notifier};
 use crate::runtime::{RunConfig, RunStatusPage};
 use crate::status::{Fetched, PageState, StatusSource, build_message, diff};
 
+/// How often the status poller reports that it is alive.
+///
+/// Why this exists at all: a healthy page answers 304 and that path only logs at
+/// `debug!`, so at `log_level = "info"` a fully working poller is indistinguishable
+/// from a dead one for as long as no incident moves — days, on quiet status pages.
+/// Why not a config knob: the interval only has to be shorter than an operator's
+/// patience, and `log_level = "debug"` already exposes per-poll detail when a real
+/// investigation needs it.
+const STATUS_SUMMARY_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// What one poll did, folded into the summary counters by [`PollStats::record`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollOutcome {
+    NotModified,
+    Updated { forwarded: u64, send_failed: u64 },
+    Failed,
+}
+
+/// Counters for one summary window. Reset when the window closes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PollStats {
+    polls: u64,
+    not_modified: u64,
+    updated: u64,
+    failed: u64,
+    forwarded: u64,
+    send_failed: u64,
+}
+
+impl PollStats {
+    fn record(&mut self, outcome: PollOutcome) {
+        self.polls += 1;
+        match outcome {
+            PollOutcome::NotModified => self.not_modified += 1,
+            PollOutcome::Updated {
+                forwarded,
+                send_failed,
+            } => {
+                self.updated += 1;
+                self.forwarded += forwarded;
+                self.send_failed += send_failed;
+            }
+            PollOutcome::Failed => self.failed += 1,
+        }
+    }
+}
+
 pub struct Scheduler<N: Notifier, S: StatusSource> {
     cfg: RunConfig,
     notifier: N,
@@ -20,6 +67,11 @@ pub struct Scheduler<N: Notifier, S: StatusSource> {
     last_fired: HashMap<String, DateTime<Tz>>,
     last_polled: HashMap<String, DateTime<Tz>>,
     page_states: HashMap<String, PageState>,
+    stats: PollStats,
+    /// `None` until the first tick: the window is anchored to a real tick rather
+    /// than to construction, so a scheduler built long before it runs does not
+    /// report an oversized first window.
+    summary_window_start: Option<DateTime<Tz>>,
 }
 
 impl<N: Notifier, S: StatusSource> Scheduler<N, S> {
@@ -31,6 +83,8 @@ impl<N: Notifier, S: StatusSource> Scheduler<N, S> {
             last_fired: HashMap::new(),
             last_polled: HashMap::new(),
             page_states: HashMap::new(),
+            stats: PollStats::default(),
+            summary_window_start: None,
         }
     }
 
@@ -62,6 +116,11 @@ impl<N: Notifier, S: StatusSource> Scheduler<N, S> {
     async fn tick(&mut self, now: DateTime<Tz>) {
         self.write_heartbeat();
         self.fire_reminders(now).await;
+        // Before this tick's poll, not after: the window has to close on the same
+        // boundary it opened on, or the closing tick's poll is counted in the window
+        // that ends and the first window reports one poll more than every window
+        // after it.
+        self.emit_status_summary(now);
         self.poll_status_pages(now).await;
     }
 
@@ -112,7 +171,58 @@ impl<N: Notifier, S: StatusSource> Scheduler<N, S> {
         // interval, not be retried on every tick.
         self.last_polled.insert(page.name.clone(), now);
         let state = self.page_states.entry(page.name.clone()).or_default();
-        poll_page(&self.source, &self.notifier, page, state).await;
+        let outcome = poll_page(&self.source, &self.notifier, page, state).await;
+        self.stats.record(outcome);
+    }
+
+    /// Log the closed summary window, if one is due.
+    fn emit_status_summary(&mut self, now: DateTime<Tz>) {
+        let Some((window_sec, stats)) = self.take_due_summary(now) else {
+            return;
+        };
+        info!(
+            window_sec,
+            pages = self.cfg.status_pages.len(),
+            polls = stats.polls,
+            not_modified = stats.not_modified,
+            updated = stats.updated,
+            failed = stats.failed,
+            forwarded = stats.forwarded,
+            send_failed = stats.send_failed,
+            "status poll summary"
+        );
+    }
+
+    /// Close the summary window and hand back its length and counters, or `None`
+    /// while the window is still open. Split from the logging so the window
+    /// arithmetic is testable without a tracing subscriber.
+    fn take_due_summary(&mut self, now: DateTime<Tz>) -> Option<(i64, PollStats)> {
+        // A reminder-only deployment has no poller to prove alive; staying silent
+        // keeps this out of logs that would never contain a status line anyway.
+        if self.cfg.status_pages.is_empty() {
+            return None;
+        }
+        let Some(start) = self.summary_window_start else {
+            self.summary_window_start = Some(now);
+            return None;
+        };
+        let elapsed = now.signed_duration_since(start).num_seconds();
+        if elapsed < 0 {
+            // A clock stepping backwards must not park the summary until the clock
+            // catches up, so the window is re-anchored here. Why not close it and
+            // report: an NTP correction would emit a rate over a zero-length window
+            // and throw away however much of the hour had already been counted. The
+            // counters ride across instead, so the next `window_sec` covers less
+            // real time than the counters it reports and the implied poll rate runs
+            // high — cheaper than either artifact.
+            self.summary_window_start = Some(now);
+            return None;
+        }
+        if elapsed < STATUS_SUMMARY_INTERVAL.as_secs() as i64 {
+            return None;
+        }
+        self.summary_window_start = Some(now);
+        Some((elapsed, std::mem::take(&mut self.stats)))
     }
 
     fn most_overdue(&self, now: DateTime<Tz>) -> Option<usize> {
@@ -153,7 +263,7 @@ async fn poll_page<N: Notifier, S: StatusSource>(
     notifier: &N,
     page: &RunStatusPage,
     state: &mut PageState,
-) {
+) -> PollOutcome {
     let etag = state.etag.clone();
     let fetched = match source.fetch(&page.api_url, etag.as_deref()).await {
         Ok(f) => f,
@@ -161,35 +271,47 @@ async fn poll_page<N: Notifier, S: StatusSource>(
             // A status page being unreachable is not chime's outage to report:
             // log it and try again next interval, never notify Discord.
             warn!(status_page = %page.name, error = %e, "failed to poll status page");
-            return;
+            return PollOutcome::Failed;
         }
     };
     let (incidents, new_etag) = match fetched {
         Fetched::NotModified => {
             debug!(status_page = %page.name, "status page not modified");
-            return;
+            return PollOutcome::NotModified;
         }
         Fetched::Modified { incidents, etag } => (incidents, etag),
     };
 
     state.etag = new_etag;
     let events = diff(state, &incidents, page.min_impact);
+    let mut forwarded = 0;
+    let mut send_failed = 0;
     for event in events {
         let message = build_message(page, &event);
         match notifier.send(&page.webhook_url, &message).await {
-            Ok(()) => info!(
-                status_page = %page.name,
-                incident = %event.incident_id,
-                state = event.state.label(),
-                "status update forwarded"
-            ),
-            Err(e) => error!(
-                status_page = %page.name,
-                incident = %event.incident_id,
-                error = %e,
-                "failed to forward status update"
-            ),
+            Ok(()) => {
+                forwarded += 1;
+                info!(
+                    status_page = %page.name,
+                    incident = %event.incident_id,
+                    state = event.state.label(),
+                    "status update forwarded"
+                )
+            }
+            Err(e) => {
+                send_failed += 1;
+                error!(
+                    status_page = %page.name,
+                    incident = %event.incident_id,
+                    error = %e,
+                    "failed to forward status update"
+                )
+            }
         }
+    }
+    PollOutcome::Updated {
+        forwarded,
+        send_failed,
     }
 }
 
@@ -263,13 +385,28 @@ mod tests {
         }
     }
 
+    /// Rejects every send, standing in for a webhook Discord no longer accepts.
+    #[derive(Clone)]
+    struct RejectingNotifier;
+
+    impl Notifier for RejectingNotifier {
+        async fn send(&self, _webhook: &Url, _message: &DiscordMessage) -> Result<(), NotifyError> {
+            Err(NotifyError::Status {
+                status: 404,
+                body: "unknown webhook".to_string(),
+            })
+        }
+    }
+
     /// Returns the queued incident lists in order, repeating the last one once the
-    /// queue drains. `fail` makes every fetch error instead.
+    /// queue drains. `fail` makes every fetch error instead, `not_modified` makes
+    /// every fetch answer 304.
     #[derive(Clone)]
     struct FakeSource {
         calls: Arc<AtomicUsize>,
         queue: Arc<Mutex<VecDeque<Vec<Incident>>>>,
         fail: bool,
+        not_modified: bool,
     }
 
     impl FakeSource {
@@ -278,20 +415,27 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 queue: Arc::new(Mutex::new(VecDeque::new())),
                 fail: false,
+                not_modified: false,
             }
         }
 
         fn with(responses: Vec<Vec<Incident>>) -> Self {
             FakeSource {
-                calls: Arc::new(AtomicUsize::new(0)),
                 queue: Arc::new(Mutex::new(responses.into())),
-                fail: false,
+                ..FakeSource::empty()
             }
         }
 
         fn failing() -> Self {
             FakeSource {
                 fail: true,
+                ..FakeSource::empty()
+            }
+        }
+
+        fn unchanged() -> Self {
+            FakeSource {
+                not_modified: true,
                 ..FakeSource::empty()
             }
         }
@@ -309,6 +453,9 @@ mod tests {
                     status: 503,
                     body: "unavailable".to_string(),
                 });
+            }
+            if self.not_modified {
+                return Ok(Fetched::NotModified);
             }
             let mut queue = self.queue.lock().unwrap();
             let incidents = if queue.len() > 1 {
@@ -569,6 +716,186 @@ mod tests {
 
         assert_eq!(scheduler.last_polled["b"], at(9, 5, 0));
         assert_eq!(scheduler.last_polled["a"], at(9, 0, 0), "a waits its turn");
+    }
+
+    #[tokio::test]
+    async fn status_summary_stays_closed_until_the_window_elapses() {
+        let page = mk_run_status_page("claude", Duration::from_secs(300));
+        let cfg = cfg_with("summary_open", vec![], vec![page]);
+        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::unchanged());
+
+        // The window is anchored to the first tick, so that tick reports nothing.
+        scheduler.tick(at(9, 0, 0)).await;
+        assert_eq!(scheduler.take_due_summary(at(9, 0, 0)), None);
+        assert_eq!(scheduler.take_due_summary(at(9, 59, 59)), None);
+        assert!(scheduler.take_due_summary(at(10, 0, 0)).is_some());
+    }
+
+    #[tokio::test]
+    async fn status_summary_counts_every_poll_outcome() {
+        let page = mk_run_status_page("claude", Duration::from_secs(300));
+        let cfg = cfg_with("summary_304", vec![], vec![page]);
+        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::unchanged());
+
+        scheduler.tick(at(9, 0, 0)).await;
+        scheduler.tick(at(9, 5, 0)).await;
+        scheduler.tick(at(9, 10, 0)).await;
+
+        let (window_sec, stats) = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
+        assert_eq!(window_sec, 3600);
+        assert_eq!(
+            stats,
+            PollStats {
+                polls: 3,
+                not_modified: 3,
+                updated: 0,
+                failed: 0,
+                forwarded: 0,
+                send_failed: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn status_summary_counts_failures_and_forwarded_updates() {
+        let backlog = vec![mk_incident(
+            "old",
+            Impact::Minor,
+            vec![mk_update("old1", "resolved", "2026-06-04T10:00:00Z")],
+        )];
+        let mut updated = backlog.clone();
+        updated.push(mk_incident(
+            "new",
+            Impact::Major,
+            vec![mk_update("new1", "investigating", "2026-06-05T09:01:00Z")],
+        ));
+        let page = mk_run_status_page("claude", Duration::from_secs(300));
+        let cfg = cfg_with("summary_mixed", vec![], vec![page]);
+        let mut scheduler = Scheduler::new(
+            cfg,
+            CountingNotifier::new(),
+            FakeSource::with(vec![backlog, updated]),
+        );
+
+        // Cold-start baseline, then one incident that produces a single forward.
+        scheduler.tick(at(9, 0, 0)).await;
+        scheduler.tick(at(9, 5, 0)).await;
+
+        let (_, stats) = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
+        assert_eq!(stats.polls, 2);
+        assert_eq!(stats.updated, 2);
+        assert_eq!(stats.forwarded, 1);
+
+        let failing = cfg_with(
+            "summary_failed",
+            vec![],
+            vec![mk_run_status_page("claude", Duration::from_secs(300))],
+        );
+        let mut scheduler = Scheduler::new(failing, CountingNotifier::new(), FakeSource::failing());
+        scheduler.tick(at(9, 0, 0)).await;
+
+        let (_, stats) = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.forwarded, 0);
+    }
+
+    #[tokio::test]
+    async fn status_summary_separates_a_rejected_post_from_having_nothing_to_post() {
+        let backlog = vec![mk_incident(
+            "old",
+            Impact::Minor,
+            vec![mk_update("old1", "resolved", "2026-06-04T10:00:00Z")],
+        )];
+        let mut updated = backlog.clone();
+        updated.push(mk_incident(
+            "new",
+            Impact::Major,
+            vec![mk_update("new1", "investigating", "2026-06-05T09:01:00Z")],
+        ));
+        let cfg = cfg_with(
+            "summary_send_failed",
+            vec![],
+            vec![mk_run_status_page("claude", Duration::from_secs(300))],
+        );
+        let mut scheduler = Scheduler::new(
+            cfg,
+            RejectingNotifier,
+            FakeSource::with(vec![backlog, updated]),
+        );
+
+        scheduler.tick(at(9, 0, 0)).await;
+        scheduler.tick(at(9, 5, 0)).await;
+
+        let (_, stats) = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
+        assert_eq!(stats.updated, 2);
+        assert_eq!(stats.forwarded, 0);
+        assert_eq!(stats.send_failed, 1);
+    }
+
+    #[tokio::test]
+    async fn status_summary_resets_between_windows() {
+        let page = mk_run_status_page("claude", Duration::from_secs(300));
+        let cfg = cfg_with("summary_reset", vec![], vec![page]);
+        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::unchanged());
+
+        // Three ticks an hour apart. The middle one closes the first window, and
+        // its own poll belongs to the second — every window covers the same number
+        // of ticks, rather than the first one counting both of its boundaries.
+        scheduler.tick(at(9, 0, 0)).await;
+        scheduler.tick(at(10, 0, 0)).await;
+        scheduler.tick(at(11, 0, 0)).await;
+
+        let (_, stats) = scheduler.take_due_summary(at(12, 0, 0)).unwrap();
+        assert_eq!(stats.polls, 1, "only the 11:00 tick is in this window");
+        assert_eq!(stats.not_modified, 1);
+    }
+
+    #[tokio::test]
+    async fn status_summary_window_length_does_not_drift_on_the_first_window() {
+        let page = mk_run_status_page("claude", Duration::from_secs(300));
+        let cfg = cfg_with("summary_first_window", vec![], vec![page]);
+        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::unchanged());
+
+        // Ticks every 30 minutes, so each window holds exactly two of them.
+        for hour in 9..=12 {
+            scheduler.tick(at(hour, 0, 0)).await;
+            scheduler.tick(at(hour, 30, 0)).await;
+        }
+
+        let (window_sec, stats) = scheduler.take_due_summary(at(13, 0, 0)).unwrap();
+        assert_eq!(window_sec, 3600);
+        assert_eq!(stats.polls, 2, "the boundary tick is not counted twice");
+    }
+
+    #[tokio::test]
+    async fn status_summary_is_silent_without_status_pages() {
+        let cfg = cfg_with(
+            "summary_no_pages",
+            vec![mk_run_reminder("daily", 9, 30)],
+            vec![],
+        );
+        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::empty());
+
+        scheduler.tick(at(9, 30, 0)).await;
+        assert_eq!(scheduler.take_due_summary(at(23, 0, 0)), None);
+    }
+
+    #[tokio::test]
+    async fn status_summary_recovers_from_a_backwards_clock() {
+        let page = mk_run_status_page("claude", Duration::from_secs(300));
+        let cfg = cfg_with("summary_backwards", vec![], vec![page]);
+        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::unchanged());
+
+        scheduler.tick(at(9, 0, 0)).await;
+        // Stepping backwards re-anchors the window: nothing is reported over the
+        // negative span, and the counters already gathered survive.
+        assert_eq!(scheduler.take_due_summary(at(8, 0, 0)), None);
+        // The window now runs from the stepped-back time, so the liveness signal
+        // returns one interval later rather than being parked until the clock
+        // catches up to where it was.
+        let (window_sec, stats) = scheduler.take_due_summary(at(9, 0, 0)).unwrap();
+        assert_eq!(window_sec, 3600);
+        assert_eq!(stats.polls, 1, "the pre-step poll is not discarded");
     }
 
     #[test]
