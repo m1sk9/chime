@@ -222,10 +222,10 @@ Status page polling follows the same rules as reminders:
 Once every hour the daemon logs one `status poll summary` line at `info`:
 
 ```json
-{"message":"status poll summary","window_sec":3600,"pages":5,"polls":60,"not_modified":55,"updated":4,"failed":1,"forwarded":0}
+{"message":"status poll summary","window_sec":3600,"pages":5,"polls":60,"not_modified":55,"updated":4,"failed":1,"forwarded":3,"send_failed":1}
 ```
 
-Without it, a working poller is silent: a page with no news answers 304, that path only logs at `debug`, and quiet status pages can go days without an incident. The summary makes "nothing is happening" distinguishable from "the poller is dead" without reading the container's network counters. `failed` counts fetch failures in the window (each is also logged at `warn` as it happens), and `forwarded` counts Discord posts that succeeded. The line is omitted entirely when no `status_pages` are configured. Set `log_level = "debug"` for the per-poll detail.
+Without it, a working poller is silent: a page with no news answers 304, that path only logs at `debug`, and quiet status pages can go days without an incident. The summary makes "nothing is happening" distinguishable from "the poller is dead" without reading the container's network counters. `not_modified` and `updated` are HTTP outcomes — 304 and 200 — not a count of incidents that moved, so an instance that returns no `ETag` reports every poll as `updated` even when the feed is unchanged. `failed` counts fetch failures in the window (each is also logged at `warn` as it happens), `forwarded` counts Discord posts that succeeded, and `send_failed` counts those Discord rejected (each also logged at `error`) — a nonzero `send_failed` is the difference between a page with no news and a webhook that stopped accepting posts. The line is omitted entirely when no `status_pages` are configured. Set `log_level = "debug"` for the per-poll detail.
 
 > [!IMPORTANT]
 >

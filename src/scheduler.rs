@@ -27,7 +27,7 @@ const STATUS_SUMMARY_INTERVAL: Duration = Duration::from_secs(3600);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PollOutcome {
     NotModified,
-    Updated { forwarded: u64 },
+    Updated { forwarded: u64, send_failed: u64 },
     Failed,
 }
 
@@ -39,6 +39,7 @@ struct PollStats {
     updated: u64,
     failed: u64,
     forwarded: u64,
+    send_failed: u64,
 }
 
 impl PollStats {
@@ -46,9 +47,13 @@ impl PollStats {
         self.polls += 1;
         match outcome {
             PollOutcome::NotModified => self.not_modified += 1,
-            PollOutcome::Updated { forwarded } => {
+            PollOutcome::Updated {
+                forwarded,
+                send_failed,
+            } => {
                 self.updated += 1;
                 self.forwarded += forwarded;
+                self.send_failed += send_failed;
             }
             PollOutcome::Failed => self.failed += 1,
         }
@@ -179,6 +184,7 @@ impl<N: Notifier, S: StatusSource> Scheduler<N, S> {
             updated = stats.updated,
             failed = stats.failed,
             forwarded = stats.forwarded,
+            send_failed = stats.send_failed,
             "status poll summary"
         );
     }
@@ -265,6 +271,7 @@ async fn poll_page<N: Notifier, S: StatusSource>(
     state.etag = new_etag;
     let events = diff(state, &incidents, page.min_impact);
     let mut forwarded = 0;
+    let mut send_failed = 0;
     for event in events {
         let message = build_message(page, &event);
         match notifier.send(&page.webhook_url, &message).await {
@@ -277,15 +284,21 @@ async fn poll_page<N: Notifier, S: StatusSource>(
                     "status update forwarded"
                 )
             }
-            Err(e) => error!(
-                status_page = %page.name,
-                incident = %event.incident_id,
-                error = %e,
-                "failed to forward status update"
-            ),
+            Err(e) => {
+                send_failed += 1;
+                error!(
+                    status_page = %page.name,
+                    incident = %event.incident_id,
+                    error = %e,
+                    "failed to forward status update"
+                )
+            }
         }
     }
-    PollOutcome::Updated { forwarded }
+    PollOutcome::Updated {
+        forwarded,
+        send_failed,
+    }
 }
 
 fn is_due(last: Option<&DateTime<Tz>>, poll_interval: Duration, now: DateTime<Tz>) -> bool {
@@ -355,6 +368,19 @@ mod tests {
                 embeds: Vec::new(),
             });
             Ok(())
+        }
+    }
+
+    /// Rejects every send, standing in for a webhook Discord no longer accepts.
+    #[derive(Clone)]
+    struct RejectingNotifier;
+
+    impl Notifier for RejectingNotifier {
+        async fn send(&self, _webhook: &Url, _message: &DiscordMessage) -> Result<(), NotifyError> {
+            Err(NotifyError::Status {
+                status: 404,
+                body: "unknown webhook".to_string(),
+            })
         }
     }
 
@@ -711,6 +737,7 @@ mod tests {
                 updated: 0,
                 failed: 0,
                 forwarded: 0,
+                send_failed: 0,
             }
         );
     }
@@ -756,6 +783,39 @@ mod tests {
         let (_, stats) = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
         assert_eq!(stats.failed, 1);
         assert_eq!(stats.forwarded, 0);
+    }
+
+    #[tokio::test]
+    async fn status_summary_separates_a_rejected_post_from_having_nothing_to_post() {
+        let backlog = vec![mk_incident(
+            "old",
+            Impact::Minor,
+            vec![mk_update("old1", "resolved", "2026-06-04T10:00:00Z")],
+        )];
+        let mut updated = backlog.clone();
+        updated.push(mk_incident(
+            "new",
+            Impact::Major,
+            vec![mk_update("new1", "investigating", "2026-06-05T09:01:00Z")],
+        ));
+        let cfg = cfg_with(
+            "summary_send_failed",
+            vec![],
+            vec![mk_run_status_page("claude", Duration::from_secs(300))],
+        );
+        let mut scheduler = Scheduler::new(
+            cfg,
+            RejectingNotifier,
+            FakeSource::with(vec![backlog, updated]),
+        );
+
+        scheduler.tick(at(9, 0, 0)).await;
+        scheduler.tick(at(9, 5, 0)).await;
+
+        let (_, stats) = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
+        assert_eq!(stats.updated, 2);
+        assert_eq!(stats.forwarded, 0);
+        assert_eq!(stats.send_failed, 1);
     }
 
     #[tokio::test]
