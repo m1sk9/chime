@@ -8,7 +8,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::config::Impact;
-use crate::notifier::{DiscordMessage, Embed, MAX_ERROR_BODY, error_body};
+use crate::notifier::{DiscordMessage, Embed, read_error_body};
 use crate::runtime::RunStatusPage;
 
 /// Path appended to a status page base URL. `incidents.json` is used rather than
@@ -382,22 +382,6 @@ async fn read_capped(resp: &mut Response, limit: usize) -> Result<Vec<u8>, Statu
         push_capped(&mut buf, &chunk, limit)?;
     }
     Ok(buf)
-}
-
-/// Read only as much of a failure body as `error_body` would keep, then drop the
-/// connection. A status page answers 5xx with a full HTML page; there is no
-/// reason to buffer all of it to quote the first 512 bytes. A read error here is
-/// swallowed on purpose — the HTTP status is the finding, and losing the quote is
-/// not worth masking it with a transport error.
-async fn read_error_body(resp: &mut Response) -> String {
-    let mut buf = Vec::new();
-    while buf.len() < MAX_ERROR_BODY {
-        match resp.chunk().await {
-            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
-            Ok(None) | Err(_) => break,
-        }
-    }
-    error_body(&buf)
 }
 
 #[cfg(test)]

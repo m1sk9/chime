@@ -1,8 +1,8 @@
-use reqwest::Client;
+use reqwest::{Client, Response};
 use serde::Serialize;
 use url::Url;
 
-pub(crate) const MAX_ERROR_BODY: usize = 512;
+const MAX_ERROR_BODY: usize = 512;
 
 // Discord counts message limits in characters, not bytes, so every cap here is
 // applied over `chars()` — byte slicing would also split multi-byte UTF-8.
@@ -142,9 +142,39 @@ pub struct EmbedFooter {
 
 /// Cap an error response body before it is attached to an error. Discord and
 /// Statuspage both answer failures with pages that dwarf the useful part.
-pub(crate) fn error_body(bytes: &[u8]) -> String {
+fn error_body(bytes: &[u8]) -> String {
     let end = bytes.len().min(MAX_ERROR_BODY);
     String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// Read only as much of a failure body as [`error_body`] would keep, then leave
+/// the rest on the socket. Discord and Statuspage both answer failures with a
+/// full HTML page, and `Response::bytes` would buffer all of it to quote the
+/// first 512 bytes — with `Accept-Encoding: gzip` on the wire the transferred
+/// size no longer bounds what that costs. A read error here is swallowed on
+/// purpose: the HTTP status is the finding, and losing the quote is not worth
+/// masking it with a transport error.
+pub(crate) async fn read_error_body(resp: &mut Response) -> String {
+    let mut buf = Vec::new();
+    // Ends on a read error as well as on the end of the body — see above.
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        if fill_capped(&mut buf, &chunk) {
+            break;
+        }
+    }
+    error_body(&buf)
+}
+
+/// Append only the part of `chunk` that fits under [`MAX_ERROR_BODY`], and report
+/// whether the buffer is now full.
+///
+/// Why not test `buf.len()` and then append whole chunks: that admits one entire
+/// chunk past the cap, and a chunk is as large as the transport hands over — 4KB
+/// from the gzip decoder, more from an uncompressed read.
+fn fill_capped(buf: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    let take = (MAX_ERROR_BODY - buf.len()).min(chunk.len());
+    buf.extend_from_slice(&chunk[..take]);
+    buf.len() >= MAX_ERROR_BODY
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -174,7 +204,7 @@ impl Discord {
 
 impl Notifier for Discord {
     async fn send(&self, webhook: &Url, message: &DiscordMessage) -> Result<(), NotifyError> {
-        let resp = self
+        let mut resp = self
             .client
             .post(webhook.clone())
             .json(message)
@@ -184,10 +214,9 @@ impl Notifier for Discord {
         if status.is_success() {
             return Ok(());
         }
-        let bytes = resp.bytes().await?;
         Err(NotifyError::Status {
             status: status.as_u16(),
-            body: error_body(&bytes),
+            body: read_error_body(&mut resp).await,
         })
     }
 }
@@ -264,6 +293,32 @@ mod tests {
         let capped = error_body(long.as_bytes());
         assert!(capped.len() < MAX_ERROR_BODY + 4);
         assert_eq!(error_body(b"boom"), "boom");
+    }
+
+    #[test]
+    fn an_oversized_chunk_is_truncated_rather_than_buffered() {
+        let mut buf = Vec::new();
+        let chunk = vec![b'x'; MAX_ERROR_BODY * 4];
+
+        assert!(
+            fill_capped(&mut buf, &chunk),
+            "the buffer reports itself full"
+        );
+        assert_eq!(
+            buf.len(),
+            MAX_ERROR_BODY,
+            "a chunk larger than the cap never lands in memory whole"
+        );
+    }
+
+    #[test]
+    fn chunks_below_the_cap_accumulate_until_it_is_reached() {
+        let mut buf = Vec::new();
+        let chunk = vec![b'x'; MAX_ERROR_BODY / 2];
+
+        assert!(!fill_capped(&mut buf, &chunk), "half a cap is not full");
+        assert!(fill_capped(&mut buf, &chunk), "two halves fill it exactly");
+        assert_eq!(buf.len(), MAX_ERROR_BODY);
     }
 
     #[test]
