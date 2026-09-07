@@ -116,8 +116,12 @@ impl<N: Notifier, S: StatusSource> Scheduler<N, S> {
     async fn tick(&mut self, now: DateTime<Tz>) {
         self.write_heartbeat();
         self.fire_reminders(now).await;
-        self.poll_status_pages(now).await;
+        // Before this tick's poll, not after: the window has to close on the same
+        // boundary it opened on, or the closing tick's poll is counted in the window
+        // that ends and the first window reports one poll more than every window
+        // after it.
         self.emit_status_summary(now);
+        self.poll_status_pages(now).await;
     }
 
     async fn fire_reminders(&mut self, now: DateTime<Tz>) {
@@ -208,8 +212,9 @@ impl<N: Notifier, S: StatusSource> Scheduler<N, S> {
             // catches up, so the window is re-anchored here. Why not close it and
             // report: an NTP correction would emit a rate over a zero-length window
             // and throw away however much of the hour had already been counted. The
-            // counters ride across instead, which overstates the next `window_sec`
-            // by the size of the step — cheaper than either artifact.
+            // counters ride across instead, so the next `window_sec` covers less
+            // real time than the counters it reports and the implied poll rate runs
+            // high — cheaper than either artifact.
             self.summary_window_start = Some(now);
             return None;
         }
@@ -833,11 +838,33 @@ mod tests {
         let cfg = cfg_with("summary_reset", vec![], vec![page]);
         let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::unchanged());
 
+        // Three ticks an hour apart. The middle one closes the first window, and
+        // its own poll belongs to the second — every window covers the same number
+        // of ticks, rather than the first one counting both of its boundaries.
         scheduler.tick(at(9, 0, 0)).await;
-        // Closes the first window; the second must start from zero.
         scheduler.tick(at(10, 0, 0)).await;
-        let (_, stats) = scheduler.take_due_summary(at(11, 0, 0)).unwrap();
-        assert_eq!(stats, PollStats::default());
+        scheduler.tick(at(11, 0, 0)).await;
+
+        let (_, stats) = scheduler.take_due_summary(at(12, 0, 0)).unwrap();
+        assert_eq!(stats.polls, 1, "only the 11:00 tick is in this window");
+        assert_eq!(stats.not_modified, 1);
+    }
+
+    #[tokio::test]
+    async fn status_summary_window_length_does_not_drift_on_the_first_window() {
+        let page = mk_run_status_page("claude", Duration::from_secs(300));
+        let cfg = cfg_with("summary_first_window", vec![], vec![page]);
+        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::unchanged());
+
+        // Ticks every 30 minutes, so each window holds exactly two of them.
+        for hour in 9..=12 {
+            scheduler.tick(at(hour, 0, 0)).await;
+            scheduler.tick(at(hour, 30, 0)).await;
+        }
+
+        let (window_sec, stats) = scheduler.take_due_summary(at(13, 0, 0)).unwrap();
+        assert_eq!(window_sec, 3600);
+        assert_eq!(stats.polls, 2, "the boundary tick is not counted twice");
     }
 
     #[tokio::test]
