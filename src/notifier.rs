@@ -2,7 +2,7 @@ use reqwest::Client;
 use serde::Serialize;
 use url::Url;
 
-const MAX_ERROR_BODY: usize = 512;
+pub(crate) const MAX_ERROR_BODY: usize = 512;
 
 // Discord counts message limits in characters, not bytes, so every cap here is
 // applied over `chars()` — byte slicing would also split multi-byte UTF-8.

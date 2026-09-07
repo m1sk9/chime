@@ -2,13 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use reqwest::Client;
 use reqwest::header::{ACCEPT, ETAG, IF_NONE_MATCH};
+use reqwest::{Client, Response};
 use serde::Deserialize;
 use url::Url;
 
 use crate::config::Impact;
-use crate::notifier::{DiscordMessage, Embed, error_body};
+use crate::notifier::{DiscordMessage, Embed, MAX_ERROR_BODY, error_body};
 use crate::runtime::RunStatusPage;
 
 /// Path appended to a status page base URL. `incidents.json` is used rather than
@@ -19,6 +19,16 @@ pub const INCIDENTS_PATH: &str = "api/v2/incidents.json";
 /// Deliberately shorter than the Discord timeout: this request runs inside the
 /// scheduler tick, so a slow status page must not delay a reminder past its minute.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ceiling on the decompressed size of one incidents feed.
+///
+/// Why this is needed at all: `Response::json`/`bytes` buffer the whole body with
+/// no limit, and once `Accept-Encoding: gzip` is on the wire the transferred size
+/// stops bounding what that costs — gzip reaches roughly 1000:1, so a few hundred
+/// kilobytes of response can become a gigabyte of `Vec<u8>` inside a tick. The
+/// real feeds measure 40-300KB, so this sits far above anything legitimate and
+/// only ever fires on a page that has gone wrong.
+const MAX_BODY: usize = 8 * 1024 * 1024;
 
 const COLOR_RESOLVED: u32 = 0x57F287;
 const COLOR_CRITICAL: u32 = 0xED4245;
@@ -33,7 +43,9 @@ pub enum StatusError {
     #[error("status page returned HTTP {status}: {body}")]
     Status { status: u16, body: String },
     #[error("response is not an Atlassian Statuspage incidents feed: {0}")]
-    Decode(#[source] reqwest::Error),
+    Decode(#[source] serde_json::Error),
+    #[error("status page body exceeded {limit} bytes")]
+    TooLarge { limit: usize },
 }
 
 // Why not `deny_unknown_fields`: every other struct in chime rejects unknown keys,
@@ -322,16 +334,15 @@ impl StatusSource for Statuspage {
         if let Some(tag) = etag {
             request = request.header(IF_NONE_MATCH, tag);
         }
-        let resp = request.send().await?;
+        let mut resp = request.send().await?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(Fetched::NotModified);
         }
         if !status.is_success() {
-            let bytes = resp.bytes().await?;
             return Err(StatusError::Status {
                 status: status.as_u16(),
-                body: error_body(&bytes),
+                body: read_error_body(&mut resp).await,
             });
         }
         let new_etag = resp
@@ -339,7 +350,8 @@ impl StatusSource for Statuspage {
             .get(ETAG)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let body: WireResponse = resp.json().await.map_err(StatusError::Decode)?;
+        let bytes = read_capped(&mut resp, MAX_BODY).await?;
+        let body: WireResponse = serde_json::from_slice(&bytes).map_err(StatusError::Decode)?;
         Ok(Fetched::Modified {
             incidents: body
                 .incidents
@@ -349,6 +361,43 @@ impl StatusSource for Statuspage {
             etag: new_etag,
         })
     }
+}
+
+/// Append `chunk`, or refuse if it would push the buffer past `limit`.
+///
+/// The check happens *before* the copy: a body that blows the ceiling must never
+/// be materialized in order to discover that it was too big.
+fn push_capped(buf: &mut Vec<u8>, chunk: &[u8], limit: usize) -> Result<(), StatusError> {
+    if buf.len() + chunk.len() > limit {
+        return Err(StatusError::TooLarge { limit });
+    }
+    buf.extend_from_slice(chunk);
+    Ok(())
+}
+
+/// Buffer the response body, failing once it passes `limit`.
+async fn read_capped(resp: &mut Response, limit: usize) -> Result<Vec<u8>, StatusError> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        push_capped(&mut buf, &chunk, limit)?;
+    }
+    Ok(buf)
+}
+
+/// Read only as much of a failure body as `error_body` would keep, then drop the
+/// connection. A status page answers 5xx with a full HTML page; there is no
+/// reason to buffer all of it to quote the first 512 bytes. A read error here is
+/// swallowed on purpose — the HTTP status is the finding, and losing the quote is
+/// not worth masking it with a transport error.
+async fn read_error_body(resp: &mut Response) -> String {
+    let mut buf = Vec::new();
+    while buf.len() < MAX_ERROR_BODY {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    error_body(&buf)
 }
 
 #[cfg(test)]
@@ -597,6 +646,29 @@ mod tests {
         assert!(diff(&mut state, &[], Impact::None).is_empty());
         // The baseline survived, so the returning feed reports nothing.
         assert!(diff(&mut state, &baseline, Impact::None).is_empty());
+    }
+
+    #[test]
+    fn a_body_within_the_cap_is_buffered_whole() {
+        let mut buf = Vec::new();
+        assert!(push_capped(&mut buf, b"abc", 6).is_ok());
+        assert!(push_capped(&mut buf, b"def", 6).is_ok());
+        assert_eq!(
+            buf, b"abcdef",
+            "a body exactly at the cap is still accepted"
+        );
+    }
+
+    #[test]
+    fn a_body_over_the_cap_is_rejected_without_being_buffered() {
+        let mut buf = Vec::new();
+        push_capped(&mut buf, b"abcde", 6).unwrap();
+
+        let err = push_capped(&mut buf, b"fg", 6).unwrap_err();
+        assert!(matches!(err, StatusError::TooLarge { limit: 6 }));
+        // The chunk that would have crossed the cap is never copied in, so a
+        // decompression bomb cannot be materialized in order to be detected.
+        assert_eq!(buf, b"abcde");
     }
 
     #[test]

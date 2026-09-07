@@ -145,6 +145,8 @@ chime **polls** that endpoint — it does not receive an inbound webhook. Nothin
 
 Only Atlassian Statuspage is supported. A URL that is not a Statuspage instance fails at the first poll with `response is not an Atlassian Statuspage incidents feed` — this is logged, not fatal.
 
+A feed is read up to a hard 8 MB ceiling and refused past it with `status page body exceeded 8388608 bytes`. Real feeds measure 40-300 KB, so this only fires on a page that has gone wrong: responses are gzip-encoded, and gzip lets a small download expand into an arbitrarily large buffer, so the limit is on what is decompressed rather than on what is transferred. Like every other polling failure it is logged and retried on the next interval.
+
 The unit of notification is an **incident update**, not an incident: `Investigating → Identified → Monitoring → Resolved` produces four messages, each a separate post rather than an edit of the first. `min_impact` drops incidents below the given severity; an incident whose severity Statuspage reports with a value chime does not recognise is always forwarded rather than silently dropped.
 
 #### What it looks like in Discord
