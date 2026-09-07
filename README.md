@@ -215,6 +215,7 @@ Status page polling follows the same rules as reminders:
 - A status page being unreachable is logged at `warn` and retried on its own interval. chime never posts about its own polling failures.
 - Because polling happens on the tick, an update is forwarded up to `poll_interval_sec` after Statuspage published it. The embed timestamp always shows the real publication time.
 - **One page is polled per tick**, so a tick costs a single request no matter how many pages are configured — a set of unreachable pages cannot stall the loop long enough for `chime health` to call the heartbeat stale. Configure at most `poll_interval_sec / tick_interval_sec` pages to keep every page on its nominal interval; beyond that they simply poll less often.
+- Requests are conditional (`If-None-Match`) and compressed (`Accept-Encoding: gzip`), so a page with no news usually costs a 304 with no body at all. An instance that returns **no `ETag`** — some Statuspage-compatible feeds are served from other infrastructure and do not — cannot be validated, so every poll downloads the whole feed. gzip keeps that in the single-digit kilobytes; nothing else is needed.
 
 > [!IMPORTANT]
 >
