@@ -203,12 +203,21 @@ impl<N: Notifier, S: StatusSource> Scheduler<N, S> {
             return None;
         };
         let elapsed = now.signed_duration_since(start).num_seconds();
-        // A clock stepping backwards must not park the summary until it catches up.
-        if (0..STATUS_SUMMARY_INTERVAL.as_secs() as i64).contains(&elapsed) {
+        if elapsed < 0 {
+            // A clock stepping backwards must not park the summary until the clock
+            // catches up, so the window is re-anchored here. Why not close it and
+            // report: an NTP correction would emit a rate over a zero-length window
+            // and throw away however much of the hour had already been counted. The
+            // counters ride across instead, which overstates the next `window_sec`
+            // by the size of the step — cheaper than either artifact.
+            self.summary_window_start = Some(now);
+            return None;
+        }
+        if elapsed < STATUS_SUMMARY_INTERVAL.as_secs() as i64 {
             return None;
         }
         self.summary_window_start = Some(now);
-        Some((elapsed.max(0), std::mem::take(&mut self.stats)))
+        Some((elapsed, std::mem::take(&mut self.stats)))
     }
 
     fn most_overdue(&self, now: DateTime<Tz>) -> Option<usize> {
@@ -851,10 +860,15 @@ mod tests {
         let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::unchanged());
 
         scheduler.tick(at(9, 0, 0)).await;
-        // Stepping backwards closes the window rather than parking it until the
-        // clock catches up, which would suppress the liveness signal for an hour.
-        let (window_sec, _) = scheduler.take_due_summary(at(8, 0, 0)).unwrap();
-        assert_eq!(window_sec, 0);
+        // Stepping backwards re-anchors the window: nothing is reported over the
+        // negative span, and the counters already gathered survive.
+        assert_eq!(scheduler.take_due_summary(at(8, 0, 0)), None);
+        // The window now runs from the stepped-back time, so the liveness signal
+        // returns one interval later rather than being parked until the clock
+        // catches up to where it was.
+        let (window_sec, stats) = scheduler.take_due_summary(at(9, 0, 0)).unwrap();
+        assert_eq!(window_sec, 3600);
+        assert_eq!(stats.polls, 1, "the pre-step poll is not discarded");
     }
 
     #[test]
