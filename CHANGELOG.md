@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.1](https://github.com/m1sk9/chime/compare/chime-v0.5.0...chime-v0.5.1) (2026-09-13)
+
+
+### Miscellaneous
+
+* **deps:** update rust crate reqwest to v0.13.5 ([#50](https://github.com/m1sk9/chime/issues/50)) ([536d0f4](https://github.com/m1sk9/chime/commit/536d0f47f8cb0b0eab9e515b5259b0c83bba7c8a))
+* **deps:** update rust crate toml to v1.1.6 ([#52](https://github.com/m1sk9/chime/issues/52)) ([85c4cf5](https://github.com/m1sk9/chime/commit/85c4cf542b74e018b4fc8da6808234297c5adbdf))
+* **deps:** update taiki-e/install-action digest to 3f74d7c ([#47](https://github.com/m1sk9/chime/issues/47)) ([bb460e6](https://github.com/m1sk9/chime/commit/bb460e67d93fe7327ce212b2b09e43c3b82da409))
+
 ## [0.5.0](https://github.com/m1sk9/chime/compare/chime-v0.4.0...chime-v0.5.0) (2026-09-07)
 
 
