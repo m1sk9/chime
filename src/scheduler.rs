@@ -12,7 +12,8 @@ use url::Url;
 
 use crate::fetch::Fetched;
 use crate::notifier::{DiscordMessage, Notifier, NotifyError};
-use crate::runtime::{RunConfig, RunFeed, RunStatusPage};
+use crate::rss::{self, RssSource, RssState};
+use crate::runtime::{RunConfig, RunFeed, RunRss, RunStatusPage};
 use crate::status::{self, PageState, StatusSource};
 use crate::watch::{self, Diff, FeedState, WatchSource};
 
@@ -84,53 +85,62 @@ impl PollStats {
 /// One pollable entry, addressed by position in its `RunConfig` list. Indexes are
 /// stable because the config is immutable for the life of the scheduler, and two
 /// lists may legitimately share a name. `Ord` is derived on purpose: variant order
-/// then index is the tie-break in `most_overdue`, so pages win an exact tie and
-/// declaration order settles the rest.
+/// then index is the tie-break in `most_overdue`, so pages beat watches, which beat
+/// feeds, on an exact tie — the order of urgency — and declaration order settles
+/// the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Job {
     Page(usize),
     Feed(usize),
+    Rss(usize),
 }
 
-/// One closed summary window. A struct rather than a tuple of two `PollStats`
-/// because the two halves have the same type and would be positionally ambiguous.
+/// One closed summary window. A struct rather than a tuple of `PollStats`
+/// because the parts have the same type and would be positionally ambiguous.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Summary {
     window_sec: i64,
     pages: PollStats,
     watches: PollStats,
+    rss: PollStats,
 }
 
-pub struct Scheduler<N: Notifier, S: StatusSource, W: WatchSource> {
+pub struct Scheduler<N: Notifier, S: StatusSource, W: WatchSource, R: RssSource> {
     cfg: RunConfig,
     notifier: N,
     source: S,
     watch_source: W,
+    rss_source: R,
     last_fired: HashMap<String, DateTime<Tz>>,
     last_polled: HashMap<Job, DateTime<Tz>>,
     page_states: HashMap<String, PageState>,
     feed_states: HashMap<usize, FeedState>,
+    rss_states: HashMap<usize, RssState>,
     stats: PollStats,
     watch_stats: PollStats,
+    rss_stats: PollStats,
     /// `None` until the first tick: the window is anchored to a real tick rather
     /// than to construction, so a scheduler built long before it runs does not
     /// report an oversized first window.
     summary_window_start: Option<DateTime<Tz>>,
 }
 
-impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
-    pub fn new(cfg: RunConfig, notifier: N, source: S, watch_source: W) -> Self {
+impl<N: Notifier, S: StatusSource, W: WatchSource, R: RssSource> Scheduler<N, S, W, R> {
+    pub fn new(cfg: RunConfig, notifier: N, source: S, watch_source: W, rss_source: R) -> Self {
         Scheduler {
             cfg,
             notifier,
             source,
             watch_source,
+            rss_source,
             last_fired: HashMap::new(),
             last_polled: HashMap::new(),
             page_states: HashMap::new(),
             feed_states: HashMap::new(),
+            rss_states: HashMap::new(),
             stats: PollStats::default(),
             watch_stats: PollStats::default(),
+            rss_stats: PollStats::default(),
             summary_window_start: None,
         }
     }
@@ -201,13 +211,13 @@ impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
         }
     }
 
-    /// Poll at most one status page or watch per tick.
+    /// Poll at most one status page, watch or feed per tick.
     ///
     /// The heartbeat is written once, at the top of the tick, and `chime health`
-    /// calls it stale past `2 * tick_interval`. Polling every due page and watch in
+    /// calls it stale past `2 * tick_interval`. Polling every due entry in
     /// one tick would let N endpoints behind a network partition hold the tick for
     /// `N * FETCH_TIMEOUT` and get the container restarted over someone else's
-    /// outage. One fetch per tick — shared by both lists — bounds that however many
+    /// outage. One fetch per tick — shared by all lists — bounds that however many
     /// are configured, and picking the most overdue one keeps them from staying in
     /// the lockstep they start in — every entry is due on the very first tick.
     async fn poll_one(&mut self, now: DateTime<Tz>) {
@@ -217,8 +227,8 @@ impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
         // Recorded before the request: a slow or failing endpoint must wait out its
         // own interval, not be retried on every tick.
         self.last_polled.insert(job, now);
-        // Borrows are split by field rather than cloning the entry: `poll_page` and
-        // `poll_feed` are free functions so `cfg`, the state maps, the sources and
+        // Borrows are split by field rather than cloning the entry: `poll_page`,
+        // `poll_feed` and `poll_rss` are free functions so `cfg`, the state maps, the sources and
         // `notifier` can be held at once.
         let notifier = Heartbeating {
             inner: &self.notifier,
@@ -238,6 +248,13 @@ impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
                 let outcome =
                     poll_feed(&self.watch_source, &notifier, feed, state, detected_at).await;
                 self.watch_stats.record(outcome);
+            }
+            Job::Rss(i) => {
+                let feed = &self.cfg.rss[i];
+                let state = self.rss_states.entry(i).or_default();
+                let detected_at = now.with_timezone(&Utc);
+                let outcome = poll_rss(&self.rss_source, &notifier, feed, state, detected_at).await;
+                self.rss_stats.record(outcome);
             }
         }
     }
@@ -276,6 +293,20 @@ impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
                 "watch poll summary"
             );
         }
+        if !self.cfg.rss.is_empty() {
+            let stats = summary.rss;
+            info!(
+                window_sec,
+                feeds = self.cfg.rss.len(),
+                polls = stats.polls,
+                not_modified = stats.not_modified,
+                updated = stats.updated,
+                failed = stats.failed,
+                forwarded = stats.forwarded,
+                send_failed = stats.send_failed,
+                "rss poll summary"
+            );
+        }
     }
 
     /// Close the summary window and hand back its length and counters, or `None`
@@ -284,7 +315,8 @@ impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
     fn take_due_summary(&mut self, now: DateTime<Tz>) -> Option<Summary> {
         // A reminder-only deployment has no poller to prove alive; staying silent
         // keeps this out of logs that would never contain a poll line anyway.
-        if self.cfg.status_pages.is_empty() && self.cfg.feeds.is_empty() {
+        if self.cfg.status_pages.is_empty() && self.cfg.feeds.is_empty() && self.cfg.rss.is_empty()
+        {
             return None;
         }
         let Some(start) = self.summary_window_start else {
@@ -311,16 +343,18 @@ impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
             window_sec: elapsed,
             pages: std::mem::take(&mut self.stats),
             watches: std::mem::take(&mut self.watch_stats),
+            rss: std::mem::take(&mut self.rss_stats),
         })
     }
 
-    /// Every pollable entry with its interval, pages first.
+    /// Every pollable entry with its interval, in `Job` order.
     fn jobs(&self) -> impl Iterator<Item = (Job, Duration)> + '_ {
         let pages = (self.cfg.status_pages.iter().enumerate())
             .map(|(i, p)| (Job::Page(i), p.poll_interval));
         let feeds =
             (self.cfg.feeds.iter().enumerate()).map(|(i, f)| (Job::Feed(i), f.poll_interval));
-        pages.chain(feeds)
+        let rss = (self.cfg.rss.iter().enumerate()).map(|(i, r)| (Job::Rss(i), r.poll_interval));
+        pages.chain(feeds).chain(rss)
     }
 
     fn most_overdue(&self, now: DateTime<Tz>) -> Option<Job> {
@@ -504,6 +538,66 @@ async fn poll_feed<N: Notifier, W: WatchSource>(
     }
 }
 
+async fn poll_rss<N: Notifier, R: RssSource>(
+    source: &R,
+    notifier: &N,
+    feed: &RunRss,
+    state: &mut RssState,
+    detected_at: DateTime<Utc>,
+) -> PollOutcome {
+    let fetched = match source.fetch(&feed.url, state.etag()).await {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(rss = %feed.name, error = %e, "failed to poll rss feed");
+            return PollOutcome::Failed;
+        }
+    };
+    let (body, etag) = match fetched {
+        Fetched::NotModified => {
+            debug!(rss = %feed.name, "rss feed not modified");
+            return PollOutcome::NotModified;
+        }
+        Fetched::Modified { value, etag } => (value, etag),
+    };
+    let entries = match rss::read_feed(state, &body, &feed.url, etag) {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!(rss = %feed.name, error = %e, "failed to parse rss feed");
+            return PollOutcome::Failed;
+        }
+    };
+
+    let first_poll = !state.is_initialized();
+    let events = rss::diff(state, &entries);
+    if first_poll {
+        info!(rss = %feed.name, entries = entries.len(), "rss baseline recorded");
+    }
+    let mut forwarded = 0;
+    let mut send_failed = 0;
+    for entry in &events {
+        let message = rss::build_message(feed, entry, detected_at);
+        match notifier.send(&feed.webhook_url, &message).await {
+            Ok(()) => {
+                forwarded += 1;
+                info!(rss = %feed.name, entry = %entry.id, "rss entry forwarded");
+            }
+            Err(e) => {
+                send_failed += 1;
+                error!(
+                    rss = %feed.name,
+                    entry = %entry.id,
+                    error = %e,
+                    "failed to forward rss entry"
+                );
+            }
+        }
+    }
+    PollOutcome::Updated {
+        forwarded,
+        send_failed,
+    }
+}
+
 fn is_due(last: Option<&DateTime<Tz>>, poll_interval: Duration, now: DateTime<Tz>) -> bool {
     match last {
         None => true,
@@ -535,7 +629,7 @@ mod tests {
     use crate::config::{Impact, LogLevel};
     use crate::fetch::FetchError;
     use crate::runtime::{
-        RunReminder, mk_run_feed, mk_run_status_page, mk_run_watch, mk_shared_feed,
+        RunReminder, mk_run_feed, mk_run_rss, mk_run_status_page, mk_run_watch, mk_shared_feed,
     };
     use crate::status::{Incident, StatusError, mk_incident, mk_update};
     use chrono::TimeZone;
@@ -549,6 +643,7 @@ mod tests {
         count: Arc<AtomicUsize>,
         messages: Arc<Mutex<Vec<DiscordMessage>>>,
         timestamps: Arc<Mutex<Vec<Option<String>>>>,
+        titles: Arc<Mutex<Vec<String>>>,
     }
 
     impl CountingNotifier {
@@ -557,6 +652,7 @@ mod tests {
                 count: Arc::new(AtomicUsize::new(0)),
                 messages: Arc::new(Mutex::new(Vec::new())),
                 timestamps: Arc::new(Mutex::new(Vec::new())),
+                titles: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -572,6 +668,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(message.embeds.first().and_then(|e| e.timestamp.clone()));
+            if let Some(embed) = message.embeds.first() {
+                self.titles.lock().unwrap().push(embed.title.clone());
+            }
             self.messages.lock().unwrap().push(DiscordMessage {
                 content: message.content.clone(),
                 username: message.username.clone(),
@@ -671,9 +770,10 @@ mod tests {
         }
     }
 
-    /// Returns the queued JSON bodies in order, repeating the last one once the
-    /// queue drains, with the same `fail` / `not_modified` switches as
-    /// `FakeSource`. Every `If-None-Match` it receives is recorded in `seen_etags`.
+    /// Returns the queued bodies in order, repeating the last one once the queue
+    /// drains, with the same `fail` / `not_modified` switches as `FakeSource`.
+    /// Every `If-None-Match` it receives is recorded in `seen_etags`. Serves the
+    /// rss list as well, as `FakeRssSource`.
     #[derive(Clone)]
     struct FakeWatchSource {
         calls: Arc<AtomicUsize>,
@@ -682,6 +782,8 @@ mod tests {
         fail: bool,
         not_modified: bool,
     }
+
+    type FakeRssSource = FakeWatchSource;
 
     impl FakeWatchSource {
         fn empty() -> Self {
@@ -694,10 +796,13 @@ mod tests {
             }
         }
 
-        fn with(bodies: Vec<&str>) -> Self {
+        fn with<B: AsRef<str>>(bodies: Vec<B>) -> Self {
             FakeWatchSource {
                 queue: Arc::new(Mutex::new(
-                    bodies.into_iter().map(|b| b.as_bytes().to_vec()).collect(),
+                    bodies
+                        .into_iter()
+                        .map(|b| b.as_ref().as_bytes().to_vec())
+                        .collect(),
                 )),
                 ..FakeWatchSource::empty()
             }
@@ -720,14 +825,8 @@ mod tests {
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
         }
-    }
 
-    impl WatchSource for FakeWatchSource {
-        async fn fetch(
-            &self,
-            _url: &Url,
-            etag: Option<&str>,
-        ) -> Result<Fetched<Vec<u8>>, FetchError> {
+        fn respond(&self, etag: Option<&str>) -> Result<Fetched<Vec<u8>>, FetchError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.seen_etags
                 .lock()
@@ -755,14 +854,65 @@ mod tests {
         }
     }
 
-    /// A scheduler whose watch source is never consulted, for tests that do not
-    /// configure watches.
+    impl WatchSource for FakeWatchSource {
+        async fn fetch(
+            &self,
+            _url: &Url,
+            etag: Option<&str>,
+        ) -> Result<Fetched<Vec<u8>>, FetchError> {
+            self.respond(etag)
+        }
+    }
+
+    impl RssSource for FakeWatchSource {
+        async fn fetch(
+            &self,
+            _url: &Url,
+            etag: Option<&str>,
+        ) -> Result<Fetched<Vec<u8>>, FetchError> {
+            self.respond(etag)
+        }
+    }
+
+    /// A scheduler whose watch and rss sources are never consulted, for tests that
+    /// configure neither.
     fn sched<N: Notifier, S: StatusSource>(
         cfg: RunConfig,
         notifier: N,
         source: S,
-    ) -> Scheduler<N, S, FakeWatchSource> {
-        Scheduler::new(cfg, notifier, source, FakeWatchSource::unchanged())
+    ) -> Scheduler<N, S, FakeWatchSource, FakeRssSource> {
+        sched_with_watches(cfg, notifier, source, FakeWatchSource::unchanged())
+    }
+
+    /// A scheduler whose rss source is never consulted.
+    fn sched_with_watches<N: Notifier, S: StatusSource, W: WatchSource>(
+        cfg: RunConfig,
+        notifier: N,
+        source: S,
+        watch_source: W,
+    ) -> Scheduler<N, S, W, FakeRssSource> {
+        Scheduler::new(
+            cfg,
+            notifier,
+            source,
+            watch_source,
+            FakeRssSource::unchanged(),
+        )
+    }
+
+    /// A scheduler whose status and watch sources are never consulted.
+    fn sched_with_rss<N: Notifier, R: RssSource>(
+        cfg: RunConfig,
+        notifier: N,
+        rss_source: R,
+    ) -> Scheduler<N, FakeSource, FakeWatchSource, R> {
+        Scheduler::new(
+            cfg,
+            notifier,
+            FakeSource::empty(),
+            FakeWatchSource::unchanged(),
+            rss_source,
+        )
     }
 
     fn mk_run_reminder(name: &str, hour: u32, minute: u32) -> RunReminder {
@@ -807,6 +957,20 @@ mod tests {
         status_pages: Vec<RunStatusPage>,
         feeds: Vec<RunFeed>,
     ) -> RunConfig {
+        cfg_with_all(tag, reminders, status_pages, feeds, Vec::new())
+    }
+
+    fn cfg_with_rss(tag: &str, rss: Vec<RunRss>) -> RunConfig {
+        cfg_with_all(tag, Vec::new(), Vec::new(), Vec::new(), rss)
+    }
+
+    fn cfg_with_all(
+        tag: &str,
+        reminders: Vec<RunReminder>,
+        status_pages: Vec<RunStatusPage>,
+        feeds: Vec<RunFeed>,
+        rss: Vec<RunRss>,
+    ) -> RunConfig {
         RunConfig {
             log_level: LogLevel::Info,
             interval: Duration::from_secs(30),
@@ -814,6 +978,7 @@ mod tests {
             reminders,
             status_pages,
             feeds,
+            rss,
             heartbeat_path: hb_path(tag),
         }
     }
@@ -1180,7 +1345,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn summary_is_silent_without_pages_or_watches() {
+    async fn summary_is_silent_without_pages_watches_or_feeds() {
         let cfg = cfg_with(
             "summary_no_pages",
             vec![mk_run_reminder("daily", 9, 30)],
@@ -1223,7 +1388,7 @@ mod tests {
     async fn watch_is_polled_once_per_interval() {
         let source = FakeWatchSource::with(vec![r#"{"version":"1"}"#]);
         let cfg = one_watch("watch_interval");
-        let mut scheduler = Scheduler::new(
+        let mut scheduler = sched_with_watches(
             cfg,
             CountingNotifier::new(),
             FakeSource::empty(),
@@ -1243,7 +1408,7 @@ mod tests {
         let notifier = CountingNotifier::new();
         let source = FakeWatchSource::with(vec![r#"{"version":"1"}"#]);
         let cfg = one_watch("watch_cold");
-        let mut scheduler = Scheduler::new(cfg, notifier.clone(), FakeSource::empty(), source);
+        let mut scheduler = sched_with_watches(cfg, notifier.clone(), FakeSource::empty(), source);
 
         scheduler.tick(at(9, 0, 0)).await;
         assert_eq!(notifier.sent(), 0);
@@ -1254,7 +1419,7 @@ mod tests {
         let notifier = CountingNotifier::new();
         let source = FakeWatchSource::with(vec![r#"{"version":"1"}"#, r#"{"version":"2"}"#]);
         let cfg = one_watch("watch_forward");
-        let mut scheduler = Scheduler::new(cfg, notifier.clone(), FakeSource::empty(), source);
+        let mut scheduler = sched_with_watches(cfg, notifier.clone(), FakeSource::empty(), source);
 
         scheduler.tick(at(9, 0, 0)).await;
         scheduler.tick(at(9, 5, 0)).await;
@@ -1270,7 +1435,7 @@ mod tests {
         let notifier = CountingNotifier::new();
         let source = FakeWatchSource::with(vec![r#"{"version":"1"}"#, r#"{"version":"2"}"#]);
         let cfg = one_watch("watch_detected_at");
-        let mut scheduler = Scheduler::new(cfg, notifier.clone(), FakeSource::empty(), source);
+        let mut scheduler = sched_with_watches(cfg, notifier.clone(), FakeSource::empty(), source);
 
         scheduler.tick(at(9, 0, 0)).await;
         scheduler.tick(at(9, 5, 0)).await;
@@ -1288,7 +1453,7 @@ mod tests {
         let source = FakeWatchSource::with(vec![r#"{"version":"1"}"#]);
         let cfg = one_watch("watch_same");
         let mut scheduler =
-            Scheduler::new(cfg, notifier.clone(), FakeSource::empty(), source.clone());
+            sched_with_watches(cfg, notifier.clone(), FakeSource::empty(), source.clone());
 
         scheduler.tick(at(9, 0, 0)).await;
         scheduler.tick(at(9, 5, 0)).await;
@@ -1309,7 +1474,7 @@ mod tests {
             vec![mk_run_feed("node", Duration::from_secs(60))],
         );
         let mut scheduler =
-            Scheduler::new(cfg, notifier.clone(), FakeSource::empty(), source.clone());
+            sched_with_watches(cfg, notifier.clone(), FakeSource::empty(), source.clone());
 
         scheduler.tick(at(9, 30, 0)).await;
         scheduler.tick(at(9, 31, 0)).await;
@@ -1322,7 +1487,7 @@ mod tests {
     async fn extract_failure_does_not_store_the_etag() {
         let source = FakeWatchSource::with(vec![r#"{"nope":1}"#, r#"{"version":"1"}"#]);
         let cfg = one_watch("watch_etag");
-        let mut scheduler = Scheduler::new(
+        let mut scheduler = sched_with_watches(
             cfg,
             CountingNotifier::new(),
             FakeSource::empty(),
@@ -1351,7 +1516,7 @@ mod tests {
             vec![mk_run_feed("node", Duration::from_secs(60))],
         );
         let mut scheduler =
-            Scheduler::new(cfg, CountingNotifier::new(), pages.clone(), watches.clone());
+            sched_with_watches(cfg, CountingNotifier::new(), pages.clone(), watches.clone());
 
         scheduler.tick(at(9, 0, 0)).await;
         assert_eq!(pages.calls() + watches.calls(), 1);
@@ -1371,7 +1536,7 @@ mod tests {
         let watches = FakeWatchSource::with(vec![r#"{"version":"1"}"#]);
         let pages = FakeSource::empty();
         let mut scheduler =
-            Scheduler::new(cfg, CountingNotifier::new(), pages.clone(), watches.clone());
+            sched_with_watches(cfg, CountingNotifier::new(), pages.clone(), watches.clone());
         scheduler.last_polled.insert(Job::Page(0), at(9, 0, 0));
         scheduler.last_polled.insert(Job::Feed(0), at(8, 0, 0));
 
@@ -1392,7 +1557,7 @@ mod tests {
         let watches = FakeWatchSource::with(vec![r#"{"version":"1"}"#]);
         let pages = FakeSource::empty();
         let mut scheduler =
-            Scheduler::new(cfg, CountingNotifier::new(), pages.clone(), watches.clone());
+            sched_with_watches(cfg, CountingNotifier::new(), pages.clone(), watches.clone());
 
         // Neither has been polled, so both are infinitely overdue.
         scheduler.tick(at(9, 0, 0)).await;
@@ -1412,7 +1577,7 @@ mod tests {
                 mk_run_feed("bad", Duration::from_secs(300)),
             ],
         );
-        let mut scheduler = Scheduler::new(cfg, RejectingNotifier, FakeSource::empty(), {
+        let mut scheduler = sched_with_watches(cfg, RejectingNotifier, FakeSource::empty(), {
             // `ok` and `bad` share the fake, so its queue is consumed in poll order:
             // ok=1 (baseline), bad={} (extract failure), ok=2 (change, rejected post).
             FakeWatchSource::with(vec![r#"{"version":"1"}"#, r#"{}"#, r#"{"version":"2"}"#])
@@ -1442,7 +1607,7 @@ mod tests {
         let source = FakeWatchSource::unchanged();
         let cfg = one_watch("watch_summary_only");
         let mut scheduler =
-            Scheduler::new(cfg, CountingNotifier::new(), FakeSource::empty(), source);
+            sched_with_watches(cfg, CountingNotifier::new(), FakeSource::empty(), source);
 
         scheduler.tick(at(9, 0, 0)).await;
 
@@ -1474,7 +1639,7 @@ mod tests {
             )],
         );
         let mut scheduler =
-            Scheduler::new(cfg, notifier.clone(), FakeSource::empty(), source.clone());
+            sched_with_watches(cfg, notifier.clone(), FakeSource::empty(), source.clone());
 
         scheduler.tick(at(9, 0, 0)).await;
         assert_eq!(source.calls(), 1, "both watches baselined from one request");
@@ -1504,7 +1669,7 @@ mod tests {
             )],
         );
         let mut scheduler =
-            Scheduler::new(cfg, notifier.clone(), FakeSource::empty(), source.clone());
+            sched_with_watches(cfg, notifier.clone(), FakeSource::empty(), source.clone());
 
         scheduler.tick(at(9, 0, 0)).await;
         scheduler.tick(at(9, 5, 0)).await;
@@ -1555,7 +1720,7 @@ mod tests {
         cfg.heartbeat_path = path.clone();
         let notifier = HeartbeatEatingNotifier { path: path.clone() };
         let source = FakeWatchSource::with(vec![r#"{"version":"1"}"#, r#"{"version":"2"}"#]);
-        let mut scheduler = Scheduler::new(cfg, notifier, FakeSource::empty(), source);
+        let mut scheduler = sched_with_watches(cfg, notifier, FakeSource::empty(), source);
 
         // 09:30 sends the reminder; 09:35 sends the release.
         scheduler.tick(at(9, 30, 0)).await;
@@ -1563,6 +1728,262 @@ mod tests {
         scheduler.tick(at(9, 35, 0)).await;
         assert!(path.exists(), "rewritten after the release was sent");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// An RSS 2.0 body of `(guid, pubDate)` items, titled after their guid.
+    fn rss_body(items: &[(&str, &str)]) -> String {
+        let items: String = items
+            .iter()
+            .map(|(guid, date)| {
+                format!(
+                    "<item><title>{guid}</title><guid>{guid}</guid><pubDate>{date}</pubDate></item>"
+                )
+            })
+            .collect();
+        format!("<rss version=\"2.0\"><channel><title>t</title>{items}</channel></rss>")
+    }
+
+    const OLD: (&str, &str) = ("old", "Mon, 01 Jun 2026 00:00:00 GMT");
+
+    fn one_rss(tag: &str) -> RunConfig {
+        cfg_with_rss(tag, vec![mk_run_rss("news", Duration::from_secs(900))])
+    }
+
+    #[tokio::test]
+    async fn rss_feed_is_polled_once_per_interval() {
+        let source = FakeRssSource::with(vec![rss_body(&[OLD])]);
+        let mut scheduler = sched_with_rss(
+            one_rss("rss_interval"),
+            CountingNotifier::new(),
+            source.clone(),
+        );
+
+        scheduler.tick(at(9, 0, 0)).await;
+        assert_eq!(source.calls(), 1);
+        scheduler.tick(at(9, 14, 59)).await;
+        assert_eq!(source.calls(), 1);
+        scheduler.tick(at(9, 15, 0)).await;
+        assert_eq!(source.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn first_rss_poll_does_not_forward_existing_entries() {
+        let notifier = CountingNotifier::new();
+        let source = FakeRssSource::with(vec![rss_body(&[
+            OLD,
+            ("older", "Sun, 31 May 2026 00:00:00 GMT"),
+        ])]);
+        let mut scheduler = sched_with_rss(one_rss("rss_baseline"), notifier.clone(), source);
+
+        scheduler.tick(at(9, 0, 0)).await;
+
+        assert_eq!(notifier.sent(), 0);
+    }
+
+    #[tokio::test]
+    async fn new_rss_entries_are_forwarded_oldest_first() {
+        let notifier = CountingNotifier::new();
+        let source = FakeRssSource::with(vec![
+            rss_body(&[OLD]),
+            rss_body(&[
+                ("newer", "Wed, 03 Jun 2026 00:00:00 GMT"),
+                ("older", "Tue, 02 Jun 2026 00:00:00 GMT"),
+                OLD,
+            ]),
+        ]);
+        let mut scheduler = sched_with_rss(one_rss("rss_new"), notifier.clone(), source);
+
+        scheduler.tick(at(9, 0, 0)).await;
+        scheduler.tick(at(9, 15, 0)).await;
+
+        assert_eq!(*notifier.titles.lock().unwrap(), ["older", "newer"]);
+        let sent = notifier.messages.lock().unwrap();
+        assert!(
+            sent.iter()
+                .all(|m| m.username.as_deref() == Some("news Feed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_rss_body_posts_nothing() {
+        let notifier = CountingNotifier::new();
+        let source = FakeRssSource::with(vec![rss_body(&[OLD])]);
+        let mut scheduler =
+            sched_with_rss(one_rss("rss_unchanged"), notifier.clone(), source.clone());
+
+        scheduler.tick(at(9, 0, 0)).await;
+        scheduler.tick(at(9, 15, 0)).await;
+        scheduler.tick(at(9, 30, 0)).await;
+
+        assert_eq!(source.calls(), 3);
+        assert_eq!(notifier.sent(), 0);
+    }
+
+    #[tokio::test]
+    async fn rss_poll_failure_does_not_stop_the_loop() {
+        let notifier = CountingNotifier::new();
+        let cfg = cfg_with_all(
+            "rss_failure",
+            vec![mk_run_reminder("daily", 9, 15)],
+            vec![],
+            vec![],
+            vec![mk_run_rss("news", Duration::from_secs(900))],
+        );
+        let source = FakeRssSource::failing();
+        let mut scheduler = sched_with_rss(cfg, notifier.clone(), source.clone());
+
+        scheduler.tick(at(9, 0, 0)).await;
+        scheduler.tick(at(9, 15, 0)).await;
+
+        assert_eq!(source.calls(), 2);
+        assert_eq!(notifier.sent(), 1, "the reminder still fires");
+    }
+
+    #[tokio::test]
+    async fn rss_parse_failure_keeps_the_last_good_etag_and_counts_as_failed() {
+        let good = rss_body(&[OLD]);
+        let source = FakeRssSource::with(vec![
+            good.clone(),
+            "<html>maintenance</html>".to_string(),
+            good,
+        ]);
+        let mut scheduler = sched_with_rss(
+            one_rss("rss_parse_failure"),
+            CountingNotifier::new(),
+            source.clone(),
+        );
+
+        scheduler.tick(at(9, 0, 0)).await;
+        scheduler.tick(at(9, 15, 0)).await;
+        scheduler.tick(at(9, 30, 0)).await;
+
+        let fake = Some("W/\"fake\"".to_string());
+        assert_eq!(
+            *source.seen_etags.lock().unwrap(),
+            [None, fake.clone(), fake]
+        );
+        let summary = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
+        assert_eq!(summary.rss.failed, 1);
+        assert_eq!(summary.rss.updated, 2);
+    }
+
+    #[tokio::test]
+    async fn a_watch_outranks_an_rss_feed_on_an_exact_tie() {
+        let cfg = cfg_with_all(
+            "rss_tie_watch",
+            vec![],
+            vec![],
+            vec![mk_run_feed("node", Duration::from_secs(60))],
+            vec![mk_run_rss("news", Duration::from_secs(60))],
+        );
+        let watches = FakeWatchSource::with(vec![r#"{"version":"1"}"#]);
+        let rss = FakeRssSource::with(vec![rss_body(&[OLD])]);
+        let mut scheduler = Scheduler::new(
+            cfg,
+            CountingNotifier::new(),
+            FakeSource::empty(),
+            watches.clone(),
+            rss.clone(),
+        );
+
+        scheduler.tick(at(9, 0, 0)).await;
+
+        assert_eq!(watches.calls(), 1);
+        assert_eq!(rss.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_page_outranks_an_rss_feed_on_an_exact_tie() {
+        let cfg = cfg_with_all(
+            "rss_tie_page",
+            vec![],
+            vec![mk_run_status_page("claude", Duration::from_secs(60))],
+            vec![],
+            vec![mk_run_rss("news", Duration::from_secs(60))],
+        );
+        let pages = FakeSource::empty();
+        let rss = FakeRssSource::with(vec![rss_body(&[OLD])]);
+        let mut scheduler = Scheduler::new(
+            cfg,
+            CountingNotifier::new(),
+            pages.clone(),
+            FakeWatchSource::unchanged(),
+            rss.clone(),
+        );
+
+        scheduler.tick(at(9, 0, 0)).await;
+
+        assert_eq!(pages.calls(), 1);
+        assert_eq!(rss.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn pages_watches_and_feeds_share_the_one_poll_per_tick_budget() {
+        let cfg = cfg_with_all(
+            "rss_shared_budget",
+            vec![],
+            vec![mk_run_status_page("claude", Duration::from_secs(60))],
+            vec![mk_run_feed("node", Duration::from_secs(60))],
+            vec![mk_run_rss("news", Duration::from_secs(60))],
+        );
+        let pages = FakeSource::empty();
+        let watches = FakeWatchSource::with(vec![r#"{"version":"1"}"#]);
+        let rss = FakeRssSource::with(vec![rss_body(&[OLD])]);
+        let mut scheduler = Scheduler::new(
+            cfg,
+            CountingNotifier::new(),
+            pages.clone(),
+            watches.clone(),
+            rss.clone(),
+        );
+
+        for (second, polls) in [(0, 1), (1, 2), (2, 3)] {
+            scheduler.tick(at(9, 0, second)).await;
+            assert_eq!(pages.calls() + watches.calls() + rss.calls(), polls);
+        }
+        assert_eq!((pages.calls(), watches.calls(), rss.calls()), (1, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn rss_summary_counts_every_poll_outcome() {
+        let source = FakeRssSource::with(vec![
+            rss_body(&[OLD]),
+            rss_body(&[("new", "Tue, 02 Jun 2026 00:00:00 GMT"), OLD]),
+        ]);
+        let mut scheduler = sched_with_rss(one_rss("rss_summary"), RejectingNotifier, source);
+
+        scheduler.tick(at(9, 0, 0)).await;
+        scheduler.tick(at(9, 15, 0)).await;
+
+        let summary = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
+        assert_eq!(summary.pages, PollStats::default());
+        assert_eq!(summary.watches, PollStats::default());
+        assert_eq!(
+            summary.rss,
+            PollStats {
+                polls: 2,
+                not_modified: 0,
+                updated: 2,
+                failed: 0,
+                forwarded: 0,
+                send_failed: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rss_summary_is_emitted_without_pages_or_watches() {
+        let mut scheduler = sched_with_rss(
+            one_rss("rss_summary_only"),
+            CountingNotifier::new(),
+            FakeRssSource::unchanged(),
+        );
+
+        scheduler.tick(at(9, 0, 0)).await;
+
+        let summary = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
+        assert_eq!(summary.rss.polls, 1);
+        assert_eq!(summary.rss.not_modified, 1);
     }
 
     #[test]

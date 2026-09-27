@@ -60,3 +60,14 @@ webhook = "team"
 source = { kind = "chrome", platform = "win", channel = "stable", rollout = "started" }
                                         # rollout: started | complete (default: started)
 poll_interval_sec = 1800                # optional; 60..=3600 (default: 3600)
+
+# Syndication feeds to subscribe to: RSS, Atom or JSON Feed, detected from the body.
+# The first poll records the current entries; after that, every entry not seen
+# before is posted as one embed.
+[[rss]]
+name = "claude-code-changelog"          # non-empty, unique within [[rss]]
+url = "https://code.claude.com/docs/en/changelog/rss.xml"
+                                        # https only; the feed URL itself
+webhook = "team"                        # logical name — resolved via env, as above
+display_name = "Claude Code Changelog"  # optional (default: the `name` above)
+poll_interval_sec = 900                 # optional; 60..=3600 (default: 900)

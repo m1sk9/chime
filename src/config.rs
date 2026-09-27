@@ -11,7 +11,9 @@ use url::Url;
 pub enum ConfigError {
     #[error(transparent)]
     Toml(#[from] toml::de::Error),
-    #[error("config defines none of `[[reminders]]`, `[[status_pages]]` or `[[watches]]`")]
+    #[error(
+        "config defines none of `[[reminders]]`, `[[status_pages]]`, `[[watches]]` or `[[rss]]`"
+    )]
     NoSources,
     #[error("duplicate reminder name: {0}")]
     DuplicateName(String),
@@ -19,6 +21,8 @@ pub enum ConfigError {
     DuplicateStatusPageName(String),
     #[error("duplicate watch name: {0}")]
     DuplicateWatchName(String),
+    #[error("duplicate rss name: {0}")]
+    DuplicateRssName(String),
     #[error("watch `{name}`: chrome has no `extended` channel on `{platform}`")]
     ChromeNoExtendedChannel {
         name: String,
@@ -245,6 +249,7 @@ non_empty_str!(WebhookRef, "webhook");
 non_empty_str!(StatusPageName, "name");
 non_empty_str!(DisplayName, "display_name");
 non_empty_str!(WatchName, "name");
+non_empty_str!(RssName, "name");
 
 impl WebhookRef {
     pub fn env_key(&self) -> String {
@@ -649,6 +654,24 @@ pub struct Watch {
     pub avatar_url: Option<HttpsUrl>,
 }
 
+fn default_rss_poll_interval() -> PollInterval {
+    PollInterval(Duration::from_secs(900))
+}
+
+/// A syndication feed to subscribe to: RSS, Atom or JSON Feed. Each entry not seen
+/// before is forwarded once; the format is detected from the body.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rss {
+    pub name: RssName,
+    pub url: HttpsUrl,
+    pub webhook: WebhookRef,
+    #[serde(default = "default_rss_poll_interval")]
+    pub poll_interval_sec: PollInterval,
+    pub display_name: Option<DisplayName>,
+    pub avatar_url: Option<HttpsUrl>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -659,12 +682,18 @@ pub struct Config {
     pub status_pages: Vec<StatusPage>,
     #[serde(default)]
     pub watches: Vec<Watch>,
+    #[serde(default)]
+    pub rss: Vec<Rss>,
 }
 
 impl Config {
     pub fn from_toml(text: &str) -> Result<Config, ConfigError> {
         let cfg: Config = toml::from_str(text)?;
-        if cfg.reminders.is_empty() && cfg.status_pages.is_empty() && cfg.watches.is_empty() {
+        if cfg.reminders.is_empty()
+            && cfg.status_pages.is_empty()
+            && cfg.watches.is_empty()
+            && cfg.rss.is_empty()
+        {
             return Err(ConfigError::NoSources);
         }
         let mut seen = HashSet::new();
@@ -701,6 +730,12 @@ impl Config {
                     name: w.name.as_str().to_string(),
                     platform: platform.as_api_str(),
                 });
+            }
+        }
+        let mut seen_rss = HashSet::new();
+        for r in &cfg.rss {
+            if !seen_rss.insert(r.name.as_str().to_string()) {
+                return Err(ConfigError::DuplicateRssName(r.name.as_str().to_string()));
             }
         }
         Ok(cfg)
@@ -854,6 +889,7 @@ mod tests {
         assert!(ReminderName::try_from("   ".to_string()).is_err());
         assert!(Message::try_from("\t\n".to_string()).is_err());
         assert!(WebhookRef::try_from("".to_string()).is_err());
+        assert!(RssName::try_from(" ".to_string()).is_err());
         assert_eq!(
             ReminderName::try_from(" foo ".to_string())
                 .unwrap()
@@ -940,7 +976,7 @@ webhook = "team"
     }
 
     #[test]
-    fn config_rejects_no_reminders_no_status_pages_and_no_watches() {
+    fn config_rejects_a_config_with_no_sources() {
         let t = r#"
 [system]
 tick_interval_sec = 30
@@ -1593,5 +1629,137 @@ source = { kind = "chrome" }
             ));
             assert!(r.is_ok(), "{platform}: {r:?}");
         }
+    }
+
+    fn parse_rss(body: &str) -> Result<Config, ConfigError> {
+        Config::from_toml(&format!("{SYSTEM}{body}"))
+    }
+
+    fn first_rss(body: &str) -> Rss {
+        parse_rss(body).unwrap().rss.remove(0)
+    }
+
+    #[test]
+    fn rss_defaults_are_applied() {
+        let r = first_rss(
+            r#"
+[[rss]]
+name = "changelog"
+url = "https://code.claude.com/docs/en/changelog/rss.xml"
+webhook = "team"
+"#,
+        );
+        assert_eq!(r.poll_interval_sec.as_duration(), Duration::from_secs(900));
+        assert!(r.display_name.is_none());
+        assert!(r.avatar_url.is_none());
+    }
+
+    #[test]
+    fn rss_accepts_full_form() {
+        let r = first_rss(
+            r#"
+[[rss]]
+name = "changelog"
+url = "https://code.claude.com/docs/en/changelog/rss.xml"
+webhook = "team"
+poll_interval_sec = 600
+display_name = "Claude Code Changelog"
+avatar_url = "https://example.com/claude.png"
+"#,
+        );
+        assert_eq!(r.name.as_str(), "changelog");
+        assert_eq!(
+            r.url.as_url().as_str(),
+            "https://code.claude.com/docs/en/changelog/rss.xml"
+        );
+        assert_eq!(r.webhook.as_str(), "team");
+        assert_eq!(r.poll_interval_sec.as_duration(), Duration::from_secs(600));
+        assert_eq!(r.display_name.unwrap().as_str(), "Claude Code Changelog");
+        assert_eq!(
+            r.avatar_url.unwrap().into_string(),
+            "https://example.com/claude.png"
+        );
+    }
+
+    #[test]
+    fn rss_url_requires_https() {
+        let r = parse_rss(
+            r#"
+[[rss]]
+name = "changelog"
+url = "http://example.com/rss.xml"
+webhook = "team"
+"#,
+        );
+        assert!(matches!(r, Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn config_rejects_unknown_rss_field() {
+        let r = parse_rss(
+            r#"
+[[rss]]
+name = "changelog"
+url = "https://example.com/rss.xml"
+webhook = "team"
+pointer = "/x"
+"#,
+        );
+        assert!(matches!(r, Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn config_accepts_rss_without_reminders_status_pages_or_watches() {
+        let cfg = parse_rss(
+            r#"
+[[rss]]
+name = "changelog"
+url = "https://example.com/rss.xml"
+webhook = "team"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.reminders.is_empty());
+        assert!(cfg.status_pages.is_empty());
+        assert!(cfg.watches.is_empty());
+        assert_eq!(cfg.rss.len(), 1);
+    }
+
+    #[test]
+    fn config_rejects_duplicate_rss_names() {
+        let r = parse_rss(
+            r#"
+[[rss]]
+name = "dup"
+url = "https://a.example/rss.xml"
+webhook = "team"
+
+[[rss]]
+name = "dup"
+url = "https://b.example/rss.xml"
+webhook = "team"
+"#,
+        );
+        assert!(matches!(r, Err(ConfigError::DuplicateRssName(n)) if n == "dup"));
+    }
+
+    #[test]
+    fn an_rss_feed_and_a_watch_may_share_a_name() {
+        let cfg = parse_rss(
+            r#"
+[[watches]]
+name = "firefox"
+webhook = "team"
+source = { kind = "firefox" }
+
+[[rss]]
+name = "firefox"
+url = "https://blog.mozilla.org/feed/"
+webhook = "team"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.watches.len(), 1);
+        assert_eq!(cfg.rss.len(), 1);
     }
 }

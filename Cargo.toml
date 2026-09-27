@@ -11,6 +11,11 @@ repository = "https://github.com/m1sk9/chime/"
 anyhow = "1.0.102"
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
 chrono-tz = { version = "0.10.4", features = ["serde"] }
+# Parses RSS 0.9x/1.0/2.0, Atom and JSON Feed into one model, so `[[rss]]` accepts
+# all of them through a single code path. Without the `sanitize` feature: chime
+# renders entry bodies to plain text itself (`rss::html_to_text`), so ammonia's
+# HTML allow-listing would be dead weight.
+feed-rs = "3.0.0"
 reqwest = { version = "0.13.0", default-features = false, features = ["gzip", "json", "rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 # Already in the tree via reqwest's `json` feature; promoted to a direct dependency
