@@ -9,9 +9,10 @@ use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+use crate::fetch::Fetched;
 use crate::notifier::{DiscordMessage, Notifier};
 use crate::runtime::{RunConfig, RunStatusPage};
-use crate::status::{Fetched, PageState, StatusSource, build_message, diff};
+use crate::status::{PageState, StatusSource, build_message, diff};
 
 /// How often the status poller reports that it is alive.
 ///
@@ -279,7 +280,7 @@ async fn poll_page<N: Notifier, S: StatusSource>(
             debug!(status_page = %page.name, "status page not modified");
             return PollOutcome::NotModified;
         }
-        Fetched::Modified { incidents, etag } => (incidents, etag),
+        Fetched::Modified { value, etag } => (value, etag),
     };
 
     state.etag = new_etag;
@@ -446,7 +447,11 @@ mod tests {
     }
 
     impl StatusSource for FakeSource {
-        async fn fetch(&self, _url: &Url, _etag: Option<&str>) -> Result<Fetched, StatusError> {
+        async fn fetch(
+            &self,
+            _url: &Url,
+            _etag: Option<&str>,
+        ) -> Result<Fetched<Vec<Incident>>, StatusError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
                 return Err(StatusError::Status {
@@ -464,7 +469,7 @@ mod tests {
                 queue.front().cloned().unwrap_or_default()
             };
             Ok(Fetched::Modified {
-                incidents,
+                value: incidents,
                 etag: None,
             })
         }

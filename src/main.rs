@@ -1,4 +1,5 @@
 mod config;
+mod fetch;
 mod heartbeat;
 mod notifier;
 mod runtime;
