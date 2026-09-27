@@ -11,12 +11,19 @@ use url::Url;
 pub enum ConfigError {
     #[error(transparent)]
     Toml(#[from] toml::de::Error),
-    #[error("config defines neither `[[reminders]]` nor `[[status_pages]]`")]
+    #[error("config defines none of `[[reminders]]`, `[[status_pages]]` or `[[watches]]`")]
     NoSources,
     #[error("duplicate reminder name: {0}")]
     DuplicateName(String),
     #[error("duplicate status page name: {0}")]
     DuplicateStatusPageName(String),
+    #[error("duplicate watch name: {0}")]
+    DuplicateWatchName(String),
+    #[error("watch `{name}`: chrome has no `extended` channel on `{platform}`")]
+    ChromeNoExtendedChannel {
+        name: String,
+        platform: &'static str,
+    },
     #[error("reminder `{name}`: {source}")]
     Schedule {
         name: String,
@@ -79,6 +86,12 @@ pub enum HttpsUrlError {
     Scheme(String),
     #[error("url must have a host")]
     NoHost,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum JsonPointerError {
+    #[error("pointer must start with `/` (RFC 6901), got {0:?}")]
+    NotAbsolute(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -231,6 +244,7 @@ non_empty_str!(Message, "message");
 non_empty_str!(WebhookRef, "webhook");
 non_empty_str!(StatusPageName, "name");
 non_empty_str!(DisplayName, "display_name");
+non_empty_str!(WatchName, "name");
 
 impl WebhookRef {
     pub fn env_key(&self) -> String {
@@ -347,20 +361,56 @@ impl TryFrom<String> for StatusUrl {
     }
 }
 
+/// Any https URL, kept verbatim: avatars, watch sources and watch links. Why not
+/// `StatusUrl`: that type appends a trailing `/` for `Url::join`, which would turn
+/// `https://x/api/v.json` into `.../v.json/`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
-pub struct AvatarUrl(Url);
+pub struct HttpsUrl(Url);
 
-impl AvatarUrl {
+impl HttpsUrl {
+    pub fn as_url(&self) -> &Url {
+        &self.0
+    }
+
     pub fn into_string(self) -> String {
         self.0.into()
     }
 }
 
-impl TryFrom<String> for AvatarUrl {
+impl TryFrom<String> for HttpsUrl {
     type Error = HttpsUrlError;
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        parse_https(&s).map(AvatarUrl)
+        parse_https(&s).map(HttpsUrl)
+    }
+}
+
+/// RFC 6901 pointer that must start with `/`.
+///
+/// Why not accept the empty pointer, which RFC 6901 allows: it addresses the whole
+/// document, useful only for an endpoint whose body is a bare string or number, and
+/// that is rare. A pointer without a leading `/` is far more often a typo
+/// (`version` for `/version`), and rejecting it here surfaces the typo at startup
+/// instead of as a warning on every poll.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct JsonPointer(String);
+
+impl JsonPointer {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for JsonPointer {
+    type Error = JsonPointerError;
+    // Why not trim like the other string types: in RFC 6901 whitespace is part of
+    // a reference token, so `/v ` and `/v` address different keys.
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        if !s.starts_with('/') {
+            return Err(JsonPointerError::NotAbsolute(s));
+        }
+        Ok(JsonPointer(s))
     }
 }
 
@@ -444,7 +494,159 @@ pub struct StatusPage {
     #[serde(default)]
     pub min_impact: Impact,
     pub display_name: Option<DisplayName>,
-    pub avatar_url: Option<AvatarUrl>,
+    pub avatar_url: Option<HttpsUrl>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FirefoxChannel {
+    #[default]
+    Release,
+    Esr,
+    Beta,
+    Devedition,
+    Nightly,
+}
+
+impl FirefoxChannel {
+    pub fn label(&self) -> &'static str {
+        match self {
+            FirefoxChannel::Release => "Release",
+            FirefoxChannel::Esr => "ESR",
+            FirefoxChannel::Beta => "Beta",
+            FirefoxChannel::Devedition => "Developer Edition",
+            FirefoxChannel::Nightly => "Nightly",
+        }
+    }
+}
+
+// `snake_case` rather than `lowercase`: the API spells one platform `mac_arm64`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ChromePlatform {
+    #[default]
+    Win,
+    Win64,
+    Mac,
+    MacArm64,
+    Linux,
+    Android,
+    Webview,
+    Ios,
+}
+
+impl ChromePlatform {
+    pub fn as_api_str(&self) -> &'static str {
+        match self {
+            ChromePlatform::Win => "win",
+            ChromePlatform::Win64 => "win64",
+            ChromePlatform::Mac => "mac",
+            ChromePlatform::MacArm64 => "mac_arm64",
+            ChromePlatform::Linux => "linux",
+            ChromePlatform::Android => "android",
+            ChromePlatform::Webview => "webview",
+            ChromePlatform::Ios => "ios",
+        }
+    }
+
+    // Why not leave this to the first poll: VersionHistory answers 400 for
+    // `extended` on every other platform (measured 2026-09-27), so such a watch can
+    // never succeed and has to fail at startup like any other config error.
+    pub fn has_extended_channel(&self) -> bool {
+        matches!(
+            self,
+            ChromePlatform::Win
+                | ChromePlatform::Win64
+                | ChromePlatform::Mac
+                | ChromePlatform::MacArm64
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChromeChannel {
+    #[default]
+    Stable,
+    Extended,
+    Beta,
+    Dev,
+    Canary,
+}
+
+impl ChromeChannel {
+    pub fn as_api_str(&self) -> &'static str {
+        match self {
+            ChromeChannel::Stable => "stable",
+            ChromeChannel::Extended => "extended",
+            ChromeChannel::Beta => "beta",
+            ChromeChannel::Dev => "dev",
+            ChromeChannel::Canary => "canary",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ChromeChannel::Stable => "Stable",
+            ChromeChannel::Extended => "Extended Stable",
+            ChromeChannel::Beta => "Beta",
+            ChromeChannel::Dev => "Dev",
+            ChromeChannel::Canary => "Canary",
+        }
+    }
+}
+
+/// Which served version counts as "released": the top version as soon as its
+/// staged rollout starts, or only once it reaches every user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChromeRollout {
+    #[default]
+    Started,
+    Complete,
+}
+
+// Why a nested `source` table rather than a flat `kind` key on `Watch`: sharing a
+// table between the common fields and a kind-specific enum needs `#[serde(flatten)]`,
+// which silently disables `deny_unknown_fields`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum WatchKind {
+    Firefox {
+        #[serde(default)]
+        channel: FirefoxChannel,
+    },
+    Chrome {
+        #[serde(default)]
+        platform: ChromePlatform,
+        #[serde(default)]
+        channel: ChromeChannel,
+        #[serde(default)]
+        rollout: ChromeRollout,
+    },
+    Json {
+        url: HttpsUrl,
+        pointer: JsonPointer,
+        link: Option<HttpsUrl>,
+    },
+}
+
+fn default_watch_poll_interval() -> PollInterval {
+    PollInterval(Duration::from_secs(3600))
+}
+
+/// A release feed to watch. Like a status page it is pulled, and only a change of
+/// the extracted version is forwarded.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Watch {
+    pub name: WatchName,
+    pub webhook: WebhookRef,
+    pub source: WatchKind,
+    #[serde(default = "default_watch_poll_interval")]
+    pub poll_interval_sec: PollInterval,
+    pub display_name: Option<DisplayName>,
+    pub avatar_url: Option<HttpsUrl>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -455,12 +657,14 @@ pub struct Config {
     pub reminders: Vec<Reminder>,
     #[serde(default)]
     pub status_pages: Vec<StatusPage>,
+    #[serde(default)]
+    pub watches: Vec<Watch>,
 }
 
 impl Config {
     pub fn from_toml(text: &str) -> Result<Config, ConfigError> {
         let cfg: Config = toml::from_str(text)?;
-        if cfg.reminders.is_empty() && cfg.status_pages.is_empty() {
+        if cfg.reminders.is_empty() && cfg.status_pages.is_empty() && cfg.watches.is_empty() {
             return Err(ConfigError::NoSources);
         }
         let mut seen = HashSet::new();
@@ -479,6 +683,24 @@ impl Config {
                 return Err(ConfigError::DuplicateStatusPageName(
                     p.name.as_str().to_string(),
                 ));
+            }
+        }
+        let mut seen_watches = HashSet::new();
+        for w in &cfg.watches {
+            if !seen_watches.insert(w.name.as_str().to_string()) {
+                return Err(ConfigError::DuplicateWatchName(w.name.as_str().to_string()));
+            }
+            if let WatchKind::Chrome {
+                platform,
+                channel: ChromeChannel::Extended,
+                ..
+            } = w.source
+                && !platform.has_extended_channel()
+            {
+                return Err(ConfigError::ChromeNoExtendedChannel {
+                    name: w.name.as_str().to_string(),
+                    platform: platform.as_api_str(),
+                });
             }
         }
         Ok(cfg)
@@ -718,7 +940,7 @@ webhook = "team"
     }
 
     #[test]
-    fn config_rejects_no_reminders_and_no_status_pages() {
+    fn config_rejects_no_reminders_no_status_pages_and_no_watches() {
         let t = r#"
 [system]
 tick_interval_sec = 30
@@ -1034,5 +1256,342 @@ webhook = "team"
                 ..
             })
         ));
+    }
+
+    const SYSTEM: &str = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+"#;
+
+    fn parse_watches(body: &str) -> Result<Config, ConfigError> {
+        Config::from_toml(&format!("{SYSTEM}{body}"))
+    }
+
+    fn first_watch(body: &str) -> Watch {
+        parse_watches(body).unwrap().watches.remove(0)
+    }
+
+    #[test]
+    fn watch_defaults_are_applied() {
+        let w = first_watch(
+            r#"
+[[watches]]
+name = "firefox"
+webhook = "team"
+source = { kind = "firefox" }
+"#,
+        );
+        assert_eq!(
+            w.source,
+            WatchKind::Firefox {
+                channel: FirefoxChannel::Release
+            }
+        );
+        assert_eq!(w.poll_interval_sec.as_duration(), Duration::from_secs(3600));
+        assert!(w.display_name.is_none());
+        assert!(w.avatar_url.is_none());
+    }
+
+    #[test]
+    fn watch_accepts_full_form() {
+        let w = first_watch(
+            r#"
+[[watches]]
+name = "chrome"
+webhook = "team"
+source = { kind = "chrome", platform = "mac_arm64", channel = "beta", rollout = "complete" }
+poll_interval_sec = 600
+display_name = "Chrome Releases"
+avatar_url = "https://example.com/chrome.png"
+"#,
+        );
+        assert_eq!(
+            w.source,
+            WatchKind::Chrome {
+                platform: ChromePlatform::MacArm64,
+                channel: ChromeChannel::Beta,
+                rollout: ChromeRollout::Complete,
+            }
+        );
+        assert_eq!(w.poll_interval_sec.as_duration(), Duration::from_secs(600));
+        assert_eq!(w.display_name.unwrap().as_str(), "Chrome Releases");
+        assert!(w.avatar_url.is_some());
+    }
+
+    #[test]
+    fn watch_source_accepts_inline_and_sub_table_forms() {
+        let inline = first_watch(
+            r#"
+[[watches]]
+name = "esr"
+webhook = "team"
+source = { kind = "firefox", channel = "esr" }
+"#,
+        );
+        let sub_table = first_watch(
+            r#"
+[[watches]]
+name = "esr"
+webhook = "team"
+
+[watches.source]
+kind = "firefox"
+channel = "esr"
+"#,
+        );
+        assert_eq!(inline.source, sub_table.source);
+        assert_eq!(
+            inline.source,
+            WatchKind::Firefox {
+                channel: FirefoxChannel::Esr
+            }
+        );
+    }
+
+    #[test]
+    fn watch_source_kind_is_required() {
+        let r = parse_watches(
+            r#"
+[[watches]]
+name = "x"
+webhook = "team"
+source = { channel = "esr" }
+"#,
+        );
+        assert!(matches!(r, Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn watch_source_rejects_an_unknown_kind() {
+        let r = parse_watches(
+            r#"
+[[watches]]
+name = "x"
+webhook = "team"
+source = { kind = "safari" }
+"#,
+        );
+        assert!(matches!(r, Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn watch_source_rejects_an_unknown_field_inside_a_kind() {
+        let r = parse_watches(
+            r#"
+[[watches]]
+name = "x"
+webhook = "team"
+source = { kind = "firefox", foo = 1 }
+"#,
+        );
+        assert!(matches!(r, Err(ConfigError::Toml(_))));
+
+        let r = parse_watches(
+            r#"
+[[watches]]
+name = "x"
+webhook = "team"
+
+[watches.source]
+kind = "firefox"
+foo = 1
+"#,
+        );
+        assert!(matches!(r, Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn watch_source_rejects_a_field_that_belongs_to_another_kind() {
+        let r = parse_watches(
+            r#"
+[[watches]]
+name = "x"
+webhook = "team"
+source = { kind = "firefox", platform = "win" }
+"#,
+        );
+        assert!(matches!(r, Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn config_rejects_unknown_watch_field() {
+        let r = parse_watches(
+            r#"
+[[watches]]
+name = "x"
+webhook = "team"
+source = { kind = "firefox" }
+min_impact = "major"
+"#,
+        );
+        assert!(matches!(r, Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn json_watch_requires_url_and_pointer() {
+        for source in [
+            r#"{ kind = "json", url = "https://nodejs.org/dist/index.json" }"#,
+            r#"{ kind = "json", pointer = "/0/version" }"#,
+        ] {
+            let r = parse_watches(&format!(
+                "[[watches]]\nname = \"node\"\nwebhook = \"team\"\nsource = {source}\n"
+            ));
+            assert!(matches!(r, Err(ConfigError::Toml(_))), "{source}");
+        }
+    }
+
+    #[test]
+    fn json_pointer_must_start_with_a_slash() {
+        assert!(matches!(
+            JsonPointer::try_from(String::new()),
+            Err(JsonPointerError::NotAbsolute(_))
+        ));
+        assert!(matches!(
+            JsonPointer::try_from("foo".to_string()),
+            Err(JsonPointerError::NotAbsolute(_))
+        ));
+        assert!(matches!(
+            JsonPointer::try_from(" /a".to_string()),
+            Err(JsonPointerError::NotAbsolute(_))
+        ));
+    }
+
+    #[test]
+    fn json_pointer_keeps_whitespace_that_belongs_to_a_key() {
+        assert_eq!(
+            JsonPointer::try_from("/v ".to_string()).unwrap().as_str(),
+            "/v "
+        );
+    }
+
+    #[test]
+    fn json_watch_url_requires_https_and_is_not_slash_normalized() {
+        assert!(matches!(
+            HttpsUrl::try_from("http://x.example/api/v.json".to_string()),
+            Err(HttpsUrlError::Scheme(_))
+        ));
+        let w = first_watch(
+            r#"
+[[watches]]
+name = "node"
+webhook = "team"
+source = { kind = "json", url = "https://x.example/api/v.json", pointer = "/version", link = "https://x.example/notes" }
+"#,
+        );
+        let WatchKind::Json { url, pointer, link } = w.source else {
+            panic!("expected a json watch");
+        };
+        assert_eq!(url.as_url().as_str(), "https://x.example/api/v.json");
+        assert_eq!(pointer.as_str(), "/version");
+        assert_eq!(link.unwrap().as_url().as_str(), "https://x.example/notes");
+
+        let r = parse_watches(
+            r#"
+[[watches]]
+name = "node"
+webhook = "team"
+source = { kind = "json", url = "https://x.example/v.json", pointer = "/v", link = "http://x.example/" }
+"#,
+        );
+        assert!(matches!(r, Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn chrome_platform_names_match_the_api_path() {
+        for (name, platform) in [
+            ("win", ChromePlatform::Win),
+            ("win64", ChromePlatform::Win64),
+            ("mac", ChromePlatform::Mac),
+            ("mac_arm64", ChromePlatform::MacArm64),
+            ("linux", ChromePlatform::Linux),
+            ("android", ChromePlatform::Android),
+            ("webview", ChromePlatform::Webview),
+            ("ios", ChromePlatform::Ios),
+        ] {
+            let w = first_watch(&format!(
+                "[[watches]]\nname = \"c\"\nwebhook = \"team\"\nsource = {{ kind = \"chrome\", platform = \"{name}\" }}\n"
+            ));
+            let WatchKind::Chrome {
+                platform: parsed, ..
+            } = w.source
+            else {
+                panic!("expected a chrome watch");
+            };
+            assert_eq!(parsed, platform);
+            assert_eq!(parsed.as_api_str(), name);
+        }
+    }
+
+    #[test]
+    fn firefox_and_chrome_enums_reject_typos() {
+        for source in [
+            r#"{ kind = "firefox", channel = "stable" }"#,
+            r#"{ kind = "chrome", platform = "macos" }"#,
+            r#"{ kind = "chrome", channel = "release" }"#,
+            r#"{ kind = "chrome", rollout = "done" }"#,
+        ] {
+            let r = parse_watches(&format!(
+                "[[watches]]\nname = \"x\"\nwebhook = \"team\"\nsource = {source}\n"
+            ));
+            assert!(matches!(r, Err(ConfigError::Toml(_))), "{source}");
+        }
+    }
+
+    #[test]
+    fn config_accepts_watches_without_reminders_or_status_pages() {
+        let cfg = parse_watches(
+            r#"
+[[watches]]
+name = "firefox"
+webhook = "team"
+source = { kind = "firefox" }
+"#,
+        )
+        .unwrap();
+        assert!(cfg.reminders.is_empty());
+        assert!(cfg.status_pages.is_empty());
+        assert_eq!(cfg.watches.len(), 1);
+    }
+
+    #[test]
+    fn config_rejects_duplicate_watch_names() {
+        let r = parse_watches(
+            r#"
+[[watches]]
+name = "dup"
+webhook = "team"
+source = { kind = "firefox" }
+
+[[watches]]
+name = "dup"
+webhook = "team"
+source = { kind = "chrome" }
+"#,
+        );
+        assert!(matches!(r, Err(ConfigError::DuplicateWatchName(_))));
+    }
+
+    #[test]
+    fn chrome_extended_is_rejected_on_platforms_without_it() {
+        for platform in ["linux", "android", "webview", "ios"] {
+            let r = parse_watches(&format!(
+                "[[watches]]\nname = \"c\"\nwebhook = \"team\"\nsource = {{ kind = \"chrome\", platform = \"{platform}\", channel = \"extended\" }}\n"
+            ));
+            assert!(
+                matches!(
+                    &r,
+                    Err(ConfigError::ChromeNoExtendedChannel { name, platform: p })
+                        if name == "c" && *p == platform
+                ),
+                "{platform}: {r:?}"
+            );
+        }
+        for platform in ["win", "win64", "mac", "mac_arm64"] {
+            let r = parse_watches(&format!(
+                "[[watches]]\nname = \"c\"\nwebhook = \"team\"\nsource = {{ kind = \"chrome\", platform = \"{platform}\", channel = \"extended\" }}\n"
+            ));
+            assert!(r.is_ok(), "{platform}: {r:?}");
+        }
     }
 }

@@ -44,3 +44,19 @@ poll_interval_sec = 600                 # optional; 60..=3600 (default: 300)
 min_impact = "major"                    # optional; none | maintenance | minor |
                                         # major | critical (default: none)
 avatar_url = "https://example.com/proton.png"   # optional
+
+# Release feeds to watch. The first poll records the current version; after
+# that, every change of version is posted as one embed.
+[[watches]]
+name = "firefox"                        # non-empty, unique within [[watches]]
+webhook = "team"                        # logical name — resolved via env, as above
+source = { kind = "firefox" }           # channel: release | esr | beta | devedition |
+                                        # nightly (default: release)
+display_name = "Firefox Releases"       # optional (default: the source label)
+
+[[watches]]
+name = "chrome"
+webhook = "team"
+source = { kind = "chrome", platform = "win", channel = "stable", rollout = "started" }
+                                        # rollout: started | complete (default: started)
+poll_interval_sec = 1800                # optional; 60..=3600 (default: 3600)
