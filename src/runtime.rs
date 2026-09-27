@@ -66,6 +66,12 @@ pub enum ResolveError {
         #[source]
         source: url::ParseError,
     },
+    #[error("rss `{name}`: {source}")]
+    RssWebhook {
+        name: String,
+        #[source]
+        source: WebhookError,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +153,19 @@ impl RunFeed {
     }
 }
 
+/// A feed with its webhook read from the environment and its identity settled.
+#[derive(Debug, Clone)]
+pub struct RunRss {
+    pub name: String,
+    pub url: Url,
+    /// Shown in the embed footer, e.g. `code.claude.com`.
+    pub host: String,
+    pub webhook_url: Url,
+    pub poll_interval: Duration,
+    pub display_name: String,
+    pub avatar_url: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     pub log_level: LogLevel,
@@ -155,6 +174,7 @@ pub struct RunConfig {
     pub reminders: Vec<RunReminder>,
     pub status_pages: Vec<RunStatusPage>,
     pub feeds: Vec<RunFeed>,
+    pub rss: Vec<RunRss>,
     pub heartbeat_path: PathBuf,
 }
 
@@ -256,6 +276,31 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
             }),
         }
     }
+    let mut rss = Vec::with_capacity(cfg.rss.len());
+    for r in cfg.rss {
+        let name = r.name.as_str().to_string();
+        let webhook_url =
+            resolve_webhook(&r.webhook).map_err(|source| ResolveError::RssWebhook {
+                name: name.clone(),
+                source,
+            })?;
+        // Why not the feed's own `<title>`: it is unknown until the first fetch and
+        // can change without notice, so the sender name would depend on the network.
+        let display_name = r
+            .display_name
+            .map(|d| d.as_str().to_string())
+            .unwrap_or_else(|| name.clone());
+        let url = r.url.as_url().clone();
+        rss.push(RunRss {
+            name,
+            host: url.host_str().unwrap_or_default().to_string(),
+            url,
+            webhook_url,
+            poll_interval: r.poll_interval_sec.as_duration(),
+            display_name,
+            avatar_url: r.avatar_url.map(|a| a.into_string()),
+        });
+    }
 
     Ok(RunConfig {
         log_level: cfg.system.log_level,
@@ -264,6 +309,7 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
         reminders,
         status_pages,
         feeds,
+        rss,
         heartbeat_path: heartbeat_path(),
     })
 }
@@ -372,6 +418,18 @@ mod test_support {
             url: Url::parse(&format!("https://watch.{host}.example/versions.json")).unwrap(),
             poll_interval,
             watches,
+        }
+    }
+
+    pub(crate) fn mk_run_rss(name: &str, poll_interval: Duration) -> RunRss {
+        RunRss {
+            name: name.to_string(),
+            url: Url::parse(&format!("https://rss.{name}.example/feed.xml")).unwrap(),
+            host: format!("rss.{name}.example"),
+            webhook_url: Url::parse("https://discord.example/webhook").unwrap(),
+            poll_interval,
+            display_name: format!("{name} Feed"),
+            avatar_url: None,
         }
     }
 }
@@ -758,6 +816,100 @@ source = { kind = "firefox" }
         assert!(matches!(
             resolve(cfg),
             Err(ResolveError::WatchWebhook { name, .. }) if name == "orphan-watch"
+        ));
+    }
+
+    #[test]
+    fn resolve_builds_the_rss_feed() {
+        let _g = EnvGuard::set("CHIME_WEBHOOK_RSS_TEAM", "https://example.com/hook");
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[rss]]
+name = "changelog"
+url = "https://code.claude.com/docs/en/changelog/rss.xml"
+webhook = "rss-team"
+"#;
+        let feed = resolve(Config::from_toml(toml).unwrap())
+            .unwrap()
+            .rss
+            .remove(0);
+        assert_eq!(
+            feed.url.as_str(),
+            "https://code.claude.com/docs/en/changelog/rss.xml"
+        );
+        assert_eq!(feed.host, "code.claude.com");
+        assert_eq!(feed.webhook_url.as_str(), "https://example.com/hook");
+        assert_eq!(feed.poll_interval, Duration::from_secs(900));
+    }
+
+    #[test]
+    fn resolve_defaults_rss_display_name_to_the_name() {
+        let _g = EnvGuard::set("CHIME_WEBHOOK_RSS_NAME", "https://example.com/hook");
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[rss]]
+name = "changelog"
+url = "https://code.claude.com/docs/en/changelog/rss.xml"
+webhook = "rss-name"
+"#;
+        let feed = resolve(Config::from_toml(toml).unwrap())
+            .unwrap()
+            .rss
+            .remove(0);
+        assert_eq!(feed.display_name, "changelog");
+        assert!(feed.avatar_url.is_none());
+    }
+
+    #[test]
+    fn resolve_keeps_an_explicit_rss_display_identity() {
+        let _g = EnvGuard::set("CHIME_WEBHOOK_RSS_IDENT", "https://example.com/hook");
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[rss]]
+name = "changelog"
+url = "https://code.claude.com/docs/en/changelog/rss.xml"
+webhook = "rss-ident"
+display_name = "Claude Code Changelog"
+avatar_url = "https://example.com/claude.png"
+"#;
+        let feed = resolve(Config::from_toml(toml).unwrap())
+            .unwrap()
+            .rss
+            .remove(0);
+        assert_eq!(feed.display_name, "Claude Code Changelog");
+        assert_eq!(
+            feed.avatar_url.as_deref(),
+            Some("https://example.com/claude.png")
+        );
+    }
+
+    #[test]
+    fn resolve_reports_missing_webhook_with_rss_name() {
+        let _g1 = EnvGuard::unset("CHIME_WEBHOOK_RSS_NOHOOK");
+        let _g2 = EnvGuard::unset("CHIME_WEBHOOK_RSS_NOHOOK_FILE");
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[rss]]
+name = "orphan-feed"
+url = "https://code.claude.com/docs/en/changelog/rss.xml"
+webhook = "rss-nohook"
+"#;
+        let cfg = Config::from_toml(toml).unwrap();
+        assert!(matches!(
+            resolve(cfg),
+            Err(ResolveError::RssWebhook { name, .. }) if name == "orphan-feed"
         ));
     }
 

@@ -31,18 +31,28 @@ pub enum FetchError {
 }
 
 /// Outcome of a conditional GET. `T` is whatever the caller decodes the body into:
-/// raw bytes for `fetch_json`, normalized incidents for `StatusSource`.
+/// raw bytes for `fetch_conditional`, normalized incidents for `StatusSource`.
 #[derive(Debug)]
 pub enum Fetched<T> {
     NotModified,
     Modified { value: T, etag: Option<String> },
 }
 
-/// Conditional GET of a JSON endpoint with the body capped at `MAX_BODY`.
+/// Conditional GET of a JSON endpoint (`Accept: application/json`).
 pub(crate) async fn fetch_json(
     client: &Client,
     url: &Url,
     etag: Option<&str>,
+) -> Result<Fetched<Vec<u8>>, FetchError> {
+    fetch_conditional(client, url, etag, "application/json").await
+}
+
+/// Conditional GET with the body capped at `MAX_BODY`. `accept` is sent verbatim.
+pub(crate) async fn fetch_conditional(
+    client: &Client,
+    url: &Url,
+    etag: Option<&str>,
+    accept: &'static str,
 ) -> Result<Fetched<Vec<u8>>, FetchError> {
     // `Accept` is required, not merely polite. The status page CDN answers with
     // `Vary: Accept, Accept-Encoding`, and a request that omits `Accept` lands on
@@ -51,7 +61,7 @@ pub(crate) async fn fetch_json(
     let mut request = client
         .get(url.clone())
         .timeout(FETCH_TIMEOUT)
-        .header(ACCEPT, "application/json");
+        .header(ACCEPT, accept);
     if let Some(tag) = etag {
         request = request.header(IF_NONE_MATCH, tag);
     }

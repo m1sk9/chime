@@ -1,6 +1,6 @@
 # chime
 
-IaC-managed Discord webhook reminder. Reads a TOML schedule, runs as a long-lived process, and posts to Discord webhooks at the configured times. It can also watch Atlassian Statuspage instances and forward incident updates to the same webhooks, and watch the Firefox and Chrome release feeds — or any JSON endpoint — to announce new versions.
+IaC-managed Discord webhook reminder. Reads a TOML schedule, runs as a long-lived process, and posts to Discord webhooks at the configured times. It can also watch Atlassian Statuspage instances and forward incident updates to the same webhooks, watch the Firefox and Chrome release feeds — or any JSON endpoint — to announce new versions, and subscribe to RSS, Atom or JSON feeds to post new entries.
 
 ## Features
 
@@ -9,6 +9,7 @@ IaC-managed Discord webhook reminder. Reads a TOML schedule, runs as a long-live
 - Webhook URLs are kept out of `config.toml` and injected via environment variables (or `*_FILE` paths for Docker secrets).
 - Forwards Atlassian Statuspage incidents (Claude, Proton, GitHub, Discord, Cloudflare, …) to Discord as colour-coded embeds. Pull-based: no inbound port, no public ingress.
 - Watches release feeds — Firefox, Chrome, or any JSON endpoint — and posts a new version as an embed. Pull-based, same as status pages.
+- Subscribes to RSS, Atom and JSON feeds and posts each new entry as an embed. Pull-based, same as the others.
 - Ships as a distroless container image to `ghcr.io/m1sk9/chime`.
 - Built-in liveness check (`chime health`) usable from a distroless `HEALTHCHECK` — no shell or extra client needed.
 
@@ -162,11 +163,24 @@ webhook = "team"
 source = { kind = "json", url = "https://nodejs.org/dist/index.json", pointer = "/0/version", link = "https://nodejs.org/en/blog/release" }
                             # url: https only. pointer: RFC 6901, must start with `/`.
                             # link: optional; https only; put on the embed as-is.
+
+[[rss]]
+name = "claude-code-changelog"
+                            # non-empty, unique within [[rss]]
+url = "https://code.claude.com/docs/en/changelog/rss.xml"
+                            # https only; the feed URL itself
+webhook = "team"            # logical name — resolved via env, same as reminders
+display_name = "Claude Code Changelog"
+                            # optional; the Discord username on the message
+                            # (default: the `name` above)
+poll_interval_sec = 900     # optional; 60..=3600 (default: 900)
+avatar_url = "https://example.com/claude.png"
+                            # optional; https only
 ```
 
 Each reminder schedules by **either** `days` (weekdays) **or** `day_of_month` (days of the month) — exactly one of the two, never both. `day_of_month` accepts a list of days in `1..=31`; a day that does not exist in a given month (e.g. `31` in February) is simply skipped that month.
 
-A config must define at least one `[[reminders]]`, `[[status_pages]]` **or** `[[watches]]`; any section alone is fine.
+A config must define at least one `[[reminders]]`, `[[status_pages]]`, `[[watches]]` **or** `[[rss]]`; any section alone is fine.
 
 ### Status pages
 
@@ -279,6 +293,36 @@ nodejs.org · <time chime saw it>
 
 The timestamp is always when chime noticed the change — up to `poll_interval_sec` after the release. product-details and arbitrary JSON carry no publication time at all. Chrome does, but after a pulled rollout the served version is an older release whose start time would date the post days in the past, so it is shown as `Serving since` instead.
 
+### RSS feeds
+
+`[[rss]]` subscribes to a syndication feed and posts every entry that was not in it before. RSS 0.9x / 1.0 / 2.0, Atom and JSON Feed are all accepted; the format is detected from the body, so there is no `kind` to set. `url` is the feed itself and is requested as written — chime appends nothing. A body that is none of these fails the poll with `response is not an RSS, Atom or JSON feed: …` — this is logged, not fatal.
+
+#### Notification semantics
+
+- **The first poll after startup is silent** — it records the entries currently in the feed as a baseline. A restart re-baselines.
+- An entry is posted when its **id** has not been seen: `<guid>` in RSS, `<id>` in Atom, `id` in JSON Feed, or, when the feed gives none, a hash of the entry's link and title. Editing an entry that was already seen does not post it again.
+- The id is recorded **before** the Discord request, so a failed send is not retried.
+- An entry that drops out of the feed is forgotten; if it comes back, it is reported as new. A feed that answers with no entries at all keeps the baseline.
+- An entry with neither a link nor a title is ignored: it has nothing stable to be recognised by.
+- Several new entries in one poll are posted **oldest first**, by the entry's own date; entries without a date come last, in feed order. There is no cap on how many are posted.
+- Polling failures (unreachable feed, a body that is not a feed) are logged at `warn` and never posted.
+
+Many feeds — the Claude Code changelog among them — send `cache-control: no-cache` and no `ETag`, so they cannot be validated and every poll downloads the whole feed and is counted as `updated` in the [summary](#knowing-the-poller-is-alive), as for Chrome. gzip keeps that small, and the same 8 MB ceiling as for status pages applies.
+
+#### What it looks like in Discord
+
+Each new entry is one embed, attributed to `display_name`. The colour is fixed (Discord fuchsia).
+
+```
+2.1.283                                  ← the entry title, linked to the entry
+- Added x-claude-code-prompt-id to the gateway hint headers …
+- Fixed MCP progress notifications being discarded …
+Published: 2026-09-25 22:00 UTC          ← if the entry is dated
+code.claude.com · <time chime saw it>
+```
+
+The body is the entry's summary, or its content when there is no summary, rendered from HTML to plain text: list items become `- ` lines, paragraphs and line breaks become newlines, every other tag is dropped and its text kept. Long bodies are truncated; the linked page is the authoritative copy. The timestamp is when chime noticed the entry, not the entry's own date.
+
 ### Webhook resolution
 
 The `webhook` field is a logical name, not a URL. At startup chime derives an env key from it:
@@ -305,7 +349,7 @@ All of the following are rejected at startup with a descriptive error and a non-
 - A reminder specifying neither or both of `days` / `day_of_month`
 - Empty `message`
 - Webhook env var unset, empty, or not a valid URL
-- Neither reminders, status pages nor watches defined
+- Neither reminders, status pages, watches nor rss feeds defined
 - Duplicate or empty status page `name`
 - Status page `url` or `avatar_url` that is not `https`, or has no host
 - `poll_interval_sec` outside `60..=3600`
@@ -315,6 +359,8 @@ All of the following are rejected at startup with a descriptive error and a non-
 - `firefox.channel` / `chrome.platform` / `chrome.channel` / `chrome.rollout` outside their listed values
 - `chrome` watch with `channel = "extended"` on `linux`, `android`, `webview` or `ios` — Extended Stable exists only for `win`, `win64`, `mac` and `mac_arm64`, and the API rejects the rest
 - `json` watch whose `url` / `link` is not https, or whose `pointer` does not start with `/`
+- Duplicate or empty rss `name`
+- rss `url` or `avatar_url` that is not `https`, or has no host
 
 ## How it works
 
@@ -324,7 +370,7 @@ chime is a long-running process, not a one-shot cron job. The main loop:
 2. Compute the current local time in the configured timezone.
 3. For each reminder, fire if the current hour and minute match and today matches its schedule — one of `days` (weekday), or one of `day_of_month` (day of the current month).
 4. Per-minute deduplication: each reminder fires at most once per matching minute, even if the tick interval is shorter than 60 seconds (e.g. with `tick_interval_sec = 30` you get exactly one POST per scheduled minute). The dedup record is updated **before** the HTTP request, so a send failure does not cause a retry within the same minute.
-5. Poll **at most one** status page or watch — the one most overdue among those whose `poll_interval_sec` has elapsed — and forward incident updates or versions not seen before.
+5. Poll **at most one** status page, watch or feed — the one most overdue among those whose `poll_interval_sec` has elapsed — and forward incident updates, versions or entries not seen before.
 6. SIGINT and SIGTERM both trigger a clean shutdown.
 
 Status page polling follows the same rules as reminders:
@@ -333,8 +379,8 @@ Status page polling follows the same rules as reminders:
 - The seen-record is written **before** the Discord request, so a failed send is not retried on the next poll.
 - A status page being unreachable is logged at `warn` and retried on its own interval. chime never posts about its own polling failures.
 - Because polling happens on the tick, an update is forwarded up to `poll_interval_sec` after Statuspage published it. The embed timestamp always shows the real publication time.
-- **One page or watch is polled per tick**, so a tick costs a single request no matter how many are configured — a set of unreachable endpoints cannot stall the loop long enough for `chime health` to call the heartbeat stale. Each entry takes `tick_interval_sec / poll_interval_sec` of that budget — with `tick_interval_sec = 60`, a page at 300 takes a fifth and a watch at 3600 a sixtieth — and every one stays on its nominal interval as long as the shares of all pages and watches add up to at most 1; beyond that they simply poll less often. Watches sharing a URL count once, at their shared interval.
-- Requests are conditional (`If-None-Match`) and compressed (`Accept-Encoding: gzip`), so a page with no news usually costs a 304 with no body at all. An instance that returns **no `ETag`** — some Statuspage-compatible feeds are served from other infrastructure and do not — cannot be validated, so every poll downloads the whole feed. gzip keeps that in the single-digit kilobytes; nothing else is needed.
+- **One page, watch or feed is polled per tick**, so a tick costs a single request no matter how many are configured — a set of unreachable endpoints cannot stall the loop long enough for `chime health` to call the heartbeat stale. Each entry takes `tick_interval_sec / poll_interval_sec` of that budget — with `tick_interval_sec = 60`, a page at 300 takes a fifth, a feed at 900 a fifteenth and a watch at 3600 a sixtieth — and every one stays on its nominal interval as long as the shares of all pages, watches and feeds add up to at most 1; beyond that they simply poll less often. Watches sharing a URL count once, at their shared interval.
+- Requests are conditional (`If-None-Match`) and compressed (`Accept-Encoding: gzip`), so a page with no news usually costs a 304 with no body at all. An instance that returns **no `ETag`** — some Statuspage-compatible feeds are served from other infrastructure and do not — cannot be validated, so every poll downloads the whole feed — as do Chrome watches and most RSS feeds. gzip keeps that in the single-digit kilobytes; nothing else is needed.
 
 ### Knowing the poller is alive
 
@@ -352,7 +398,14 @@ Watches get their own `watch poll summary` line over the same window, with the s
 {"timestamp":"2026-06-05T09:00:00.000000Z","level":"INFO","fields":{"message":"watch poll summary","window_sec":3600,"watches":2,"polls":2,"not_modified":1,"updated":1,"failed":0,"forwarded":0,"send_failed":0},"target":"chime::scheduler"}
 ```
 
-As for status pages, `polls`, `not_modified` and `updated` count requests — watches sharing a URL are one request — and `updated` counts 200 responses, not versions that changed, so a Chrome watch reports every poll as `updated`. `failed` also covers a body that was fetched but that at least one watch on it could not read; the posts of the watches that could read it are still counted in `forwarded` / `send_failed`. Each line is omitted when its list is empty.
+As for status pages, `polls`, `not_modified` and `updated` count requests — watches sharing a URL are one request — and `updated` counts 200 responses, not versions that changed, so a Chrome watch reports every poll as `updated`. `failed` also covers a body that was fetched but that at least one watch on it could not read; the posts of the watches that could read it are still counted in `forwarded` / `send_failed`. 
+RSS feeds get a third line, `rss poll summary`, with `feeds` (the number configured) in place of `pages`:
+
+```json
+{"timestamp":"2026-06-05T09:00:00.000000Z","level":"INFO","fields":{"message":"rss poll summary","window_sec":3600,"feeds":1,"polls":4,"not_modified":0,"updated":4,"failed":0,"forwarded":1,"send_failed":0},"target":"chime::scheduler"}
+```
+
+A feed that returns no `ETag` reports every poll as `updated`, and `failed` includes a body that was fetched but is not a feed. Each line is omitted when its list is empty.
 
 > [!IMPORTANT]
 >

@@ -2,6 +2,7 @@ mod config;
 mod fetch;
 mod heartbeat;
 mod notifier;
+mod rss;
 mod runtime;
 mod scheduler;
 mod status;
@@ -18,6 +19,7 @@ use tracing_subscriber::prelude::*;
 use crate::config::{Config, LogLevel};
 use crate::heartbeat::{check_liveness, heartbeat_path};
 use crate::notifier::Discord;
+use crate::rss::FeedEndpoint;
 use crate::runtime::resolve;
 use crate::scheduler::Scheduler;
 use crate::status::Statuspage;
@@ -103,6 +105,7 @@ async fn run_daemon() -> Result<()> {
         reminders = run_cfg.reminders.len(),
         status_pages = run_cfg.status_pages.len(),
         watches = run_cfg.watch_count(),
+        rss = run_cfg.rss.len(),
         interval_sec = run_cfg.interval.as_secs(),
         timezone = %run_cfg.timezone,
         "chime starting"
@@ -115,8 +118,9 @@ async fn run_daemon() -> Result<()> {
         .context("failed to build HTTP client")?;
     let notifier = Discord::new(client.clone());
     let watch_source = JsonEndpoint::new(client.clone());
+    let rss_source = FeedEndpoint::new(client.clone());
     let source = Statuspage::new(client);
-    let scheduler = Scheduler::new(run_cfg, notifier, source, watch_source);
+    let scheduler = Scheduler::new(run_cfg, notifier, source, watch_source, rss_source);
     scheduler
         .run()
         .await
