@@ -1,6 +1,16 @@
 # chime
 
+[![CI](https://github.com/m1sk9/chime/actions/workflows/ci.yaml/badge.svg)](https://github.com/m1sk9/chime/actions/workflows/ci.yaml)
+[![Release chime](https://github.com/m1sk9/chime/actions/workflows/release.yaml/badge.svg)](https://github.com/m1sk9/chime/actions/workflows/release.yaml)
+[![Apache License 2.0](https://img.shields.io/github/license/m1sk9/chime?color=%239944ee)](https://github.com/m1sk9/chime/blob/main/LICENSE)
+[![codecov](https://codecov.io/gh/m1sk9/chime/graph/badge.svg?token=7FMYFTZ2XU)](https://codecov.io/gh/m1sk9/chime)
+
+
 IaC-managed Discord webhook reminder. Reads a TOML schedule, runs as a long-lived process, and posts to Discord webhooks at the configured times. It can also watch Atlassian Statuspage instances and forward incident updates to the same webhooks, watch the Firefox and Chrome release feeds — or any JSON endpoint — to announce new versions, and subscribe to RSS, Atom or JSON feeds to post new entries.
+
+```sh
+docker pull ghcr.io/m1sk9/chime:v0
+```
 
 ## Features
 
