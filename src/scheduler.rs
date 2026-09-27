@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Duration;
 
 use chrono::{DateTime, Timelike, Utc};
@@ -10,7 +11,7 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::fetch::Fetched;
-use crate::notifier::{DiscordMessage, Notifier};
+use crate::notifier::{DiscordMessage, Notifier, NotifyError};
 use crate::runtime::{RunConfig, RunFeed, RunStatusPage};
 use crate::status::{self, PageState, StatusSource};
 use crate::watch::{self, Diff, FeedState, WatchSource};
@@ -160,7 +161,7 @@ impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
     }
 
     async fn tick(&mut self, now: DateTime<Tz>) {
-        self.write_heartbeat();
+        write_heartbeat(&self.cfg.heartbeat_path);
         self.fire_reminders(now).await;
         // Before this tick's poll, not after: the window has to close on the same
         // boundary it opened on, or the closing tick's poll is counted in the window
@@ -187,9 +188,13 @@ impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
             self.last_fired.insert(r.name.clone(), current_minute);
             to_fire.push((r.name.clone(), r.webhook_url.clone(), r.message.clone()));
         }
+        let notifier = Heartbeating {
+            inner: &self.notifier,
+            path: &self.cfg.heartbeat_path,
+        };
         for (name, url, message) in to_fire {
             let payload = DiscordMessage::text(&message);
-            match self.notifier.send(&url, &payload).await {
+            match notifier.send(&url, &payload).await {
                 Ok(()) => info!(reminder = %name, "reminder fired"),
                 Err(e) => error!(reminder = %name, error = %e, "failed to send reminder"),
             }
@@ -213,13 +218,17 @@ impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
         // own interval, not be retried on every tick.
         self.last_polled.insert(job, now);
         // Borrows are split by field rather than cloning the entry: `poll_page` and
-        // `poll_watch` are free functions so `cfg`, the state maps, the sources and
+        // `poll_feed` are free functions so `cfg`, the state maps, the sources and
         // `notifier` can be held at once.
+        let notifier = Heartbeating {
+            inner: &self.notifier,
+            path: &self.cfg.heartbeat_path,
+        };
         match job {
             Job::Page(i) => {
                 let page = &self.cfg.status_pages[i];
                 let state = self.page_states.entry(page.name.clone()).or_default();
-                let outcome = poll_page(&self.source, &self.notifier, page, state).await;
+                let outcome = poll_page(&self.source, &notifier, page, state).await;
                 self.stats.record(outcome);
             }
             Job::Feed(i) => {
@@ -227,7 +236,7 @@ impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
                 let state = self.feed_states.entry(i).or_default();
                 let detected_at = now.with_timezone(&Utc);
                 let outcome =
-                    poll_feed(&self.watch_source, &self.notifier, feed, state, detected_at).await;
+                    poll_feed(&self.watch_source, &notifier, feed, state, detected_at).await;
                 self.watch_stats.record(outcome);
             }
         }
@@ -322,20 +331,41 @@ impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
             .min_by_key(|(job, _)| (Reverse(overdue_secs(self.last_polled.get(job), now)), *job))
             .map(|(job, _)| job)
     }
+}
 
-    /// Write the liveness heartbeat. Called at the start of every tick, before any
-    /// network send, so the signal is independent of Discord reachability. A write
-    /// failure is logged and ignored: a persistent failure ages the mtime and the
-    /// `health` subcommand fails on its own, which is the detection path we want.
-    fn write_heartbeat(&self) {
-        let body = Utc::now().to_rfc3339();
-        if let Err(e) = std::fs::write(&self.cfg.heartbeat_path, body) {
-            warn!(
-                path = %self.cfg.heartbeat_path.display(),
-                error = %e,
-                "failed to write heartbeat"
-            );
-        }
+/// Write the liveness heartbeat. Called at the start of every tick, before any
+/// network send, so the signal is independent of Discord reachability, and again
+/// after every send (see [`Heartbeating`]). A write failure is logged and ignored:
+/// a persistent failure ages the mtime and the `health` subcommand fails on its
+/// own, which is the detection path we want.
+fn write_heartbeat(path: &Path) {
+    let body = Utc::now().to_rfc3339();
+    if let Err(e) = std::fs::write(path, body) {
+        warn!(
+            path = %path.display(),
+            error = %e,
+            "failed to write heartbeat"
+        );
+    }
+}
+
+/// A notifier that refreshes the heartbeat after every send, failed or not.
+///
+/// Why: one tick may send several messages, each allowed the full Discord timeout
+/// — every channel of a shared Firefox feed on release day, or a burst of incident
+/// updates. With the heartbeat written only at the top of the tick, a slow but
+/// working Discord would age it past `2 * tick_interval` and get a loop that is
+/// still making progress restarted by `chime health`.
+struct Heartbeating<'a, N> {
+    inner: &'a N,
+    path: &'a Path,
+}
+
+impl<N: Notifier> Notifier for Heartbeating<'_, N> {
+    async fn send(&self, webhook: &Url, message: &DiscordMessage) -> Result<(), NotifyError> {
+        let result = self.inner.send(webhook, message).await;
+        write_heartbeat(self.path);
+        result
     }
 }
 
@@ -504,7 +534,6 @@ mod tests {
     use super::*;
     use crate::config::{Impact, LogLevel};
     use crate::fetch::FetchError;
-    use crate::notifier::NotifyError;
     use crate::runtime::{
         RunReminder, mk_run_feed, mk_run_status_page, mk_run_watch, mk_shared_feed,
     };
@@ -1498,6 +1527,42 @@ mod tests {
                 send_failed: 0,
             }
         );
+    }
+
+    /// Deletes the heartbeat on every send, standing in for a send slow enough to
+    /// age it: the file exists afterwards only if something rewrote it.
+    #[derive(Clone)]
+    struct HeartbeatEatingNotifier {
+        path: std::path::PathBuf,
+    }
+
+    impl Notifier for HeartbeatEatingNotifier {
+        async fn send(&self, _webhook: &Url, _message: &DiscordMessage) -> Result<(), NotifyError> {
+            let _ = std::fs::remove_file(&self.path);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn every_send_refreshes_the_heartbeat() {
+        let path = hb_path("refresh");
+        let mut cfg = cfg_with_watches(
+            "refresh",
+            vec![mk_run_reminder("daily", 9, 30)],
+            vec![],
+            vec![mk_run_feed("node", Duration::from_secs(300))],
+        );
+        cfg.heartbeat_path = path.clone();
+        let notifier = HeartbeatEatingNotifier { path: path.clone() };
+        let source = FakeWatchSource::with(vec![r#"{"version":"1"}"#, r#"{"version":"2"}"#]);
+        let mut scheduler = Scheduler::new(cfg, notifier, FakeSource::empty(), source);
+
+        // 09:30 sends the reminder; 09:35 sends the release.
+        scheduler.tick(at(9, 30, 0)).await;
+        assert!(path.exists(), "rewritten after the reminder was sent");
+        scheduler.tick(at(9, 35, 0)).await;
+        assert!(path.exists(), "rewritten after the release was sent");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

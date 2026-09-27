@@ -32,6 +32,8 @@ pub enum ExtractError {
     Missing(String),
     #[error("value at JSON pointer `{0}` is not a string or number")]
     NotScalar(String),
+    #[error("value at JSON pointer `{0}` is a fractional number; serve the version as a string")]
+    Fractional(String),
     #[error("value at JSON pointer `{0}` is empty")]
     Empty(String),
     #[error("product-details has no version for the {0} channel")]
@@ -110,8 +112,6 @@ struct ChromeServing {
 pub struct Release {
     /// The dedup key; everything else is display.
     pub version: String,
-    /// When the source says the release went live; `None` when it does not say.
-    pub published_at: Option<DateTime<Utc>>,
     pub detail: ReleaseDetail,
 }
 
@@ -126,6 +126,8 @@ pub enum ReleaseDetail {
     },
     Chrome {
         fraction: Option<f64>,
+        /// When this version started serving, per the API.
+        serving_since: Option<DateTime<Utc>>,
     },
     Plain,
 }
@@ -184,7 +186,6 @@ fn extract_firefox(channel: FirefoxChannel, body: &[u8]) -> Result<Release, Watc
         .map(str::to_string);
     Ok(Release {
         version: version.to_string(),
-        published_at: None,
         detail: ReleaseDetail::Firefox {
             channels,
             next_release_date,
@@ -203,16 +204,16 @@ fn extract_chrome(body: &[u8]) -> Result<Release, WatchError> {
     if version.is_empty() {
         return Err(ExtractError::ChromeNoRelease.into());
     }
-    let published_at = top
+    let serving_since = top
         .serving
         .and_then(|s| s.start_time)
         .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
         .map(|t| t.with_timezone(&Utc));
     Ok(Release {
         version: version.to_string(),
-        published_at,
         detail: ReleaseDetail::Chrome {
             fraction: top.fraction,
+            serving_since,
         },
     })
 }
@@ -222,7 +223,12 @@ fn extract_pointer(pointer: &str, body: &[u8]) -> Result<Release, WatchError> {
     let version = match doc.pointer(pointer) {
         None => return Err(ExtractError::Missing(pointer.to_string()).into()),
         Some(serde_json::Value::String(s)) => s.trim().to_string(),
-        Some(serde_json::Value::Number(n)) => n.to_string(),
+        // Why integers only: a fractional number is parsed as `f64`, so `1.10` would
+        // read back as `1.1` and then equal a later, genuinely different `1.1`.
+        Some(serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => n.to_string(),
+        Some(serde_json::Value::Number(_)) => {
+            return Err(ExtractError::Fractional(pointer.to_string()).into());
+        }
         Some(_) => return Err(ExtractError::NotScalar(pointer.to_string()).into()),
     };
     if version.is_empty() {
@@ -230,7 +236,6 @@ fn extract_pointer(pointer: &str, body: &[u8]) -> Result<Release, WatchError> {
     }
     Ok(Release {
         version,
-        published_at: None,
         detail: ReleaseDetail::Plain,
     })
 }
@@ -306,7 +311,7 @@ pub fn resolve_source(name: &str, kind: &WatchKind) -> Result<SourceSpec, url::P
                 ChromeRollout::Complete => "fraction%3D1,endtime%3Dnone",
             };
             let url = format!(
-                "{CHROME_VERSION_HISTORY}/{}/channels/{}/versions/all/releases?order_by=version%20desc&filter={filter}",
+                "{CHROME_VERSION_HISTORY}/{}/channels/{}/versions/all/releases?order_by=version%20desc&filter={filter}&pageSize=1",
                 platform.as_api_str(),
                 channel.as_api_str(),
             );
@@ -406,8 +411,12 @@ pub fn read_feed(
     results
 }
 
-/// `detected_at` is the embed timestamp whenever the source has no
-/// `published_at` of its own.
+/// `detected_at` is always the embed timestamp.
+///
+/// Why not Chrome's serving start time, although it is the more precise release
+/// time: after a pulled rollout the served version goes back to an older release,
+/// and its start time would date the post days in the past. It is shown as a field
+/// instead.
 pub fn build_message(
     watch: &RunWatch,
     event: &ReleaseEvent,
@@ -452,12 +461,22 @@ pub fn build_message(
                 embed = embed.with_field("Channels", &all, false);
             }
         }
-        ReleaseDetail::Chrome { fraction } => {
+        ReleaseDetail::Chrome {
+            fraction,
+            serving_since,
+        } => {
             if let Some(f) = fraction {
                 embed = embed.with_field("Rollout", &rollout_percent(*f), true);
             }
             if let Some(m) = chrome_milestone(&release.version) {
                 embed = embed.with_field("Milestone", &m.to_string(), true);
+            }
+            if let Some(t) = serving_since {
+                embed = embed.with_field(
+                    "Serving since",
+                    &t.format("%Y-%m-%d %H:%M UTC").to_string(),
+                    true,
+                );
             }
         }
         ReleaseDetail::Plain => {}
@@ -465,7 +484,7 @@ pub fn build_message(
 
     embed = embed
         .with_footer(&watch.host)
-        .with_timestamp(&release.published_at.unwrap_or(detected_at).to_rfc3339());
+        .with_timestamp(&detected_at.to_rfc3339());
     DiscordMessage::embed(embed).with_identity(&watch.display_name, watch.avatar_url.as_deref())
 }
 
@@ -564,7 +583,6 @@ mod test_support {
     pub(crate) fn plain(version: &str) -> Release {
         Release {
             version: version.to_string(),
-            published_at: None,
             detail: ReleaseDetail::Plain,
         }
     }
@@ -655,7 +673,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             started.url.as_str(),
-            "https://versionhistory.googleapis.com/v1/chrome/platforms/mac_arm64/channels/beta/versions/all/releases?order_by=version%20desc&filter=endtime%3Dnone"
+            "https://versionhistory.googleapis.com/v1/chrome/platforms/mac_arm64/channels/beta/versions/all/releases?order_by=version%20desc&filter=endtime%3Dnone&pageSize=1"
         );
         assert_eq!(started.label, "Chrome Beta");
         assert_eq!(
@@ -677,7 +695,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             complete.url.as_str(),
-            "https://versionhistory.googleapis.com/v1/chrome/platforms/win/channels/stable/versions/all/releases?order_by=version%20desc&filter=fraction%3D1,endtime%3Dnone"
+            "https://versionhistory.googleapis.com/v1/chrome/platforms/win/channels/stable/versions/all/releases?order_by=version%20desc&filter=fraction%3D1,endtime%3Dnone&pageSize=1"
         );
         assert_eq!(complete.label, "Chrome Stable");
     }
@@ -719,7 +737,6 @@ mod tests {
                 .extract(FIREFOX_FIXTURE.as_bytes())
                 .unwrap();
             assert_eq!(release.version, version, "{channel:?}");
-            assert!(release.published_at.is_none());
         }
     }
 
@@ -827,13 +844,10 @@ mod tests {
             .unwrap();
         assert_eq!(release.version, "155.0.8059.12");
         assert_eq!(
-            release.published_at,
-            Some(ts("2026-09-23T18:50:42.380821Z"))
-        );
-        assert_eq!(
             release.detail,
             ReleaseDetail::Chrome {
-                fraction: Some(0.005)
+                fraction: Some(0.005),
+                serving_since: Some(ts("2026-09-23T18:50:42.380821Z")),
             }
         );
     }
@@ -860,7 +874,13 @@ mod tests {
         let body = br#"{"releases": [{"version": "1.2.3.4", "serving": {"startTime": "soon"}}]}"#;
         let release = chrome(ChromeChannel::Stable).extract(body).unwrap();
         assert_eq!(release.version, "1.2.3.4");
-        assert!(release.published_at.is_none());
+        assert!(matches!(
+            release.detail,
+            ReleaseDetail::Chrome {
+                serving_since: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -906,6 +926,15 @@ mod tests {
         assert!(matches!(
             err,
             WatchError::Extract(ExtractError::Missing(p)) if p == "/releases/0/version"
+        ));
+    }
+
+    #[test]
+    fn json_pointer_rejects_a_fractional_number() {
+        let err = pointer("/v").extract(br#"{"v": 1.10}"#).unwrap_err();
+        assert!(matches!(
+            err,
+            WatchError::Extract(ExtractError::Fractional(p)) if p == "/v"
         ));
     }
 
@@ -987,9 +1016,9 @@ mod tests {
     fn a_changed_rollout_fraction_alone_is_not_a_change() {
         let at = |fraction| Release {
             version: "155.0.8059.12".to_string(),
-            published_at: None,
             detail: ReleaseDetail::Chrome {
                 fraction: Some(fraction),
+                serving_since: None,
             },
         };
         let mut state = WatchState::default();
@@ -1050,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn chrome_message_reports_rollout_platform_and_serving_time() {
+    fn chrome_message_reports_rollout_platform_and_serving_time_as_a_field() {
         let mut watch = watch_with("chrome", chrome(ChromeChannel::Stable));
         watch.label = "Chrome Stable".to_string();
         let ev = event_from(
@@ -1079,12 +1108,13 @@ mod tests {
                 ("Platform", "win"),
                 ("Rollout", "0.5%"),
                 ("Milestone", "155"),
+                ("Serving since", "2026-09-23 18:50 UTC"),
             ]
         );
         assert_eq!(
             embed.timestamp.as_deref(),
-            Some("2026-09-23T18:50:42.380821+00:00"),
-            "the source's own serving time wins over detection time"
+            Some("2026-09-27T00:00:00+00:00"),
+            "detection time, so a rollback is not dated to the older release"
         );
     }
 

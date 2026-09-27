@@ -404,12 +404,13 @@ impl JsonPointer {
 
 impl TryFrom<String> for JsonPointer {
     type Error = JsonPointerError;
+    // Why not trim like the other string types: in RFC 6901 whitespace is part of
+    // a reference token, so `/v ` and `/v` address different keys.
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        let trimmed = s.trim();
-        if !trimmed.starts_with('/') {
+        if !s.starts_with('/') {
             return Err(JsonPointerError::NotAbsolute(s));
         }
-        Ok(JsonPointer(trimmed.to_string()))
+        Ok(JsonPointer(s))
     }
 }
 
@@ -1450,9 +1451,17 @@ min_impact = "major"
             JsonPointer::try_from("foo".to_string()),
             Err(JsonPointerError::NotAbsolute(_))
         ));
+        assert!(matches!(
+            JsonPointer::try_from(" /a".to_string()),
+            Err(JsonPointerError::NotAbsolute(_))
+        ));
+    }
+
+    #[test]
+    fn json_pointer_keeps_whitespace_that_belongs_to_a_key() {
         assert_eq!(
-            JsonPointer::try_from(" /a ".to_string()).unwrap().as_str(),
-            "/a"
+            JsonPointer::try_from("/v ".to_string()).unwrap().as_str(),
+            "/v "
         );
     }
 

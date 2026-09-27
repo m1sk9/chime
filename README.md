@@ -231,11 +231,11 @@ The feed supports conditional requests, so an unchanged feed costs a `304`. An e
 - `started` (default) — the top version being served, as soon as its staged rollout begins, even at 0.5%. A pulled rollout makes the top version go *down*, and that is reported too.
 - `complete` — only the top version served to 100% of users.
 
-A change in rollout fraction alone is not a new release and posts nothing. The VersionHistory API returns no `ETag`, so every poll downloads the (few-kilobyte) response and is counted as `updated` in the [summary](#knowing-the-poller-is-alive). The embed links to the channel's label on the Chrome Releases blog (canary, which is not announced there, links to the blog itself).
+A change in rollout fraction alone is not a new release and posts nothing. The VersionHistory API returns no `ETag`, so every poll downloads the response — only the top release is requested, well under a kilobyte — and is counted as `updated` in the [summary](#knowing-the-poller-is-alive). The embed links to the channel's label on the Chrome Releases blog (canary, which is not announced there, links to the blog itself).
 
 #### `json`
 
-chime does not know the shape of the document: `pointer` ([RFC 6901](https://www.rfc-editor.org/rfc/rfc6901)) names the one value that is the version. Segments are separated by `/`, array elements are addressed by index, and `~0` / `~1` escape `~` / `/`. The value must be a string or a number; searching inside an array or combining several fields is not possible.
+chime does not know the shape of the document: `pointer` ([RFC 6901](https://www.rfc-editor.org/rfc/rfc6901)) names the one value that is the version. Segments are separated by `/`, array elements are addressed by index, and `~0` / `~1` escape `~` / `/`. The pointer is used exactly as written — whitespace is part of a key, so `/v ` and `/v` are different pointers. The value must be a string or an integer; a fractional number is refused, because `1.10` would read back as `1.1` — serve such a version as a string. Searching inside an array or combining several fields is not possible.
 
 | Feed | `url` | `pointer` |
 |---|---|---|
@@ -267,8 +267,8 @@ product-details.mozilla.org · <time chime saw it>
 ```
 Chrome Stable 155.0.8059.12              ← links to the Chrome Releases blog
 Previous: 154.0.8037.58   Channel: Stable   Platform: win
-Rollout: 0.5%             Milestone: 155
-versionhistory.googleapis.com · <serving start time>
+Rollout: 0.5%             Milestone: 155   Serving since: 2026-09-23 18:50 UTC
+versionhistory.googleapis.com · <time chime saw it>
 ```
 
 ```
@@ -277,7 +277,7 @@ Previous: v24.8.0
 nodejs.org · <time chime saw it>
 ```
 
-The timestamp is the Chrome release's own serving start time. product-details and arbitrary JSON carry no publication time, so for `firefox` and `json` it is when chime noticed the change — up to `poll_interval_sec` after the release.
+The timestamp is always when chime noticed the change — up to `poll_interval_sec` after the release. product-details and arbitrary JSON carry no publication time at all. Chrome does, but after a pulled rollout the served version is an older release whose start time would date the post days in the past, so it is shown as `Serving since` instead.
 
 ### Webhook resolution
 
@@ -369,7 +369,7 @@ As for status pages, `polls`, `not_modified` and `updated` count requests — wa
 
 How it works:
 
-- On every tick the daemon writes the current timestamp to a heartbeat file (default `/tmp/chime.heartbeat`, override with `CHIME_HEARTBEAT_PATH`). The write happens **before** any Discord request, so the signal is independent of network reachability.
+- On every tick the daemon writes the current timestamp to a heartbeat file (default `/tmp/chime.heartbeat`, override with `CHIME_HEARTBEAT_PATH`). The write happens **before** any Discord request, so the signal is independent of network reachability, and is repeated after every Discord request, so a tick that sends several messages to a slow Discord is not mistaken for a hung one.
 - The `chime health` subcommand reads that file's mtime and exits `0` when it is fresh — `now - mtime <= 2 * tick_interval_sec` — and non-zero with a one-line stderr message otherwise (stale, missing, or unreadable). It reads the tick interval from the same `CHIME_CONFIG`, and does **not** require any webhook env var.
 
 The container image already wires this into a `HEALTHCHECK` (exec-form, since distroless has no shell), so `docker ps` / `docker inspect` report health automatically. To set it explicitly in `docker-compose.yml`:

@@ -635,7 +635,7 @@ source = { kind = "chrome", platform = "linux", channel = "dev" }
         let w = &feed.watches[0];
         assert_eq!(
             feed.url.as_str(),
-            "https://versionhistory.googleapis.com/v1/chrome/platforms/linux/channels/dev/versions/all/releases?order_by=version%20desc&filter=endtime%3Dnone"
+            "https://versionhistory.googleapis.com/v1/chrome/platforms/linux/channels/dev/versions/all/releases?order_by=version%20desc&filter=endtime%3Dnone&pageSize=1"
         );
         assert_eq!(w.host, "versionhistory.googleapis.com");
         assert_eq!(w.label, "Chrome Dev");
