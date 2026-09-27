@@ -102,7 +102,7 @@ async fn run_daemon() -> Result<()> {
     info!(
         reminders = run_cfg.reminders.len(),
         status_pages = run_cfg.status_pages.len(),
-        watches = run_cfg.watches.len(),
+        watches = run_cfg.watch_count(),
         interval_sec = run_cfg.interval.as_secs(),
         timezone = %run_cfg.timezone,
         "chime starting"

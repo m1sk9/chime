@@ -250,6 +250,7 @@ A pointer that does not match the document is not caught at startup: like a stat
 - A post is sent whenever the version string **differs** from the last one seen, including when it goes down. There is no version ordering: `140.16.0esr`, `157.0b5` and `v24.9.0` do not share one.
 - The last-seen version is updated **before** the Discord request, so a failed send is not retried.
 - Polling failures (unreachable feed, non-JSON body, pointer that matches nothing) are logged at `warn` and never posted.
+- **Watches that read the same URL share one request** — several Firefox channels, or two `json` watches with different pointers on one endpoint. The shared request runs at the shortest `poll_interval_sec` among them, and one watch failing to read the body does not stop the others from reporting.
 
 #### What it looks like in Discord
 
@@ -258,7 +259,7 @@ Each new version is one embed, attributed to `display_name`, with the feed's hos
 ```
 Firefox 156.0.1                          ← links to the release notes
 Previous: 156.0        Channel: Release
-Released: 2026-09-25   Next release: 2026-10-09      ← release channel only
+Next release: 2026-10-09                  ← release channel only
 Channels: Release 156.0.1 · ESR 140.16.0esr · Beta 157.0b5 · Developer Edition 157.0b5 · Nightly 159.0a1
 product-details.mozilla.org · <time chime saw it>
 ```
@@ -312,6 +313,7 @@ All of the following are rejected at startup with a descriptive error and a non-
 - Duplicate or empty watch `name`
 - `source.kind` that is not `firefox` / `chrome` / `json`, or an unknown key inside `source`
 - `firefox.channel` / `chrome.platform` / `chrome.channel` / `chrome.rollout` outside their listed values
+- `chrome` watch with `channel = "extended"` on `linux`, `android`, `webview` or `ios` — Extended Stable exists only for `win`, `win64`, `mac` and `mac_arm64`, and the API rejects the rest
 - `json` watch whose `url` / `link` is not https, or whose `pointer` does not start with `/`
 
 ## How it works
@@ -331,7 +333,7 @@ Status page polling follows the same rules as reminders:
 - The seen-record is written **before** the Discord request, so a failed send is not retried on the next poll.
 - A status page being unreachable is logged at `warn` and retried on its own interval. chime never posts about its own polling failures.
 - Because polling happens on the tick, an update is forwarded up to `poll_interval_sec` after Statuspage published it. The embed timestamp always shows the real publication time.
-- **One page or watch is polled per tick**, so a tick costs a single request no matter how many are configured — a set of unreachable endpoints cannot stall the loop long enough for `chime health` to call the heartbeat stale. Configure at most `poll_interval_sec / tick_interval_sec` pages and watches in total to keep every one on its nominal interval; beyond that they simply poll less often.
+- **One page or watch is polled per tick**, so a tick costs a single request no matter how many are configured — a set of unreachable endpoints cannot stall the loop long enough for `chime health` to call the heartbeat stale. Each entry takes `tick_interval_sec / poll_interval_sec` of that budget — with `tick_interval_sec = 60`, a page at 300 takes a fifth and a watch at 3600 a sixtieth — and every one stays on its nominal interval as long as the shares of all pages and watches add up to at most 1; beyond that they simply poll less often. Watches sharing a URL count once, at their shared interval.
 - Requests are conditional (`If-None-Match`) and compressed (`Accept-Encoding: gzip`), so a page with no news usually costs a 304 with no body at all. An instance that returns **no `ETag`** — some Statuspage-compatible feeds are served from other infrastructure and do not — cannot be validated, so every poll downloads the whole feed. gzip keeps that in the single-digit kilobytes; nothing else is needed.
 
 ### Knowing the poller is alive
@@ -350,7 +352,7 @@ Watches get their own `watch poll summary` line over the same window, with the s
 {"timestamp":"2026-06-05T09:00:00.000000Z","level":"INFO","fields":{"message":"watch poll summary","window_sec":3600,"watches":2,"polls":2,"not_modified":1,"updated":1,"failed":0,"forwarded":0,"send_failed":0},"target":"chime::scheduler"}
 ```
 
-As for status pages, `updated` counts 200 responses, not versions that changed — a Chrome watch reports every poll as `updated`. `failed` also covers a body that was fetched but held no readable version. Each line is omitted when its list is empty.
+As for status pages, `polls`, `not_modified` and `updated` count requests — watches sharing a URL are one request — and `updated` counts 200 responses, not versions that changed, so a Chrome watch reports every poll as `updated`. `failed` also covers a body that was fetched but that at least one watch on it could not read; the posts of the watches that could read it are still counted in `forwarded` / `send_failed`. Each line is omitted when its list is empty.
 
 > [!IMPORTANT]
 >

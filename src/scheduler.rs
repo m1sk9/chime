@@ -11,9 +11,9 @@ use url::Url;
 
 use crate::fetch::Fetched;
 use crate::notifier::{DiscordMessage, Notifier};
-use crate::runtime::{RunConfig, RunStatusPage, RunWatch};
+use crate::runtime::{RunConfig, RunFeed, RunStatusPage};
 use crate::status::{self, PageState, StatusSource};
-use crate::watch::{self, Diff, WatchSource, WatchState};
+use crate::watch::{self, Diff, FeedState, WatchSource};
 
 /// How often the pollers report that they are alive.
 ///
@@ -29,8 +29,18 @@ const STATUS_SUMMARY_INTERVAL: Duration = Duration::from_secs(3600);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PollOutcome {
     NotModified,
-    Updated { forwarded: u64, send_failed: u64 },
+    Updated {
+        forwarded: u64,
+        send_failed: u64,
+    },
     Failed,
+    /// A shared feed was fetched, but at least one watch on it could not read its
+    /// version. Counted as `failed`; the watches that could read were still diffed
+    /// and sent, and their posts are counted as usual.
+    PartlyUnreadable {
+        forwarded: u64,
+        send_failed: u64,
+    },
 }
 
 /// Counters for one summary window. Reset when the window closes.
@@ -58,6 +68,14 @@ impl PollStats {
                 self.send_failed += send_failed;
             }
             PollOutcome::Failed => self.failed += 1,
+            PollOutcome::PartlyUnreadable {
+                forwarded,
+                send_failed,
+            } => {
+                self.failed += 1;
+                self.forwarded += forwarded;
+                self.send_failed += send_failed;
+            }
         }
     }
 }
@@ -70,7 +88,7 @@ impl PollStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Job {
     Page(usize),
-    Watch(usize),
+    Feed(usize),
 }
 
 /// One closed summary window. A struct rather than a tuple of two `PollStats`
@@ -90,7 +108,7 @@ pub struct Scheduler<N: Notifier, S: StatusSource, W: WatchSource> {
     last_fired: HashMap<String, DateTime<Tz>>,
     last_polled: HashMap<Job, DateTime<Tz>>,
     page_states: HashMap<String, PageState>,
-    watch_states: HashMap<String, WatchState>,
+    feed_states: HashMap<usize, FeedState>,
     stats: PollStats,
     watch_stats: PollStats,
     /// `None` until the first tick: the window is anchored to a real tick rather
@@ -109,7 +127,7 @@ impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
             last_fired: HashMap::new(),
             last_polled: HashMap::new(),
             page_states: HashMap::new(),
-            watch_states: HashMap::new(),
+            feed_states: HashMap::new(),
             stats: PollStats::default(),
             watch_stats: PollStats::default(),
             summary_window_start: None,
@@ -204,10 +222,12 @@ impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
                 let outcome = poll_page(&self.source, &self.notifier, page, state).await;
                 self.stats.record(outcome);
             }
-            Job::Watch(i) => {
-                let w = &self.cfg.watches[i];
-                let state = self.watch_states.entry(w.name.clone()).or_default();
-                let outcome = poll_watch(&self.watch_source, &self.notifier, w, state).await;
+            Job::Feed(i) => {
+                let feed = &self.cfg.feeds[i];
+                let state = self.feed_states.entry(i).or_default();
+                let detected_at = now.with_timezone(&Utc);
+                let outcome =
+                    poll_feed(&self.watch_source, &self.notifier, feed, state, detected_at).await;
                 self.watch_stats.record(outcome);
             }
         }
@@ -233,11 +253,11 @@ impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
                 "status poll summary"
             );
         }
-        if !self.cfg.watches.is_empty() {
+        if !self.cfg.feeds.is_empty() {
             let stats = summary.watches;
             info!(
                 window_sec,
-                watches = self.cfg.watches.len(),
+                watches = self.cfg.watch_count(),
                 polls = stats.polls,
                 not_modified = stats.not_modified,
                 updated = stats.updated,
@@ -255,7 +275,7 @@ impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
     fn take_due_summary(&mut self, now: DateTime<Tz>) -> Option<Summary> {
         // A reminder-only deployment has no poller to prove alive; staying silent
         // keeps this out of logs that would never contain a poll line anyway.
-        if self.cfg.status_pages.is_empty() && self.cfg.watches.is_empty() {
+        if self.cfg.status_pages.is_empty() && self.cfg.feeds.is_empty() {
             return None;
         }
         let Some(start) = self.summary_window_start else {
@@ -289,9 +309,9 @@ impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
     fn jobs(&self) -> impl Iterator<Item = (Job, Duration)> + '_ {
         let pages = (self.cfg.status_pages.iter().enumerate())
             .map(|(i, p)| (Job::Page(i), p.poll_interval));
-        let watches =
-            (self.cfg.watches.iter().enumerate()).map(|(i, w)| (Job::Watch(i), w.poll_interval));
-        pages.chain(watches)
+        let feeds =
+            (self.cfg.feeds.iter().enumerate()).map(|(i, f)| (Job::Feed(i), f.poll_interval));
+        pages.chain(feeds)
     }
 
     fn most_overdue(&self, now: DateTime<Tz>) -> Option<Job> {
@@ -376,81 +396,80 @@ async fn poll_page<N: Notifier, S: StatusSource>(
     }
 }
 
-async fn poll_watch<N: Notifier, W: WatchSource>(
+async fn poll_feed<N: Notifier, W: WatchSource>(
     source: &W,
     notifier: &N,
-    w: &RunWatch,
-    state: &mut WatchState,
+    feed: &RunFeed,
+    state: &mut FeedState,
+    detected_at: DateTime<Utc>,
 ) -> PollOutcome {
-    let etag = state.etag.clone();
-    let fetched = match source.fetch(&w.url, etag.as_deref()).await {
+    let fetched = match source.fetch(&feed.url, state.etag()).await {
         Ok(f) => f,
         Err(e) => {
-            warn!(watch = %w.name, error = %e, "failed to poll watch");
+            warn!(watch = %feed.names(), error = %e, "failed to poll watch");
             return PollOutcome::Failed;
         }
     };
-    let (body, new_etag) = match fetched {
+    let (body, etag) = match fetched {
         Fetched::NotModified => {
-            debug!(watch = %w.name, "watch not modified");
+            debug!(watch = %feed.names(), "watch not modified");
             return PollOutcome::NotModified;
         }
         Fetched::Modified { value, etag } => (value, etag),
     };
-    let release = match w.extractor.extract(&body) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(watch = %w.name, error = %e, "failed to read release from watch");
-            return PollOutcome::Failed;
-        }
-    };
-    // Only after a successful extract: an ETag stored for a body chime could not
-    // read would turn every later poll into a 304, and a broken pointer would stop
-    // showing up as `failed` or as a warning.
-    state.etag = new_etag;
 
-    let event = match watch::diff(state, release) {
-        Diff::Baseline(version) => {
-            info!(watch = %w.name, version = %version, "watch baseline recorded");
-            return PollOutcome::Updated {
-                forwarded: 0,
-                send_failed: 0,
-            };
-        }
-        Diff::Unchanged => {
-            debug!(watch = %w.name, "watch unchanged");
-            return PollOutcome::Updated {
-                forwarded: 0,
-                send_failed: 0,
-            };
-        }
-        Diff::Changed(event) => event,
-    };
-    let message = watch::build_message(w, &event, Utc::now());
-    match notifier.send(&w.webhook_url, &message).await {
-        Ok(()) => {
-            info!(
-                watch = %w.name,
-                version = %event.release.version,
-                previous = %event.previous,
-                "release forwarded"
-            );
-            PollOutcome::Updated {
-                forwarded: 1,
-                send_failed: 0,
+    let results = watch::read_feed(state, &feed.watches, &body, etag);
+    let mut unreadable = false;
+    let mut forwarded = 0;
+    let mut send_failed = 0;
+    for (w, result) in feed.watches.iter().zip(results) {
+        let event = match result {
+            Err(e) => {
+                unreadable = true;
+                warn!(watch = %w.name, error = %e, "failed to read release from watch");
+                continue;
+            }
+            Ok(Diff::Baseline(version)) => {
+                info!(watch = %w.name, version = %version, "watch baseline recorded");
+                continue;
+            }
+            Ok(Diff::Unchanged) => {
+                debug!(watch = %w.name, "watch unchanged");
+                continue;
+            }
+            Ok(Diff::Changed(event)) => event,
+        };
+        let message = watch::build_message(w, &event, detected_at);
+        match notifier.send(&w.webhook_url, &message).await {
+            Ok(()) => {
+                forwarded += 1;
+                info!(
+                    watch = %w.name,
+                    version = %event.release.version,
+                    previous = %event.previous,
+                    "release forwarded"
+                );
+            }
+            Err(e) => {
+                send_failed += 1;
+                error!(
+                    watch = %w.name,
+                    version = %event.release.version,
+                    error = %e,
+                    "failed to forward release"
+                );
             }
         }
-        Err(e) => {
-            error!(
-                watch = %w.name,
-                version = %event.release.version,
-                error = %e,
-                "failed to forward release"
-            );
-            PollOutcome::Updated {
-                forwarded: 0,
-                send_failed: 1,
-            }
+    }
+    if unreadable {
+        PollOutcome::PartlyUnreadable {
+            forwarded,
+            send_failed,
+        }
+    } else {
+        PollOutcome::Updated {
+            forwarded,
+            send_failed,
         }
     }
 }
@@ -486,7 +505,9 @@ mod tests {
     use crate::config::{Impact, LogLevel};
     use crate::fetch::FetchError;
     use crate::notifier::NotifyError;
-    use crate::runtime::{RunReminder, mk_run_status_page, mk_run_watch};
+    use crate::runtime::{
+        RunReminder, mk_run_feed, mk_run_status_page, mk_run_watch, mk_shared_feed,
+    };
     use crate::status::{Incident, StatusError, mk_incident, mk_update};
     use chrono::TimeZone;
     use chrono_tz::Asia::Tokyo;
@@ -498,6 +519,7 @@ mod tests {
     struct CountingNotifier {
         count: Arc<AtomicUsize>,
         messages: Arc<Mutex<Vec<DiscordMessage>>>,
+        timestamps: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     impl CountingNotifier {
@@ -505,6 +527,7 @@ mod tests {
             CountingNotifier {
                 count: Arc::new(AtomicUsize::new(0)),
                 messages: Arc::new(Mutex::new(Vec::new())),
+                timestamps: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -516,6 +539,10 @@ mod tests {
     impl Notifier for CountingNotifier {
         async fn send(&self, _webhook: &Url, message: &DiscordMessage) -> Result<(), NotifyError> {
             self.count.fetch_add(1, Ordering::SeqCst);
+            self.timestamps
+                .lock()
+                .unwrap()
+                .push(message.embeds.first().and_then(|e| e.timestamp.clone()));
             self.messages.lock().unwrap().push(DiscordMessage {
                 content: message.content.clone(),
                 username: message.username.clone(),
@@ -749,7 +776,7 @@ mod tests {
         tag: &str,
         reminders: Vec<RunReminder>,
         status_pages: Vec<RunStatusPage>,
-        watches: Vec<RunWatch>,
+        feeds: Vec<RunFeed>,
     ) -> RunConfig {
         RunConfig {
             log_level: LogLevel::Info,
@@ -757,7 +784,7 @@ mod tests {
             timezone: Tokyo,
             reminders,
             status_pages,
-            watches,
+            feeds,
             heartbeat_path: hb_path(tag),
         }
     }
@@ -1159,7 +1186,7 @@ mod tests {
             tag,
             vec![],
             vec![],
-            vec![mk_run_watch("node", Duration::from_secs(300))],
+            vec![mk_run_feed("node", Duration::from_secs(300))],
         )
     }
 
@@ -1210,6 +1237,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_release_without_its_own_time_is_stamped_with_the_tick_that_saw_it() {
+        let notifier = CountingNotifier::new();
+        let source = FakeWatchSource::with(vec![r#"{"version":"1"}"#, r#"{"version":"2"}"#]);
+        let cfg = one_watch("watch_detected_at");
+        let mut scheduler = Scheduler::new(cfg, notifier.clone(), FakeSource::empty(), source);
+
+        scheduler.tick(at(9, 0, 0)).await;
+        scheduler.tick(at(9, 5, 0)).await;
+
+        assert_eq!(
+            *notifier.timestamps.lock().unwrap(),
+            vec![Some("2026-06-05T00:05:00+00:00".to_string())],
+            "09:05 in Tokyo, rendered in UTC"
+        );
+    }
+
+    #[tokio::test]
     async fn an_unchanged_watch_body_posts_nothing() {
         let notifier = CountingNotifier::new();
         let source = FakeWatchSource::with(vec![r#"{"version":"1"}"#]);
@@ -1233,7 +1277,7 @@ mod tests {
             "watch_fail",
             vec![mk_run_reminder("daily", 9, 30)],
             vec![],
-            vec![mk_run_watch("node", Duration::from_secs(60))],
+            vec![mk_run_feed("node", Duration::from_secs(60))],
         );
         let mut scheduler =
             Scheduler::new(cfg, notifier.clone(), FakeSource::empty(), source.clone());
@@ -1275,7 +1319,7 @@ mod tests {
             "shared_budget",
             vec![],
             vec![mk_run_status_page("claude", Duration::from_secs(60))],
-            vec![mk_run_watch("node", Duration::from_secs(60))],
+            vec![mk_run_feed("node", Duration::from_secs(60))],
         );
         let mut scheduler =
             Scheduler::new(cfg, CountingNotifier::new(), pages.clone(), watches.clone());
@@ -1293,14 +1337,14 @@ mod tests {
             "overdue_mixed",
             vec![],
             vec![mk_run_status_page("claude", Duration::from_secs(60))],
-            vec![mk_run_watch("node", Duration::from_secs(60))],
+            vec![mk_run_feed("node", Duration::from_secs(60))],
         );
         let watches = FakeWatchSource::with(vec![r#"{"version":"1"}"#]);
         let pages = FakeSource::empty();
         let mut scheduler =
             Scheduler::new(cfg, CountingNotifier::new(), pages.clone(), watches.clone());
         scheduler.last_polled.insert(Job::Page(0), at(9, 0, 0));
-        scheduler.last_polled.insert(Job::Watch(0), at(8, 0, 0));
+        scheduler.last_polled.insert(Job::Feed(0), at(8, 0, 0));
 
         scheduler.tick(at(9, 5, 0)).await;
 
@@ -1314,7 +1358,7 @@ mod tests {
             "overdue_tie",
             vec![],
             vec![mk_run_status_page("claude", Duration::from_secs(60))],
-            vec![mk_run_watch("node", Duration::from_secs(60))],
+            vec![mk_run_feed("node", Duration::from_secs(60))],
         );
         let watches = FakeWatchSource::with(vec![r#"{"version":"1"}"#]);
         let pages = FakeSource::empty();
@@ -1335,8 +1379,8 @@ mod tests {
             vec![],
             vec![],
             vec![
-                mk_run_watch("ok", Duration::from_secs(300)),
-                mk_run_watch("bad", Duration::from_secs(300)),
+                mk_run_feed("ok", Duration::from_secs(300)),
+                mk_run_feed("bad", Duration::from_secs(300)),
             ],
         );
         let mut scheduler = Scheduler::new(cfg, RejectingNotifier, FakeSource::empty(), {
@@ -1376,6 +1420,84 @@ mod tests {
         let summary = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
         assert_eq!(summary.watches.polls, 1);
         assert_eq!(summary.watches.not_modified, 1);
+    }
+
+    fn pointer_watch(name: &str, pointer: &str) -> crate::runtime::RunWatch {
+        let mut w = mk_run_watch(name);
+        w.extractor = crate::watch::Extractor::JsonPointer {
+            pointer: pointer.to_string(),
+        };
+        w
+    }
+
+    #[tokio::test]
+    async fn watches_on_one_url_share_a_single_request() {
+        let notifier = CountingNotifier::new();
+        let source = FakeWatchSource::with(vec![r#"{"a":"1","b":"1"}"#, r#"{"a":"2","b":"1"}"#]);
+        let cfg = cfg_with_watches(
+            "shared_feed",
+            vec![],
+            vec![],
+            vec![mk_shared_feed(
+                "shared",
+                Duration::from_secs(300),
+                vec![pointer_watch("a", "/a"), pointer_watch("b", "/b")],
+            )],
+        );
+        let mut scheduler =
+            Scheduler::new(cfg, notifier.clone(), FakeSource::empty(), source.clone());
+
+        scheduler.tick(at(9, 0, 0)).await;
+        assert_eq!(source.calls(), 1, "both watches baselined from one request");
+        scheduler.tick(at(9, 5, 0)).await;
+
+        assert_eq!(source.calls(), 2);
+        assert_eq!(notifier.sent(), 1, "only `a` changed");
+        let sent = notifier.messages.lock().unwrap();
+        assert_eq!(sent[0].username.as_deref(), Some("a Releases"));
+    }
+
+    #[tokio::test]
+    async fn one_unreadable_watch_does_not_silence_the_others_on_its_feed() {
+        let notifier = CountingNotifier::new();
+        let source = FakeWatchSource::with(vec![r#"{"a":"1"}"#, r#"{"a":"2"}"#]);
+        let cfg = cfg_with_watches(
+            "partly_unreadable",
+            vec![],
+            vec![],
+            vec![mk_shared_feed(
+                "partly",
+                Duration::from_secs(300),
+                vec![
+                    pointer_watch("a", "/a"),
+                    pointer_watch("broken", "/missing"),
+                ],
+            )],
+        );
+        let mut scheduler =
+            Scheduler::new(cfg, notifier.clone(), FakeSource::empty(), source.clone());
+
+        scheduler.tick(at(9, 0, 0)).await;
+        scheduler.tick(at(9, 5, 0)).await;
+
+        assert_eq!(notifier.sent(), 1, "`a` still reports its change");
+        assert_eq!(
+            *source.seen_etags.lock().unwrap(),
+            vec![None, None],
+            "the feed never answers 304 while one of its watches cannot read it"
+        );
+        let summary = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
+        assert_eq!(
+            summary.watches,
+            PollStats {
+                polls: 2,
+                not_modified: 0,
+                updated: 0,
+                failed: 2,
+                forwarded: 1,
+                send_failed: 0,
+            }
+        );
     }
 
     #[test]

@@ -104,21 +104,47 @@ pub struct RunStatusPage {
     pub avatar_url: Option<String>,
 }
 
-/// A watch with its source URL built, its extractor chosen and its webhook read
-/// from the environment.
+/// A watch with its extractor chosen and its webhook read from the environment.
+/// Where it is fetched from, and how often, belongs to its `RunFeed`.
 #[derive(Debug, Clone)]
 pub struct RunWatch {
     pub name: String,
     /// Embed title prefix, e.g. `Firefox`, `Chrome Stable`, or the watch name for `json`.
     pub label: String,
-    pub url: Url,
     /// Shown in the embed footer, e.g. `product-details.mozilla.org`.
     pub host: String,
     pub extractor: Extractor,
+    /// The configured `link` of a `json` watch; the presets derive theirs.
+    pub link: Option<String>,
     pub webhook_url: Url,
-    pub poll_interval: Duration,
     pub display_name: String,
     pub avatar_url: Option<String>,
+}
+
+/// Every watch that reads one URL, polled with a single request.
+///
+/// Why group at all: several Firefox channels are one 638-byte document, and
+/// fetching it once per watch would spend that many slots of the one-fetch-per-tick
+/// budget on identical bytes.
+#[derive(Debug, Clone)]
+pub struct RunFeed {
+    pub url: Url,
+    /// The shortest `poll_interval_sec` among `watches`: a watch is never polled
+    /// less often than it asked for.
+    pub poll_interval: Duration,
+    /// Never empty, in declaration order.
+    pub watches: Vec<RunWatch>,
+}
+
+impl RunFeed {
+    /// The watch names, for log lines about the shared request.
+    pub fn names(&self) -> String {
+        self.watches
+            .iter()
+            .map(|w| w.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -128,8 +154,14 @@ pub struct RunConfig {
     pub timezone: Tz,
     pub reminders: Vec<RunReminder>,
     pub status_pages: Vec<RunStatusPage>,
-    pub watches: Vec<RunWatch>,
+    pub feeds: Vec<RunFeed>,
     pub heartbeat_path: PathBuf,
+}
+
+impl RunConfig {
+    pub fn watch_count(&self) -> usize {
+        self.feeds.iter().map(|f| f.watches.len()).sum()
+    }
 }
 
 pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
@@ -183,7 +215,7 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
             avatar_url: p.avatar_url.map(|a| a.into_string()),
         });
     }
-    let mut watches = Vec::with_capacity(cfg.watches.len());
+    let mut feeds: Vec<RunFeed> = Vec::new();
     for w in cfg.watches {
         let name = w.name.as_str().to_string();
         let webhook_url =
@@ -201,17 +233,28 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
             .display_name
             .map(|d| d.as_str().to_string())
             .unwrap_or_else(|| spec.label.clone());
-        watches.push(RunWatch {
+        let watch = RunWatch {
             name,
             host: spec.url.host_str().unwrap_or_default().to_string(),
             label: spec.label,
-            url: spec.url,
             extractor: spec.extractor,
+            link: spec.link,
             webhook_url,
-            poll_interval: w.poll_interval_sec.as_duration(),
             display_name,
             avatar_url: w.avatar_url.map(|a| a.into_string()),
-        });
+        };
+        let poll_interval = w.poll_interval_sec.as_duration();
+        match feeds.iter_mut().find(|f| f.url == spec.url) {
+            Some(feed) => {
+                feed.poll_interval = feed.poll_interval.min(poll_interval);
+                feed.watches.push(watch);
+            }
+            None => feeds.push(RunFeed {
+                url: spec.url,
+                poll_interval,
+                watches: vec![watch],
+            }),
+        }
     }
 
     Ok(RunConfig {
@@ -220,7 +263,7 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
         timezone: cfg.system.timezone,
         reminders,
         status_pages,
-        watches,
+        feeds,
         heartbeat_path: heartbeat_path(),
     })
 }
@@ -299,20 +342,36 @@ mod test_support {
         }
     }
 
-    pub(crate) fn mk_run_watch(name: &str, poll_interval: Duration) -> RunWatch {
+    /// A `json` watch reading `/version`, with no link.
+    pub(crate) fn mk_run_watch(name: &str) -> RunWatch {
         RunWatch {
             name: name.to_string(),
             label: name.to_string(),
-            url: Url::parse(&format!("https://watch.{name}.example/versions.json")).unwrap(),
             host: format!("watch.{name}.example"),
             extractor: Extractor::JsonPointer {
                 pointer: "/version".to_string(),
-                link: None,
             },
+            link: None,
             webhook_url: Url::parse("https://discord.example/webhook").unwrap(),
-            poll_interval,
             display_name: format!("{name} Releases"),
             avatar_url: None,
+        }
+    }
+
+    /// A feed of its own for `mk_run_watch(name)`.
+    pub(crate) fn mk_run_feed(name: &str, poll_interval: Duration) -> RunFeed {
+        mk_shared_feed(name, poll_interval, vec![mk_run_watch(name)])
+    }
+
+    pub(crate) fn mk_shared_feed(
+        host: &str,
+        poll_interval: Duration,
+        watches: Vec<RunWatch>,
+    ) -> RunFeed {
+        RunFeed {
+            url: Url::parse(&format!("https://watch.{host}.example/versions.json")).unwrap(),
+            poll_interval,
+            watches,
         }
     }
 }
@@ -540,19 +599,20 @@ name = "ff-esr"
 webhook = "watch-firefox"
 source = { kind = "firefox", channel = "esr" }
 "#;
-        let w = resolve(Config::from_toml(toml).unwrap())
+        let feed = resolve(Config::from_toml(toml).unwrap())
             .unwrap()
-            .watches
+            .feeds
             .remove(0);
+        let w = &feed.watches[0];
         assert_eq!(w.name, "ff-esr");
         assert_eq!(w.label, "Firefox ESR");
         assert_eq!(
-            w.url.as_str(),
+            feed.url.as_str(),
             "https://product-details.mozilla.org/1.0/firefox_versions.json"
         );
         assert_eq!(w.host, "product-details.mozilla.org");
         assert_eq!(w.webhook_url.as_str(), "https://example.com/hook");
-        assert_eq!(w.poll_interval, Duration::from_secs(3600));
+        assert_eq!(feed.poll_interval, Duration::from_secs(3600));
     }
 
     #[test]
@@ -568,12 +628,13 @@ name = "chrome"
 webhook = "watch-chrome"
 source = { kind = "chrome", platform = "linux", channel = "dev" }
 "#;
-        let w = resolve(Config::from_toml(toml).unwrap())
+        let feed = resolve(Config::from_toml(toml).unwrap())
             .unwrap()
-            .watches
+            .feeds
             .remove(0);
+        let w = &feed.watches[0];
         assert_eq!(
-            w.url.as_str(),
+            feed.url.as_str(),
             "https://versionhistory.googleapis.com/v1/chrome/platforms/linux/channels/dev/versions/all/releases?order_by=version%20desc&filter=endtime%3Dnone"
         );
         assert_eq!(w.host, "versionhistory.googleapis.com");
@@ -595,11 +656,12 @@ source = { kind = "json", url = "https://nodejs.org/dist/index.json", pointer = 
 display_name = "Node.js"
 avatar_url = "https://example.com/node.png"
 "#;
-        let w = resolve(Config::from_toml(toml).unwrap())
+        let feed = resolve(Config::from_toml(toml).unwrap())
             .unwrap()
-            .watches
+            .feeds
             .remove(0);
-        assert_eq!(w.url.as_str(), "https://nodejs.org/dist/index.json");
+        let w = &feed.watches[0];
+        assert_eq!(feed.url.as_str(), "https://nodejs.org/dist/index.json");
         assert_eq!(w.host, "nodejs.org");
         assert_eq!(w.label, "node");
         assert_eq!(w.display_name, "Node.js");
@@ -611,9 +673,50 @@ avatar_url = "https://example.com/node.png"
             w.extractor,
             Extractor::JsonPointer {
                 pointer: "/0/version".to_string(),
-                link: None,
             }
         );
+    }
+
+    #[test]
+    fn resolve_shares_one_feed_between_watches_on_the_same_url() {
+        let _g = EnvGuard::set("CHIME_WEBHOOK_WATCH_SHARED", "https://example.com/hook");
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[watches]]
+name = "ff"
+webhook = "watch-shared"
+source = { kind = "firefox" }
+
+[[watches]]
+name = "chrome"
+webhook = "watch-shared"
+source = { kind = "chrome" }
+
+[[watches]]
+name = "ff-esr"
+webhook = "watch-shared"
+source = { kind = "firefox", channel = "esr" }
+poll_interval_sec = 600
+"#;
+        let run = resolve(Config::from_toml(toml).unwrap()).unwrap();
+        assert_eq!(run.watch_count(), 3);
+        assert_eq!(run.feeds.len(), 2);
+
+        let firefox = &run.feeds[0];
+        assert_eq!(
+            firefox.url.as_str(),
+            "https://product-details.mozilla.org/1.0/firefox_versions.json"
+        );
+        assert_eq!(firefox.names(), "ff,ff-esr");
+        assert_eq!(
+            firefox.poll_interval,
+            Duration::from_secs(600),
+            "the shared request runs at the shortest interval any member asked for"
+        );
+        assert_eq!(run.feeds[1].names(), "chrome");
     }
 
     #[test]
@@ -629,10 +732,11 @@ name = "chrome-stable-win"
 webhook = "watch-label"
 source = { kind = "chrome" }
 "#;
-        let w = resolve(Config::from_toml(toml).unwrap())
+        let feed = resolve(Config::from_toml(toml).unwrap())
             .unwrap()
-            .watches
+            .feeds
             .remove(0);
+        let w = &feed.watches[0];
         assert_eq!(w.display_name, "Chrome Stable");
     }
 

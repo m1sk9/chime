@@ -20,8 +20,6 @@ const COLOR_RELEASE: u32 = 0x5865F2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WatchError {
-    #[error(transparent)]
-    Fetch(#[from] FetchError),
     #[error("response is not the expected JSON: {0}")]
     Decode(#[source] serde_json::Error),
     #[error(transparent)]
@@ -44,25 +42,27 @@ pub enum ExtractError {
 
 // Why not `deny_unknown_fields`: like the Statuspage wire types, these mirror
 // third-party APIs that add keys without notice.
-// Why every key is defaulted: product-details publishes channels that are empty for
+// Why every key is an `Option`: product-details publishes channels that are empty for
 // part of the release cycle (`FIREFOX_ESR_NEXT`, `FIREFOX_AURORA`). Only the channel a
-// watch selects has to be present, and that is checked at extraction time.
+// watch selects has to be present, and that is checked at extraction time. Why not
+// `String` with `default`: that covers a missing key but not a `null`, and one `null`
+// in a channel nobody watches would fail the decode for every Firefox watch.
+// Why not `LAST_RELEASE_DATE`: it is the date of the last major release, not of the
+// version in the embed title — a dot release does not move it.
 #[derive(Debug, Deserialize)]
 struct FirefoxVersions {
     #[serde(rename = "LATEST_FIREFOX_VERSION", default)]
-    release: String,
+    release: Option<String>,
     #[serde(rename = "FIREFOX_ESR", default)]
-    esr: String,
+    esr: Option<String>,
     #[serde(rename = "LATEST_FIREFOX_RELEASED_DEVEL_VERSION", default)]
-    beta: String,
+    beta: Option<String>,
     #[serde(rename = "FIREFOX_DEVEDITION", default)]
-    devedition: String,
+    devedition: Option<String>,
     #[serde(rename = "FIREFOX_NIGHTLY", default)]
-    nightly: String,
-    #[serde(rename = "LAST_RELEASE_DATE", default)]
-    last_release_date: String,
+    nightly: Option<String>,
     #[serde(rename = "NEXT_RELEASE_DATE", default)]
-    next_release_date: String,
+    next_release_date: Option<String>,
 }
 
 impl FirefoxVersions {
@@ -74,6 +74,8 @@ impl FirefoxVersions {
             FirefoxChannel::Devedition => &self.devedition,
             FirefoxChannel::Nightly => &self.nightly,
         }
+        .as_deref()
+        .unwrap_or_default()
         .trim()
     }
 }
@@ -101,11 +103,13 @@ struct ChromeServing {
     start_time: Option<String>,
 }
 
-/// One observed release. `version` is the dedup key; everything else is display.
+/// One observed release: only what the fetched body said. What the watch's own
+/// config already determines (channel, platform, link) is read from `RunWatch`
+/// when the message is built.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Release {
+    /// The dedup key; everything else is display.
     pub version: String,
-    pub link: Option<String>,
     /// When the source says the release went live; `None` when it does not say.
     pub published_at: Option<DateTime<Utc>>,
     pub detail: ReleaseDetail,
@@ -114,19 +118,14 @@ pub struct Release {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReleaseDetail {
     Firefox {
-        channel: FirefoxChannel,
         /// `(label, version)` for every non-empty channel, in the order Release,
         /// ESR, Beta, Developer Edition, Nightly.
         channels: Vec<(&'static str, String)>,
         /// Only for the release channel; product-details has no dates for the others.
-        last_release_date: Option<String>,
         next_release_date: Option<String>,
     },
     Chrome {
-        channel: ChromeChannel,
-        platform: ChromePlatform,
         fraction: Option<f64>,
-        milestone: Option<u32>,
     },
     Plain,
 }
@@ -144,7 +143,6 @@ pub enum Extractor {
     },
     JsonPointer {
         pointer: String,
-        link: Option<String>,
     },
 }
 
@@ -153,8 +151,8 @@ impl Extractor {
     pub fn extract(&self, body: &[u8]) -> Result<Release, WatchError> {
         match self {
             Extractor::Firefox { channel } => extract_firefox(*channel, body),
-            Extractor::Chrome { platform, channel } => extract_chrome(*platform, *channel, body),
-            Extractor::JsonPointer { pointer, link } => extract_pointer(pointer, link, body),
+            Extractor::Chrome { .. } => extract_chrome(body),
+            Extractor::JsonPointer { pointer } => extract_pointer(pointer, body),
         }
     }
 }
@@ -178,28 +176,23 @@ fn extract_firefox(channel: FirefoxChannel, body: &[u8]) -> Result<Release, Watc
         .filter(|c| !wire.get(**c).is_empty())
         .map(|c| (c.label(), wire.get(*c).to_string()))
         .collect();
-    let release_date = |d: &str| {
-        let d = d.trim();
-        (channel == FirefoxChannel::Release && !d.is_empty()).then(|| d.to_string())
-    };
+    let next_release_date = wire
+        .next_release_date
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| channel == FirefoxChannel::Release && !d.is_empty())
+        .map(str::to_string);
     Ok(Release {
         version: version.to_string(),
-        link: Some(firefox_release_notes(channel, version)),
         published_at: None,
         detail: ReleaseDetail::Firefox {
-            channel,
             channels,
-            last_release_date: release_date(&wire.last_release_date),
-            next_release_date: release_date(&wire.next_release_date),
+            next_release_date,
         },
     })
 }
 
-fn extract_chrome(
-    platform: ChromePlatform,
-    channel: ChromeChannel,
-    body: &[u8],
-) -> Result<Release, WatchError> {
+fn extract_chrome(body: &[u8]) -> Result<Release, WatchError> {
     let wire: ChromeReleases = serde_json::from_slice(body).map_err(WatchError::Decode)?;
     let top = wire
         .releases
@@ -215,25 +208,16 @@ fn extract_chrome(
         .and_then(|s| s.start_time)
         .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
         .map(|t| t.with_timezone(&Utc));
-    let milestone = version.split('.').next().and_then(|m| m.parse().ok());
     Ok(Release {
         version: version.to_string(),
-        link: Some(chrome_channel_link(channel)),
         published_at,
         detail: ReleaseDetail::Chrome {
-            channel,
-            platform,
             fraction: top.fraction,
-            milestone,
         },
     })
 }
 
-fn extract_pointer(
-    pointer: &str,
-    link: &Option<String>,
-    body: &[u8],
-) -> Result<Release, WatchError> {
+fn extract_pointer(pointer: &str, body: &[u8]) -> Result<Release, WatchError> {
     let doc: serde_json::Value = serde_json::from_slice(body).map_err(WatchError::Decode)?;
     let version = match doc.pointer(pointer) {
         None => return Err(ExtractError::Missing(pointer.to_string()).into()),
@@ -246,7 +230,6 @@ fn extract_pointer(
     }
     Ok(Release {
         version,
-        link: link.clone(),
         published_at: None,
         detail: ReleaseDetail::Plain,
     })
@@ -279,12 +262,24 @@ fn chrome_channel_link(channel: ChromeChannel) -> String {
     format!("{CHROME_RELEASES_BLOG}search/label/{label}")
 }
 
+/// Where the embed title links for `version`: derived for the presets, the
+/// configured `link` for `json`.
+fn release_link(watch: &RunWatch, version: &str) -> Option<String> {
+    match watch.extractor {
+        Extractor::Firefox { channel } => Some(firefox_release_notes(channel, version)),
+        Extractor::Chrome { channel, .. } => Some(chrome_channel_link(channel)),
+        Extractor::JsonPointer { .. } => watch.link.clone(),
+    }
+}
+
 /// Everything the poller needs, derived from one `WatchKind` at resolve time.
 #[derive(Debug, Clone)]
 pub struct SourceSpec {
     pub label: String,
     pub url: Url,
     pub extractor: Extractor,
+    /// Only `json` has one; the presets derive theirs from the version.
+    pub link: Option<String>,
 }
 
 /// Called from `runtime::resolve`. The only fallible step is `Url::parse` of the
@@ -299,6 +294,7 @@ pub fn resolve_source(name: &str, kind: &WatchKind) -> Result<SourceSpec, url::P
             },
             url: Url::parse(FIREFOX_VERSIONS_URL)?,
             extractor: Extractor::Firefox { channel: *channel },
+            link: None,
         }),
         WatchKind::Chrome {
             platform,
@@ -321,6 +317,7 @@ pub fn resolve_source(name: &str, kind: &WatchKind) -> Result<SourceSpec, url::P
                     platform: *platform,
                     channel: *channel,
                 },
+                link: None,
             })
         }
         WatchKind::Json { url, pointer, link } => Ok(SourceSpec {
@@ -328,17 +325,30 @@ pub fn resolve_source(name: &str, kind: &WatchKind) -> Result<SourceSpec, url::P
             url: url.as_url().clone(),
             extractor: Extractor::JsonPointer {
                 pointer: pointer.as_str().to_string(),
-                link: link.as_ref().map(|l| l.as_url().to_string()),
             },
+            link: link.as_ref().map(|l| l.as_url().to_string()),
         }),
     }
 }
 
-/// Per-watch polling state. In-memory only: a restart re-baselines.
+/// Per-watch dedup state. In-memory only: a restart re-baselines.
 #[derive(Debug, Default)]
 pub struct WatchState {
-    pub etag: Option<String>,
     last: Option<String>,
+}
+
+/// Per-feed polling state: the validator for the shared request, and one
+/// `WatchState` per watch on the feed, in the feed's order.
+#[derive(Debug, Default)]
+pub struct FeedState {
+    etag: Option<String>,
+    watches: Vec<WatchState>,
+}
+
+impl FeedState {
+    pub fn etag(&self) -> Option<&str> {
+        self.etag.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -370,6 +380,32 @@ pub fn diff(state: &mut WatchState, release: Release) -> Diff {
     }
 }
 
+/// Pure: runs every watch on a feed over one fetched body and diffs each result,
+/// returning one entry per watch in `watches` order.
+///
+/// The ETag is recorded here, and only when every watch could read its version:
+/// storing it for a body some watch could not read would turn every later poll
+/// into a 304, and a broken pointer would stop surfacing as a failure.
+pub fn read_feed(
+    state: &mut FeedState,
+    watches: &[RunWatch],
+    body: &[u8],
+    etag: Option<String>,
+) -> Vec<Result<Diff, WatchError>> {
+    state
+        .watches
+        .resize_with(watches.len(), WatchState::default);
+    let results: Vec<_> = watches
+        .iter()
+        .zip(&mut state.watches)
+        .map(|(w, s)| w.extractor.extract(body).map(|r| diff(s, r)))
+        .collect();
+    if results.iter().all(Result::is_ok) {
+        state.etag = etag;
+    }
+    results
+}
+
 /// `detected_at` is the embed timestamp whenever the source has no
 /// `published_at` of its own.
 pub fn build_message(
@@ -383,21 +419,27 @@ pub fn build_message(
         COLOR_RELEASE,
     )
     .with_field("Previous", &event.previous, true);
-    if let Some(link) = &release.link {
-        embed = embed.with_url(link);
+    if let Some(link) = release_link(watch, &release.version) {
+        embed = embed.with_url(&link);
+    }
+
+    match watch.extractor {
+        Extractor::Firefox { channel } => {
+            embed = embed.with_field("Channel", channel.label(), true);
+        }
+        Extractor::Chrome { platform, channel } => {
+            embed = embed
+                .with_field("Channel", channel.label(), true)
+                .with_field("Platform", platform.as_api_str(), true);
+        }
+        Extractor::JsonPointer { .. } => {}
     }
 
     match &release.detail {
         ReleaseDetail::Firefox {
-            channel,
             channels,
-            last_release_date,
             next_release_date,
         } => {
-            embed = embed.with_field("Channel", channel.label(), true);
-            if let Some(d) = last_release_date {
-                embed = embed.with_field("Released", d, true);
-            }
             if let Some(d) = next_release_date {
                 embed = embed.with_field("Next release", d, true);
             }
@@ -410,19 +452,11 @@ pub fn build_message(
                 embed = embed.with_field("Channels", &all, false);
             }
         }
-        ReleaseDetail::Chrome {
-            channel,
-            platform,
-            fraction,
-            milestone,
-        } => {
-            embed = embed
-                .with_field("Channel", channel.label(), true)
-                .with_field("Platform", platform.as_api_str(), true);
+        ReleaseDetail::Chrome { fraction } => {
             if let Some(f) = fraction {
                 embed = embed.with_field("Rollout", &rollout_percent(*f), true);
             }
-            if let Some(m) = milestone {
+            if let Some(m) = chrome_milestone(&release.version) {
                 embed = embed.with_field("Milestone", &m.to_string(), true);
             }
         }
@@ -435,11 +469,20 @@ pub fn build_message(
     DiscordMessage::embed(embed).with_identity(&watch.display_name, watch.avatar_url.as_deref())
 }
 
+fn chrome_milestone(version: &str) -> Option<u32> {
+    version.split('.').next().and_then(|m| m.parse().ok())
+}
+
 fn rollout_percent(fraction: f64) -> String {
     if fraction >= 1.0 {
         return "100%".to_string();
     }
-    format!("{:.1}%", fraction * 100.0)
+    if fraction <= 0.0 {
+        return "0%".to_string();
+    }
+    // Clamped so one-decimal rounding never shows a partial rollout as `100.0%`
+    // or a started one as `0.0%`.
+    format!("{:.1}%", (fraction * 100.0).clamp(0.1, 99.9))
 }
 
 #[allow(async_fn_in_trait)]
@@ -521,7 +564,6 @@ mod test_support {
     pub(crate) fn plain(version: &str) -> Release {
         Release {
             version: version.to_string(),
-            link: None,
             published_at: None,
             detail: ReleaseDetail::Plain,
         }
@@ -540,11 +582,9 @@ mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
     use crate::config::{HttpsUrl, JsonPointer};
-    use crate::runtime::mk_run_watch;
+    use crate::runtime::{RunWatch, mk_run_watch};
 
     fn ts(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
@@ -564,8 +604,13 @@ mod tests {
     fn pointer(p: &str) -> Extractor {
         Extractor::JsonPointer {
             pointer: p.to_string(),
-            link: None,
         }
+    }
+
+    fn watch_with(name: &str, extractor: Extractor) -> RunWatch {
+        let mut w = mk_run_watch(name);
+        w.extractor = extractor;
+        w
     }
 
     fn chrome_kind(
@@ -593,6 +638,7 @@ mod tests {
             assert_eq!(spec.label, label);
             assert_eq!(spec.url.as_str(), FIREFOX_VERSIONS_URL);
             assert_eq!(spec.extractor, firefox(channel));
+            assert!(spec.link.is_none(), "derived from the version instead");
         }
     }
 
@@ -652,8 +698,11 @@ mod tests {
             spec.extractor,
             Extractor::JsonPointer {
                 pointer: "/0/version".to_string(),
-                link: Some("https://nodejs.org/en/blog/release".to_string()),
             }
+        );
+        assert_eq!(
+            spec.link.as_deref(),
+            Some("https://nodejs.org/en/blog/release")
         );
     }
 
@@ -675,15 +724,13 @@ mod tests {
     }
 
     #[test]
-    fn firefox_payload_carries_every_channel_and_the_release_dates() {
+    fn firefox_payload_carries_every_channel_and_the_next_release_date() {
         let release = firefox(FirefoxChannel::Release)
             .extract(FIREFOX_FIXTURE.as_bytes())
             .unwrap();
         let ReleaseDetail::Firefox {
             channels,
-            last_release_date,
             next_release_date,
-            ..
         } = release.detail
         else {
             panic!("expected firefox detail");
@@ -698,25 +745,21 @@ mod tests {
                 ("Nightly", "159.0a1".to_string()),
             ]
         );
-        assert_eq!(last_release_date.as_deref(), Some("2026-09-25"));
         assert_eq!(next_release_date.as_deref(), Some("2026-10-09"));
 
         let esr = firefox(FirefoxChannel::Esr)
             .extract(FIREFOX_FIXTURE.as_bytes())
             .unwrap();
         let ReleaseDetail::Firefox {
-            last_release_date,
-            next_release_date,
-            ..
+            next_release_date, ..
         } = esr.detail
         else {
             panic!("expected firefox detail");
         };
         assert!(
-            last_release_date.is_none(),
-            "dates belong to the release channel"
+            next_release_date.is_none(),
+            "the date belongs to the release channel"
         );
-        assert!(next_release_date.is_none());
     }
 
     #[test]
@@ -726,6 +769,30 @@ mod tests {
         assert!(matches!(
             err,
             WatchError::Extract(ExtractError::FirefoxChannelEmpty("Release"))
+        ));
+    }
+
+    #[test]
+    fn firefox_null_in_an_unwatched_channel_does_not_break_the_watched_one() {
+        let body = br#"{"LATEST_FIREFOX_VERSION": "156.0.1", "FIREFOX_DEVEDITION": null, "NEXT_RELEASE_DATE": null}"#;
+        let release = firefox(FirefoxChannel::Release).extract(body).unwrap();
+        assert_eq!(release.version, "156.0.1");
+        let ReleaseDetail::Firefox {
+            channels,
+            next_release_date,
+        } = release.detail
+        else {
+            panic!("expected firefox detail");
+        };
+        assert_eq!(channels, vec![("Release", "156.0.1".to_string())]);
+        assert!(next_release_date.is_none());
+
+        let err = firefox(FirefoxChannel::Devedition)
+            .extract(body)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            WatchError::Extract(ExtractError::FirefoxChannelEmpty("Developer Edition"))
         ));
     }
 
@@ -766,12 +833,15 @@ mod tests {
         assert_eq!(
             release.detail,
             ReleaseDetail::Chrome {
-                channel: ChromeChannel::Stable,
-                platform: ChromePlatform::Win,
-                fraction: Some(0.005),
-                milestone: Some(155),
+                fraction: Some(0.005)
             }
         );
+    }
+
+    #[test]
+    fn chrome_milestone_is_the_leading_version_component() {
+        assert_eq!(chrome_milestone("155.0.8059.12"), Some(155));
+        assert_eq!(chrome_milestone("not-a-version"), None);
     }
 
     #[test]
@@ -917,13 +987,9 @@ mod tests {
     fn a_changed_rollout_fraction_alone_is_not_a_change() {
         let at = |fraction| Release {
             version: "155.0.8059.12".to_string(),
-            link: None,
             published_at: None,
             detail: ReleaseDetail::Chrome {
-                channel: ChromeChannel::Stable,
-                platform: ChromePlatform::Win,
                 fraction: Some(fraction),
-                milestone: Some(155),
             },
         };
         let mut state = WatchState::default();
@@ -939,8 +1005,8 @@ mod tests {
     }
 
     #[test]
-    fn firefox_message_lists_channels_and_dates() {
-        let mut watch = mk_run_watch("firefox", Duration::from_secs(3600));
+    fn firefox_message_lists_channels_and_the_next_release() {
+        let mut watch = watch_with("firefox", firefox(FirefoxChannel::Release));
         watch.label = "Firefox".to_string();
         watch.host = "product-details.mozilla.org".to_string();
         let ev = event_from(&firefox(FirefoxChannel::Release), FIREFOX_FIXTURE, "156.0");
@@ -965,7 +1031,6 @@ mod tests {
             vec![
                 ("Previous", "156.0", true),
                 ("Channel", "Release", true),
-                ("Released", "2026-09-25", true),
                 ("Next release", "2026-10-09", true),
                 (
                     "Channels",
@@ -986,7 +1051,7 @@ mod tests {
 
     #[test]
     fn chrome_message_reports_rollout_platform_and_serving_time() {
-        let mut watch = mk_run_watch("chrome", Duration::from_secs(3600));
+        let mut watch = watch_with("chrome", chrome(ChromeChannel::Stable));
         watch.label = "Chrome Stable".to_string();
         let ev = event_from(
             &chrome(ChromeChannel::Stable),
@@ -1030,13 +1095,17 @@ mod tests {
     }
 
     #[test]
+    fn rollout_rounding_never_reads_as_complete_or_as_not_started() {
+        assert_eq!(rollout_percent(0.9996), "99.9%");
+        assert_eq!(rollout_percent(0.0001), "0.1%");
+        assert_eq!(rollout_percent(0.0), "0%");
+    }
+
+    #[test]
     fn plain_message_carries_only_previous_and_link() {
-        let watch = mk_run_watch("node", Duration::from_secs(3600));
-        let extractor = Extractor::JsonPointer {
-            pointer: "/version".to_string(),
-            link: Some("https://nodejs.org/en/blog/release".to_string()),
-        };
-        let ev = event_from(&extractor, r#"{"version": "v24.9.0"}"#, "v24.8.0");
+        let mut watch = mk_run_watch("node");
+        watch.link = Some("https://nodejs.org/en/blog/release".to_string());
+        let ev = event_from(&watch.extractor, r#"{"version": "v24.9.0"}"#, "v24.8.0");
         let msg = build_message(&watch, &ev, ts("2026-09-27T01:02:03Z"));
 
         let embed = &msg.embeds[0];
@@ -1057,12 +1126,60 @@ mod tests {
 
     #[test]
     fn message_without_link_omits_url() {
-        let watch = mk_run_watch("node", Duration::from_secs(3600));
+        let watch = mk_run_watch("node");
         let ev = ReleaseEvent {
             previous: "1".to_string(),
             release: plain("2"),
         };
         let msg = build_message(&watch, &ev, ts("2026-09-27T00:00:00Z"));
         assert!(msg.embeds[0].url.is_none());
+    }
+    #[test]
+    fn read_feed_diffs_every_watch_from_one_body() {
+        let watches = vec![
+            watch_with("a", pointer("/a")),
+            watch_with("b", pointer("/b")),
+        ];
+        let mut state = FeedState::default();
+        let first = read_feed(&mut state, &watches, br#"{"a":"1","b":"1"}"#, None);
+        assert!(matches!(
+            first[..],
+            [Ok(Diff::Baseline(_)), Ok(Diff::Baseline(_))]
+        ));
+
+        let second = read_feed(&mut state, &watches, br#"{"a":"2","b":"1"}"#, None);
+        assert!(matches!(second[0], Ok(Diff::Changed(_))));
+        assert!(matches!(second[1], Ok(Diff::Unchanged)));
+    }
+
+    #[test]
+    fn read_feed_keeps_the_etag_only_when_every_watch_could_read() {
+        let watches = vec![
+            watch_with("a", pointer("/a")),
+            watch_with("b", pointer("/b")),
+        ];
+        let mut state = FeedState::default();
+        read_feed(
+            &mut state,
+            &watches,
+            br#"{"a":"1"}"#,
+            Some("v1".to_string()),
+        );
+        assert_eq!(state.etag(), None, "`b` could not read this body");
+
+        read_feed(
+            &mut state,
+            &watches,
+            br#"{"a":"1","b":"1"}"#,
+            Some("v2".to_string()),
+        );
+        assert_eq!(state.etag(), Some("v2"));
+
+        read_feed(&mut state, &watches, b"<html>", Some("v3".to_string()));
+        assert_eq!(
+            state.etag(),
+            Some("v2"),
+            "an unreadable body leaves the last good validator in place"
+        );
     }
 }

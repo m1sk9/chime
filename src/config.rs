@@ -19,6 +19,11 @@ pub enum ConfigError {
     DuplicateStatusPageName(String),
     #[error("duplicate watch name: {0}")]
     DuplicateWatchName(String),
+    #[error("watch `{name}`: chrome has no `extended` channel on `{platform}`")]
+    ChromeNoExtendedChannel {
+        name: String,
+        platform: &'static str,
+    },
     #[error("reminder `{name}`: {source}")]
     Schedule {
         name: String,
@@ -356,25 +361,9 @@ impl TryFrom<String> for StatusUrl {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "String")]
-pub struct AvatarUrl(Url);
-
-impl AvatarUrl {
-    pub fn into_string(self) -> String {
-        self.0.into()
-    }
-}
-
-impl TryFrom<String> for AvatarUrl {
-    type Error = HttpsUrlError;
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        parse_https(&s).map(AvatarUrl)
-    }
-}
-
-/// Any https URL, kept verbatim. Why not `StatusUrl`: that type appends a trailing
-/// `/` for `Url::join`, which would turn `https://x/api/v.json` into `.../v.json/`.
+/// Any https URL, kept verbatim: avatars, watch sources and watch links. Why not
+/// `StatusUrl`: that type appends a trailing `/` for `Url::join`, which would turn
+/// `https://x/api/v.json` into `.../v.json/`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub struct HttpsUrl(Url);
@@ -382,6 +371,10 @@ pub struct HttpsUrl(Url);
 impl HttpsUrl {
     pub fn as_url(&self) -> &Url {
         &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0.into()
     }
 }
 
@@ -392,8 +385,13 @@ impl TryFrom<String> for HttpsUrl {
     }
 }
 
-/// RFC 6901 pointer. Must start with `/`; the empty pointer addresses the whole
-/// document, which is never a scalar, so it is rejected here rather than at poll time.
+/// RFC 6901 pointer that must start with `/`.
+///
+/// Why not accept the empty pointer, which RFC 6901 allows: it addresses the whole
+/// document, useful only for an endpoint whose body is a bare string or number, and
+/// that is rare. A pointer without a leading `/` is far more often a typo
+/// (`version` for `/version`), and rejecting it here surfaces the typo at startup
+/// instead of as a warning on every poll.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub struct JsonPointer(String);
@@ -495,7 +493,7 @@ pub struct StatusPage {
     #[serde(default)]
     pub min_impact: Impact,
     pub display_name: Option<DisplayName>,
-    pub avatar_url: Option<AvatarUrl>,
+    pub avatar_url: Option<HttpsUrl>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -548,6 +546,19 @@ impl ChromePlatform {
             ChromePlatform::Webview => "webview",
             ChromePlatform::Ios => "ios",
         }
+    }
+
+    // Why not leave this to the first poll: VersionHistory answers 400 for
+    // `extended` on every other platform (measured 2026-09-27), so such a watch can
+    // never succeed and has to fail at startup like any other config error.
+    pub fn has_extended_channel(&self) -> bool {
+        matches!(
+            self,
+            ChromePlatform::Win
+                | ChromePlatform::Win64
+                | ChromePlatform::Mac
+                | ChromePlatform::MacArm64
+        )
     }
 }
 
@@ -634,7 +645,7 @@ pub struct Watch {
     #[serde(default = "default_watch_poll_interval")]
     pub poll_interval_sec: PollInterval,
     pub display_name: Option<DisplayName>,
-    pub avatar_url: Option<AvatarUrl>,
+    pub avatar_url: Option<HttpsUrl>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -677,6 +688,18 @@ impl Config {
         for w in &cfg.watches {
             if !seen_watches.insert(w.name.as_str().to_string()) {
                 return Err(ConfigError::DuplicateWatchName(w.name.as_str().to_string()));
+            }
+            if let WatchKind::Chrome {
+                platform,
+                channel: ChromeChannel::Extended,
+                ..
+            } = w.source
+                && !platform.has_extended_channel()
+            {
+                return Err(ConfigError::ChromeNoExtendedChannel {
+                    name: w.name.as_str().to_string(),
+                    platform: platform.as_api_str(),
+                });
             }
         }
         Ok(cfg)
@@ -1538,5 +1561,28 @@ source = { kind = "chrome" }
 "#,
         );
         assert!(matches!(r, Err(ConfigError::DuplicateWatchName(_))));
+    }
+
+    #[test]
+    fn chrome_extended_is_rejected_on_platforms_without_it() {
+        for platform in ["linux", "android", "webview", "ios"] {
+            let r = parse_watches(&format!(
+                "[[watches]]\nname = \"c\"\nwebhook = \"team\"\nsource = {{ kind = \"chrome\", platform = \"{platform}\", channel = \"extended\" }}\n"
+            ));
+            assert!(
+                matches!(
+                    &r,
+                    Err(ConfigError::ChromeNoExtendedChannel { name, platform: p })
+                        if name == "c" && *p == platform
+                ),
+                "{platform}: {r:?}"
+            );
+        }
+        for platform in ["win", "win64", "mac", "mac_arm64"] {
+            let r = parse_watches(&format!(
+                "[[watches]]\nname = \"c\"\nwebhook = \"team\"\nsource = {{ kind = \"chrome\", platform = \"{platform}\", channel = \"extended\" }}\n"
+            ));
+            assert!(r.is_ok(), "{platform}: {r:?}");
+        }
     }
 }
