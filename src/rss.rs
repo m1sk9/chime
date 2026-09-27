@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
+use feed_rs::model::{Entry, FeedType, Link, Text};
 use feed_rs::parser::ParseFeedError;
 use reqwest::Client;
 use url::Url;
@@ -43,29 +44,57 @@ pub struct RssEntry {
 pub fn parse_feed(body: &[u8], url: &Url) -> Result<Vec<RssEntry>, RssError> {
     let feed = feed_rs::parser::Builder::new()
         .base_uri(Some(url.as_str()))
+        .id_generator(stable_id)
         .build()
         .parse(body)
         .map_err(RssError::Decode)?;
-    Ok(feed.entries.into_iter().filter_map(normalize).collect())
+    // Why not trust `text/plain` everywhere: RSS 1.0 types `<description>` as plain
+    // text, yet feeds put escaped HTML in it. Atom and JSON Feed state the type.
+    let typed = matches!(feed.feed_type, FeedType::Atom | FeedType::JSON);
+    Ok(feed
+        .entries
+        .into_iter()
+        .filter_map(|e| normalize(e, typed))
+        .collect())
 }
 
-fn normalize(e: feed_rs::model::Entry) -> Option<RssEntry> {
-    let title = e.title.map(|t| t.content).filter(|t| !t.trim().is_empty());
+/// Why not feed-rs's `generate_id` as is: its last resort is a random UUID per
+/// parse, which would re-post the entry on every poll. The empty id marks it for
+/// `normalize` to drop instead.
+fn stable_id(links: &[Link], title: &Option<Text>, uri: Option<&str>) -> String {
+    if links.is_empty() && (title.is_none() || uri.is_none()) {
+        return String::new();
+    }
+    feed_rs::parser::generate_id(links, title, uri)
+}
+
+fn normalize(e: Entry, typed: bool) -> Option<RssEntry> {
+    if e.id.is_empty() {
+        return None;
+    }
+    let title = e
+        .title
+        .map(|t| render(&t.content, t.content_type.as_str(), true))
+        .filter(|t| !t.is_empty());
+    // Why not the first link that has no `rel`: RSS `<comments>` has none either,
+    // and may come before `<link>`.
     let link = e
         .links
         .iter()
-        .find(|l| l.rel.as_deref().is_none_or(|r| r == "alternate"))
+        .find(|l| l.target.is_none() && l.rel.as_deref().is_none_or(|r| r == "alternate"))
         .or(e.links.first())
         .map(|l| l.href.clone());
-    // Neither a link nor a title: no stable id (UUID per parse) and nothing to show.
-    if title.is_none() && link.is_none() {
+    let body = [
+        e.summary.map(|t| (t.content, t.content_type)),
+        e.content.and_then(|c| Some((c.body?, c.content_type))),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|(text, media)| render(&text, media.as_str(), typed))
+    .find(|s| !s.is_empty());
+    if title.is_none() && link.is_none() && body.is_none() {
         return None;
     }
-    let body = [e.summary.map(|t| t.content), e.content.and_then(|c| c.body)]
-        .into_iter()
-        .flatten()
-        .map(|s| html_to_text(&s))
-        .find(|s| !s.is_empty());
     Some(RssEntry {
         id: e.id,
         title,
@@ -73,6 +102,14 @@ fn normalize(e: feed_rs::model::Entry) -> Option<RssEntry> {
         body,
         published: e.published.or(e.updated),
     })
+}
+
+fn render(text: &str, media: &str, trust_plain: bool) -> String {
+    if trust_plain && media == "text/plain" {
+        tidy_lines(text)
+    } else {
+        html_to_text(text)
+    }
 }
 
 /// Renders an entry body to the plain text an embed description can show.
@@ -87,6 +124,10 @@ pub fn html_to_text(html: &str) -> String {
     while let Some(open) = rest.find('<') {
         push_text(&mut out, &rest[..open], &mut after_space);
         let tail = &rest[open + 1..];
+        if let Some(after) = skip_unrendered(tail) {
+            rest = after;
+            continue;
+        }
         let Some(close) = tail.find('>') else {
             push_text(&mut out, &rest[open..], &mut after_space);
             rest = "";
@@ -97,15 +138,41 @@ pub fn html_to_text(html: &str) -> String {
     }
     push_text(&mut out, rest, &mut after_space);
 
-    let decoded = decode_entities(&out);
+    tidy_lines(&decode_entities(&out))
+}
+
+fn tidy_lines(text: &str) -> String {
     let mut lines: Vec<&str> = Vec::new();
-    for line in decoded.lines().map(str::trim) {
+    for line in text.lines().map(str::trim) {
         if line.is_empty() && lines.last().is_some_and(|l| l.is_empty()) {
             continue;
         }
         lines.push(line);
     }
     lines.join("\n").trim().to_string()
+}
+
+/// Why not the generic tag path: a comment may contain `>`, and script and style
+/// bodies are not text a reader would ever see.
+fn skip_unrendered(tail: &str) -> Option<&str> {
+    if let Some(comment) = tail.strip_prefix("!--") {
+        return Some(comment.find("-->").map_or("", |end| &comment[end + 3..]));
+    }
+    let name_len = tail.bytes().take_while(u8::is_ascii_alphanumeric).count();
+    let name = &tail[..name_len];
+    let closing = ["script", "style"]
+        .into_iter()
+        .find(|n| name.eq_ignore_ascii_case(n))?;
+    let end_tag = format!("</{closing}");
+    let bytes = tail.as_bytes();
+    let Some(start) = bytes
+        .windows(end_tag.len())
+        .position(|w| w.eq_ignore_ascii_case(end_tag.as_bytes()))
+    else {
+        return Some("");
+    };
+    let after = &tail[start..];
+    Some(after.find('>').map_or("", |close| &after[close + 1..]))
 }
 
 /// Whitespace runs collapse to one space, as HTML renders them, so the source
@@ -148,7 +215,12 @@ fn push_tag(out: &mut String, inner: &str, after_space: &mut bool) {
         // `<ul>` would put a blank line above every nested list.
         "ul" | "ol" if closing => push_break(out),
         "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote" | "pre" | "tr"
-        | "table" => push_break(out),
+        | "table" | "dt" | "dd" => push_break(out),
+        "td" | "th" if !closing => {
+            if !*after_space {
+                out.push(' ');
+            }
+        }
         _ => return,
     }
     *after_space = true;
@@ -173,9 +245,11 @@ fn decode_entities(s: &str) -> String {
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         let tail = &rest[amp + 1..];
-        let decoded = tail
-            .find(';')
-            .filter(|&end| end <= 10)
+        // Why not `tail.find(';')`: it scans the whole rest for every `&`, which is
+        // quadratic on a body full of bare ampersands.
+        let decoded = tail.as_bytes()[..tail.len().min(11)]
+            .iter()
+            .position(|&b| b == b';')
             .and_then(|end| decode_entity(&tail[..end]).map(|c| (c, end)));
         match decoded {
             Some((c, end)) => {
@@ -200,6 +274,23 @@ fn decode_entity(name: &str) -> Option<char> {
         "quot" => Some('"'),
         "apos" => Some('\''),
         "nbsp" => Some(' '),
+        "lsquo" => Some('\u{2018}'),
+        "rsquo" => Some('\u{2019}'),
+        "ldquo" => Some('\u{201C}'),
+        "rdquo" => Some('\u{201D}'),
+        "laquo" => Some('\u{AB}'),
+        "raquo" => Some('\u{BB}'),
+        "ndash" => Some('\u{2013}'),
+        "mdash" => Some('\u{2014}'),
+        "hellip" => Some('\u{2026}'),
+        "bull" => Some('\u{2022}'),
+        "middot" => Some('\u{B7}'),
+        "copy" => Some('\u{A9}'),
+        "reg" => Some('\u{AE}'),
+        "trade" => Some('\u{2122}'),
+        "deg" => Some('\u{B0}'),
+        "times" => Some('\u{D7}'),
+        "euro" => Some('\u{20AC}'),
         _ => {
             let num = name.strip_prefix('#')?;
             let code = match num.strip_prefix(['x', 'X']) {
@@ -217,7 +308,7 @@ fn decode_entity(name: &str) -> Option<char> {
 pub struct RssState {
     seen: HashSet<String>,
     initialized: bool,
-    pub etag: Option<String>,
+    etag: Option<String>,
 }
 
 impl RssState {
@@ -225,6 +316,23 @@ impl RssState {
     pub fn is_initialized(&self) -> bool {
         self.initialized
     }
+
+    pub fn etag(&self) -> Option<&str> {
+        self.etag.as_deref()
+    }
+}
+
+/// Pure. Why not store the ETag before parsing: a body chime cannot read must not
+/// hide behind 304s on the next polls (the same rule as `watch::read_feed`).
+pub fn read_feed(
+    state: &mut RssState,
+    body: &[u8],
+    url: &Url,
+    etag: Option<String>,
+) -> Result<Vec<RssEntry>, RssError> {
+    let entries = parse_feed(body, url)?;
+    state.etag = etag;
+    Ok(entries)
 }
 
 /// Every entry whose id has not been seen, oldest first. The first call is the
@@ -445,9 +553,76 @@ mod tests {
     }
 
     #[test]
-    fn an_item_with_neither_link_nor_title_is_dropped() {
+    fn an_item_without_id_link_or_title_is_dropped() {
         let entries = parse(&rss_item("<description>orphan</description>"));
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn an_item_with_only_a_guid_and_a_description_is_kept() {
+        let body = rss_item("<guid>note-1</guid><description>just a note</description>");
+        let entries = parse(&body);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "note-1");
+        assert_eq!(entries[0].body.as_deref(), Some("just a note"));
+    }
+
+    #[test]
+    fn a_comments_link_before_the_item_link_is_not_the_entry_link() {
+        let entries = parse(&rss_item(
+            "<title>a</title><comments>https://blog.example/1#comments</comments><link>https://blog.example/1</link>",
+        ));
+        assert_eq!(entries[0].link.as_deref(), Some("https://blog.example/1"));
+    }
+
+    #[test]
+    fn an_html_title_is_rendered_to_text() {
+        let atom = r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>t</title><id>f</id><updated>2026-09-25T12:00:00Z</updated>
+<entry><title type="html"><![CDATA[It&#8217;s <em>here</em> &#038; now]]></title><id>e</id><updated>2026-09-25T12:00:00Z</updated></entry></feed>"#;
+        assert_eq!(
+            parse(atom)[0].title.as_deref(),
+            Some("It\u{2019}s here & now")
+        );
+    }
+
+    #[test]
+    fn atom_plain_text_keeps_its_lines_brackets_and_entities() {
+        let atom = r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>t</title><id>f</id><updated>2026-09-25T12:00:00Z</updated>
+<entry><title>x</title><id>e</id><updated>2026-09-25T12:00:00Z</updated><summary type="text">Use Vec&lt;String&gt; &amp;amp; more
+second line</summary></entry></feed>"#;
+        assert_eq!(
+            parse(atom)[0].body.as_deref(),
+            Some("Use Vec<String> &amp; more\nsecond line")
+        );
+    }
+
+    #[test]
+    fn json_feed_content_text_keeps_its_lines() {
+        let feed = r#"{"version":"https://jsonfeed.org/version/1.1","title":"t","items":[{"id":"1","title":"x","content_text":"line one\nline two uses Vec<String>"}]}"#;
+        assert_eq!(
+            parse(feed)[0].body.as_deref(),
+            Some("line one\nline two uses Vec<String>")
+        );
+    }
+
+    #[test]
+    fn an_rss1_description_is_rendered_as_html_although_typed_plain() {
+        let rdf = r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns="http://purl.org/rss/1.0/"><channel rdf:about="https://blog.example/"><title>t</title><link>https://blog.example/</link><description>d</description></channel>
+<item rdf:about="https://blog.example/1"><title>one</title><link>https://blog.example/1</link><description>&lt;p&gt;Hello&lt;/p&gt;</description></item></rdf:RDF>"#;
+        assert_eq!(parse(rdf)[0].body.as_deref(), Some("Hello"));
+    }
+
+    #[test]
+    fn read_feed_stores_the_etag_only_for_a_body_that_parses() {
+        let mut state = RssState::default();
+        let etag = || Some("W/\"1\"".to_string());
+
+        assert!(read_feed(&mut state, b"<html>maintenance</html>", &feed_url(), etag()).is_err());
+        assert_eq!(state.etag(), None);
+
+        let entries = read_feed(&mut state, RSS2_FIXTURE.as_bytes(), &feed_url(), etag()).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(state.etag(), Some("W/\"1\""));
     }
 
     #[test]
@@ -529,6 +704,43 @@ mod tests {
         assert_eq!(
             html_to_text("&amp;lt; &amp;amp; &unknown; & x"),
             "&lt; &amp; &unknown; & x"
+        );
+    }
+
+    #[test]
+    fn common_named_entities_are_decoded() {
+        assert_eq!(
+            html_to_text("It&rsquo;s &ldquo;here&rdquo; &mdash; read more&hellip; &copy;"),
+            "It\u{2019}s \u{201C}here\u{201D} \u{2014} read more\u{2026} \u{A9}"
+        );
+    }
+
+    #[test]
+    fn an_entity_name_longer_than_any_known_one_stays_literal() {
+        assert_eq!(
+            html_to_text("&averyverylongname; a"),
+            "&averyverylongname; a"
+        );
+    }
+
+    #[test]
+    fn scripts_styles_and_comments_are_dropped() {
+        assert_eq!(
+            html_to_text(
+                "<style>p{color:red}</style><p>hi</p><SCRIPT>if (a > b) x();</SCRIPT> a <!-- x > y --> b"
+            ),
+            "hi\na b"
+        );
+        assert_eq!(html_to_text("a <!-- never closed"), "a");
+    }
+
+    #[test]
+    fn definition_lists_and_table_cells_keep_words_apart() {
+        assert_eq!(
+            html_to_text(
+                "<dl><dt>k</dt><dd>v</dd></dl><table><tr><td>a</td><td>b</td></tr></table>"
+            ),
+            "k\n\nv\n\na b"
         );
     }
 

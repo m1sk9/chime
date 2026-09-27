@@ -300,10 +300,10 @@ The timestamp is always when chime noticed the change — up to `poll_interval_s
 #### Notification semantics
 
 - **The first poll after startup is silent** — it records the entries currently in the feed as a baseline. A restart re-baselines.
-- An entry is posted when its **id** has not been seen: `<guid>` in RSS, `<id>` in Atom, `id` in JSON Feed, or, when the feed gives none, a hash of the entry's link and title. Editing an entry that was already seen does not post it again.
+- An entry is posted when its **id** has not been seen: `<guid>` in RSS, `<id>` in Atom, `id` in JSON Feed, or, when the feed gives none, a hash of the entry's link and title (the feed URL and title when it has no link). Editing an entry that was already seen does not post it again — unless it has no id of its own: then a new title or link is a new id, and the entry is posted again. Two such entries with the same link and title are one entry.
 - The id is recorded **before** the Discord request, so a failed send is not retried.
 - An entry that drops out of the feed is forgotten; if it comes back, it is reported as new. A feed that answers with no entries at all keeps the baseline.
-- An entry with neither a link nor a title is ignored: it has nothing stable to be recognised by.
+- An entry with no id of its own and neither a link nor a title is ignored: it has nothing stable to be recognised by. So is an entry with no title, link or body.
 - Several new entries in one poll are posted **oldest first**, by the entry's own date; entries without a date come last, in feed order. There is no cap on how many are posted.
 - Polling failures (unreachable feed, a body that is not a feed) are logged at `warn` and never posted.
 
@@ -321,7 +321,7 @@ Published: 2026-09-25 22:00 UTC          ← if the entry is dated
 code.claude.com · <time chime saw it>
 ```
 
-The body is the entry's summary, or its content when there is no summary, rendered from HTML to plain text: list items become `- ` lines, paragraphs and line breaks become newlines, every other tag is dropped and its text kept. Long bodies are truncated; the linked page is the authoritative copy. The timestamp is when chime noticed the entry, not the entry's own date.
+The body is the entry's summary, or its content when there is no summary, rendered from HTML to plain text: list items become `- ` lines, paragraphs and line breaks become newlines, `<script>`, `<style>` and comments are dropped with their content, every other tag is dropped and its text kept. Atom and JSON Feed text that the feed marks as plain text is shown as it is. An Atom title marked as HTML is rendered the same way. Long bodies are truncated; the linked page is the authoritative copy. The timestamp is when chime noticed the entry, not the entry's own date.
 
 ### Webhook resolution
 
@@ -398,7 +398,8 @@ Watches get their own `watch poll summary` line over the same window, with the s
 {"timestamp":"2026-06-05T09:00:00.000000Z","level":"INFO","fields":{"message":"watch poll summary","window_sec":3600,"watches":2,"polls":2,"not_modified":1,"updated":1,"failed":0,"forwarded":0,"send_failed":0},"target":"chime::scheduler"}
 ```
 
-As for status pages, `polls`, `not_modified` and `updated` count requests — watches sharing a URL are one request — and `updated` counts 200 responses, not versions that changed, so a Chrome watch reports every poll as `updated`. `failed` also covers a body that was fetched but that at least one watch on it could not read; the posts of the watches that could read it are still counted in `forwarded` / `send_failed`. 
+As for status pages, `polls`, `not_modified` and `updated` count requests — watches sharing a URL are one request — and `updated` counts 200 responses, not versions that changed, so a Chrome watch reports every poll as `updated`. `failed` also covers a body that was fetched but that at least one watch on it could not read; the posts of the watches that could read it are still counted in `forwarded` / `send_failed`.
+
 RSS feeds get a third line, `rss poll summary`, with `feeds` (the number configured) in place of `pages`:
 
 ```json

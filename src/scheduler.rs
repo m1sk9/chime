@@ -545,7 +545,7 @@ async fn poll_rss<N: Notifier, R: RssSource>(
     state: &mut RssState,
     detected_at: DateTime<Utc>,
 ) -> PollOutcome {
-    let fetched = match source.fetch(&feed.url, state.etag.as_deref()).await {
+    let fetched = match source.fetch(&feed.url, state.etag()).await {
         Ok(f) => f,
         Err(e) => {
             warn!(rss = %feed.name, error = %e, "failed to poll rss feed");
@@ -559,17 +559,14 @@ async fn poll_rss<N: Notifier, R: RssSource>(
         }
         Fetched::Modified { value, etag } => (value, etag),
     };
-    let entries = match rss::parse_feed(&body, &feed.url) {
+    let entries = match rss::read_feed(state, &body, &feed.url, etag) {
         Ok(entries) => entries,
-        // The ETag is not stored: a body chime cannot read must not hide behind
-        // 304s on the next polls (the same rule as `watch::read_feed`).
         Err(e) => {
             warn!(rss = %feed.name, error = %e, "failed to parse rss feed");
             return PollOutcome::Failed;
         }
     };
 
-    state.etag = etag;
     let first_poll = !state.is_initialized();
     let events = rss::diff(state, &entries);
     if first_poll {
@@ -773,9 +770,10 @@ mod tests {
         }
     }
 
-    /// Returns the queued JSON bodies in order, repeating the last one once the
-    /// queue drains, with the same `fail` / `not_modified` switches as
-    /// `FakeSource`. Every `If-None-Match` it receives is recorded in `seen_etags`.
+    /// Returns the queued bodies in order, repeating the last one once the queue
+    /// drains, with the same `fail` / `not_modified` switches as `FakeSource`.
+    /// Every `If-None-Match` it receives is recorded in `seen_etags`. Serves the
+    /// rss list as well, as `FakeRssSource`.
     #[derive(Clone)]
     struct FakeWatchSource {
         calls: Arc<AtomicUsize>,
@@ -784,6 +782,8 @@ mod tests {
         fail: bool,
         not_modified: bool,
     }
+
+    type FakeRssSource = FakeWatchSource;
 
     impl FakeWatchSource {
         fn empty() -> Self {
@@ -796,10 +796,13 @@ mod tests {
             }
         }
 
-        fn with(bodies: Vec<&str>) -> Self {
+        fn with<B: AsRef<str>>(bodies: Vec<B>) -> Self {
             FakeWatchSource {
                 queue: Arc::new(Mutex::new(
-                    bodies.into_iter().map(|b| b.as_bytes().to_vec()).collect(),
+                    bodies
+                        .into_iter()
+                        .map(|b| b.as_ref().as_bytes().to_vec())
+                        .collect(),
                 )),
                 ..FakeWatchSource::empty()
             }
@@ -821,6 +824,33 @@ mod tests {
 
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        fn respond(&self, etag: Option<&str>) -> Result<Fetched<Vec<u8>>, FetchError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.seen_etags
+                .lock()
+                .unwrap()
+                .push(etag.map(str::to_string));
+            if self.fail {
+                return Err(FetchError::Status {
+                    status: 503,
+                    body: "unavailable".to_string(),
+                });
+            }
+            if self.not_modified {
+                return Ok(Fetched::NotModified);
+            }
+            let mut queue = self.queue.lock().unwrap();
+            let body = if queue.len() > 1 {
+                queue.pop_front().unwrap()
+            } else {
+                queue.front().cloned().unwrap_or_default()
+            };
+            Ok(Fetched::Modified {
+                value: body,
+                etag: Some("W/\"fake\"".to_string()),
+            })
         }
     }
 
@@ -830,113 +860,17 @@ mod tests {
             _url: &Url,
             etag: Option<&str>,
         ) -> Result<Fetched<Vec<u8>>, FetchError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.seen_etags
-                .lock()
-                .unwrap()
-                .push(etag.map(str::to_string));
-            if self.fail {
-                return Err(FetchError::Status {
-                    status: 503,
-                    body: "unavailable".to_string(),
-                });
-            }
-            if self.not_modified {
-                return Ok(Fetched::NotModified);
-            }
-            let mut queue = self.queue.lock().unwrap();
-            let body = if queue.len() > 1 {
-                queue.pop_front().unwrap()
-            } else {
-                queue.front().cloned().unwrap_or_default()
-            };
-            Ok(Fetched::Modified {
-                value: body,
-                etag: Some("W/\"fake\"".to_string()),
-            })
+            self.respond(etag)
         }
     }
 
-    /// `FakeWatchSource` for the rss list: queued bodies in order, the last one
-    /// repeated, every `If-None-Match` recorded in `seen_etags`.
-    #[derive(Clone)]
-    struct FakeRssSource {
-        calls: Arc<AtomicUsize>,
-        queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
-        seen_etags: Arc<Mutex<Vec<Option<String>>>>,
-        fail: bool,
-        not_modified: bool,
-    }
-
-    impl FakeRssSource {
-        fn empty() -> Self {
-            FakeRssSource {
-                calls: Arc::new(AtomicUsize::new(0)),
-                queue: Arc::new(Mutex::new(VecDeque::new())),
-                seen_etags: Arc::new(Mutex::new(Vec::new())),
-                fail: false,
-                not_modified: false,
-            }
-        }
-
-        fn with(bodies: Vec<String>) -> Self {
-            FakeRssSource {
-                queue: Arc::new(Mutex::new(
-                    bodies.into_iter().map(String::into_bytes).collect(),
-                )),
-                ..FakeRssSource::empty()
-            }
-        }
-
-        fn failing() -> Self {
-            FakeRssSource {
-                fail: true,
-                ..FakeRssSource::empty()
-            }
-        }
-
-        fn unchanged() -> Self {
-            FakeRssSource {
-                not_modified: true,
-                ..FakeRssSource::empty()
-            }
-        }
-
-        fn calls(&self) -> usize {
-            self.calls.load(Ordering::SeqCst)
-        }
-    }
-
-    impl RssSource for FakeRssSource {
+    impl RssSource for FakeWatchSource {
         async fn fetch(
             &self,
             _url: &Url,
             etag: Option<&str>,
         ) -> Result<Fetched<Vec<u8>>, FetchError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.seen_etags
-                .lock()
-                .unwrap()
-                .push(etag.map(str::to_string));
-            if self.fail {
-                return Err(FetchError::Status {
-                    status: 503,
-                    body: "unavailable".to_string(),
-                });
-            }
-            if self.not_modified {
-                return Ok(Fetched::NotModified);
-            }
-            let mut queue = self.queue.lock().unwrap();
-            let body = if queue.len() > 1 {
-                queue.pop_front().unwrap()
-            } else {
-                queue.front().cloned().unwrap_or_default()
-            };
-            Ok(Fetched::Modified {
-                value: body,
-                etag: Some("W/\"fake\"".to_string()),
-            })
+            self.respond(etag)
         }
     }
 
