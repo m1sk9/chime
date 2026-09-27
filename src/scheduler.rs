@@ -11,10 +11,11 @@ use url::Url;
 
 use crate::fetch::Fetched;
 use crate::notifier::{DiscordMessage, Notifier};
-use crate::runtime::{RunConfig, RunStatusPage};
-use crate::status::{PageState, StatusSource, build_message, diff};
+use crate::runtime::{RunConfig, RunStatusPage, RunWatch};
+use crate::status::{self, PageState, StatusSource};
+use crate::watch::{self, Diff, WatchSource, WatchState};
 
-/// How often the status poller reports that it is alive.
+/// How often the pollers report that they are alive.
 ///
 /// Why this exists at all: a healthy page answers 304 and that path only logs at
 /// `debug!`, so at `log_level = "info"` a fully working poller is indistinguishable
@@ -61,30 +62,56 @@ impl PollStats {
     }
 }
 
-pub struct Scheduler<N: Notifier, S: StatusSource> {
+/// One pollable entry, addressed by position in its `RunConfig` list. Indexes are
+/// stable because the config is immutable for the life of the scheduler, and two
+/// lists may legitimately share a name. `Ord` is derived on purpose: variant order
+/// then index is the tie-break in `most_overdue`, so pages win an exact tie and
+/// declaration order settles the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Job {
+    Page(usize),
+    Watch(usize),
+}
+
+/// One closed summary window. A struct rather than a tuple of two `PollStats`
+/// because the two halves have the same type and would be positionally ambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Summary {
+    window_sec: i64,
+    pages: PollStats,
+    watches: PollStats,
+}
+
+pub struct Scheduler<N: Notifier, S: StatusSource, W: WatchSource> {
     cfg: RunConfig,
     notifier: N,
     source: S,
+    watch_source: W,
     last_fired: HashMap<String, DateTime<Tz>>,
-    last_polled: HashMap<String, DateTime<Tz>>,
+    last_polled: HashMap<Job, DateTime<Tz>>,
     page_states: HashMap<String, PageState>,
+    watch_states: HashMap<String, WatchState>,
     stats: PollStats,
+    watch_stats: PollStats,
     /// `None` until the first tick: the window is anchored to a real tick rather
     /// than to construction, so a scheduler built long before it runs does not
     /// report an oversized first window.
     summary_window_start: Option<DateTime<Tz>>,
 }
 
-impl<N: Notifier, S: StatusSource> Scheduler<N, S> {
-    pub fn new(cfg: RunConfig, notifier: N, source: S) -> Self {
+impl<N: Notifier, S: StatusSource, W: WatchSource> Scheduler<N, S, W> {
+    pub fn new(cfg: RunConfig, notifier: N, source: S, watch_source: W) -> Self {
         Scheduler {
             cfg,
             notifier,
             source,
+            watch_source,
             last_fired: HashMap::new(),
             last_polled: HashMap::new(),
             page_states: HashMap::new(),
+            watch_states: HashMap::new(),
             stats: PollStats::default(),
+            watch_stats: PollStats::default(),
             summary_window_start: None,
         }
     }
@@ -121,8 +148,8 @@ impl<N: Notifier, S: StatusSource> Scheduler<N, S> {
         // boundary it opened on, or the closing tick's poll is counted in the window
         // that ends and the first window reports one poll more than every window
         // after it.
-        self.emit_status_summary(now);
-        self.poll_status_pages(now).await;
+        self.emit_poll_summaries(now);
+        self.poll_one(now).await;
     }
 
     async fn fire_reminders(&mut self, now: DateTime<Tz>) {
@@ -151,56 +178,84 @@ impl<N: Notifier, S: StatusSource> Scheduler<N, S> {
         }
     }
 
-    /// Poll at most one status page per tick.
+    /// Poll at most one status page or watch per tick.
     ///
     /// The heartbeat is written once, at the top of the tick, and `chime health`
-    /// calls it stale past `2 * tick_interval`. Polling every due page in one tick
-    /// would let N pages behind a network partition hold the tick for
+    /// calls it stale past `2 * tick_interval`. Polling every due page and watch in
+    /// one tick would let N endpoints behind a network partition hold the tick for
     /// `N * FETCH_TIMEOUT` and get the container restarted over someone else's
-    /// outage. One page per tick bounds that to a single fetch however many pages
+    /// outage. One fetch per tick — shared by both lists — bounds that however many
     /// are configured, and picking the most overdue one keeps them from staying in
-    /// the lockstep they start in — every page is due on the very first tick.
-    async fn poll_status_pages(&mut self, now: DateTime<Tz>) {
-        let Some(index) = self.most_overdue(now) else {
+    /// the lockstep they start in — every entry is due on the very first tick.
+    async fn poll_one(&mut self, now: DateTime<Tz>) {
+        let Some(job) = self.most_overdue(now) else {
             return;
         };
-        // Borrows are split by field rather than cloning the page: `poll_page` is a
-        // free function so `cfg`, `page_states`, `source` and `notifier` can be held
-        // at once.
-        let page = &self.cfg.status_pages[index];
-        // Recorded before the request: a slow or failing page must wait out its own
-        // interval, not be retried on every tick.
-        self.last_polled.insert(page.name.clone(), now);
-        let state = self.page_states.entry(page.name.clone()).or_default();
-        let outcome = poll_page(&self.source, &self.notifier, page, state).await;
-        self.stats.record(outcome);
+        // Recorded before the request: a slow or failing endpoint must wait out its
+        // own interval, not be retried on every tick.
+        self.last_polled.insert(job, now);
+        // Borrows are split by field rather than cloning the entry: `poll_page` and
+        // `poll_watch` are free functions so `cfg`, the state maps, the sources and
+        // `notifier` can be held at once.
+        match job {
+            Job::Page(i) => {
+                let page = &self.cfg.status_pages[i];
+                let state = self.page_states.entry(page.name.clone()).or_default();
+                let outcome = poll_page(&self.source, &self.notifier, page, state).await;
+                self.stats.record(outcome);
+            }
+            Job::Watch(i) => {
+                let w = &self.cfg.watches[i];
+                let state = self.watch_states.entry(w.name.clone()).or_default();
+                let outcome = poll_watch(&self.watch_source, &self.notifier, w, state).await;
+                self.watch_stats.record(outcome);
+            }
+        }
     }
 
-    /// Log the closed summary window, if one is due.
-    fn emit_status_summary(&mut self, now: DateTime<Tz>) {
-        let Some((window_sec, stats)) = self.take_due_summary(now) else {
+    /// Log the closed summary window, one line per non-empty list, if one is due.
+    fn emit_poll_summaries(&mut self, now: DateTime<Tz>) {
+        let Some(summary) = self.take_due_summary(now) else {
             return;
         };
-        info!(
-            window_sec,
-            pages = self.cfg.status_pages.len(),
-            polls = stats.polls,
-            not_modified = stats.not_modified,
-            updated = stats.updated,
-            failed = stats.failed,
-            forwarded = stats.forwarded,
-            send_failed = stats.send_failed,
-            "status poll summary"
-        );
+        let window_sec = summary.window_sec;
+        if !self.cfg.status_pages.is_empty() {
+            let stats = summary.pages;
+            info!(
+                window_sec,
+                pages = self.cfg.status_pages.len(),
+                polls = stats.polls,
+                not_modified = stats.not_modified,
+                updated = stats.updated,
+                failed = stats.failed,
+                forwarded = stats.forwarded,
+                send_failed = stats.send_failed,
+                "status poll summary"
+            );
+        }
+        if !self.cfg.watches.is_empty() {
+            let stats = summary.watches;
+            info!(
+                window_sec,
+                watches = self.cfg.watches.len(),
+                polls = stats.polls,
+                not_modified = stats.not_modified,
+                updated = stats.updated,
+                failed = stats.failed,
+                forwarded = stats.forwarded,
+                send_failed = stats.send_failed,
+                "watch poll summary"
+            );
+        }
     }
 
     /// Close the summary window and hand back its length and counters, or `None`
     /// while the window is still open. Split from the logging so the window
     /// arithmetic is testable without a tracing subscriber.
-    fn take_due_summary(&mut self, now: DateTime<Tz>) -> Option<(i64, PollStats)> {
+    fn take_due_summary(&mut self, now: DateTime<Tz>) -> Option<Summary> {
         // A reminder-only deployment has no poller to prove alive; staying silent
-        // keeps this out of logs that would never contain a status line anyway.
-        if self.cfg.status_pages.is_empty() {
+        // keeps this out of logs that would never contain a poll line anyway.
+        if self.cfg.status_pages.is_empty() && self.cfg.watches.is_empty() {
             return None;
         }
         let Some(start) = self.summary_window_start else {
@@ -223,24 +278,29 @@ impl<N: Notifier, S: StatusSource> Scheduler<N, S> {
             return None;
         }
         self.summary_window_start = Some(now);
-        Some((elapsed, std::mem::take(&mut self.stats)))
+        Some(Summary {
+            window_sec: elapsed,
+            pages: std::mem::take(&mut self.stats),
+            watches: std::mem::take(&mut self.watch_stats),
+        })
     }
 
-    fn most_overdue(&self, now: DateTime<Tz>) -> Option<usize> {
-        self.cfg
-            .status_pages
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| is_due(self.last_polled.get(&p.name), p.poll_interval, now))
-            .min_by_key(|(i, p)| {
-                // Longest overdue first; declaration order settles a tie, so the
-                // choice is deterministic rather than hash-order dependent.
-                (
-                    Reverse(overdue_secs(self.last_polled.get(&p.name), now)),
-                    *i,
-                )
-            })
-            .map(|(i, _)| i)
+    /// Every pollable entry with its interval, pages first.
+    fn jobs(&self) -> impl Iterator<Item = (Job, Duration)> + '_ {
+        let pages = (self.cfg.status_pages.iter().enumerate())
+            .map(|(i, p)| (Job::Page(i), p.poll_interval));
+        let watches =
+            (self.cfg.watches.iter().enumerate()).map(|(i, w)| (Job::Watch(i), w.poll_interval));
+        pages.chain(watches)
+    }
+
+    fn most_overdue(&self, now: DateTime<Tz>) -> Option<Job> {
+        self.jobs()
+            .filter(|(job, interval)| is_due(self.last_polled.get(job), *interval, now))
+            // Longest overdue first; `Job`'s `Ord` settles a tie, so the choice is
+            // deterministic rather than hash-order dependent.
+            .min_by_key(|(job, _)| (Reverse(overdue_secs(self.last_polled.get(job), now)), *job))
+            .map(|(job, _)| job)
     }
 
     /// Write the liveness heartbeat. Called at the start of every tick, before any
@@ -284,11 +344,11 @@ async fn poll_page<N: Notifier, S: StatusSource>(
     };
 
     state.etag = new_etag;
-    let events = diff(state, &incidents, page.min_impact);
+    let events = status::diff(state, &incidents, page.min_impact);
     let mut forwarded = 0;
     let mut send_failed = 0;
     for event in events {
-        let message = build_message(page, &event);
+        let message = status::build_message(page, &event);
         match notifier.send(&page.webhook_url, &message).await {
             Ok(()) => {
                 forwarded += 1;
@@ -316,18 +376,97 @@ async fn poll_page<N: Notifier, S: StatusSource>(
     }
 }
 
+async fn poll_watch<N: Notifier, W: WatchSource>(
+    source: &W,
+    notifier: &N,
+    w: &RunWatch,
+    state: &mut WatchState,
+) -> PollOutcome {
+    let etag = state.etag.clone();
+    let fetched = match source.fetch(&w.url, etag.as_deref()).await {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(watch = %w.name, error = %e, "failed to poll watch");
+            return PollOutcome::Failed;
+        }
+    };
+    let (body, new_etag) = match fetched {
+        Fetched::NotModified => {
+            debug!(watch = %w.name, "watch not modified");
+            return PollOutcome::NotModified;
+        }
+        Fetched::Modified { value, etag } => (value, etag),
+    };
+    let release = match w.extractor.extract(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(watch = %w.name, error = %e, "failed to read release from watch");
+            return PollOutcome::Failed;
+        }
+    };
+    // Only after a successful extract: an ETag stored for a body chime could not
+    // read would turn every later poll into a 304, and a broken pointer would stop
+    // showing up as `failed` or as a warning.
+    state.etag = new_etag;
+
+    let event = match watch::diff(state, release) {
+        Diff::Baseline(version) => {
+            info!(watch = %w.name, version = %version, "watch baseline recorded");
+            return PollOutcome::Updated {
+                forwarded: 0,
+                send_failed: 0,
+            };
+        }
+        Diff::Unchanged => {
+            debug!(watch = %w.name, "watch unchanged");
+            return PollOutcome::Updated {
+                forwarded: 0,
+                send_failed: 0,
+            };
+        }
+        Diff::Changed(event) => event,
+    };
+    let message = watch::build_message(w, &event, Utc::now());
+    match notifier.send(&w.webhook_url, &message).await {
+        Ok(()) => {
+            info!(
+                watch = %w.name,
+                version = %event.release.version,
+                previous = %event.previous,
+                "release forwarded"
+            );
+            PollOutcome::Updated {
+                forwarded: 1,
+                send_failed: 0,
+            }
+        }
+        Err(e) => {
+            error!(
+                watch = %w.name,
+                version = %event.release.version,
+                error = %e,
+                "failed to forward release"
+            );
+            PollOutcome::Updated {
+                forwarded: 0,
+                send_failed: 1,
+            }
+        }
+    }
+}
+
 fn is_due(last: Option<&DateTime<Tz>>, poll_interval: Duration, now: DateTime<Tz>) -> bool {
     match last {
         None => true,
         Some(previous) => {
             let elapsed = now.signed_duration_since(*previous).num_seconds();
-            // A clock stepping backwards must not park a page until it catches up.
+            // A clock stepping backwards must not park an entry until it catches up.
             elapsed < 0 || elapsed >= poll_interval.as_secs() as i64
         }
     }
 }
 
-/// A page that has never been polled outranks every page that has.
+/// An entry that has never been polled outranks every entry that has.
 fn overdue_secs(last: Option<&DateTime<Tz>>, now: DateTime<Tz>) -> i64 {
     match last {
         None => i64::MAX,
@@ -345,8 +484,9 @@ fn truncate_to_minute(t: &DateTime<Tz>) -> DateTime<Tz> {
 mod tests {
     use super::*;
     use crate::config::{Impact, LogLevel};
+    use crate::fetch::FetchError;
     use crate::notifier::NotifyError;
-    use crate::runtime::{RunReminder, mk_run_status_page};
+    use crate::runtime::{RunReminder, mk_run_status_page, mk_run_watch};
     use crate::status::{Incident, StatusError, mk_incident, mk_update};
     use chrono::TimeZone;
     use chrono_tz::Asia::Tokyo;
@@ -475,6 +615,100 @@ mod tests {
         }
     }
 
+    /// Returns the queued JSON bodies in order, repeating the last one once the
+    /// queue drains, with the same `fail` / `not_modified` switches as
+    /// `FakeSource`. Every `If-None-Match` it receives is recorded in `seen_etags`.
+    #[derive(Clone)]
+    struct FakeWatchSource {
+        calls: Arc<AtomicUsize>,
+        queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        seen_etags: Arc<Mutex<Vec<Option<String>>>>,
+        fail: bool,
+        not_modified: bool,
+    }
+
+    impl FakeWatchSource {
+        fn empty() -> Self {
+            FakeWatchSource {
+                calls: Arc::new(AtomicUsize::new(0)),
+                queue: Arc::new(Mutex::new(VecDeque::new())),
+                seen_etags: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+                not_modified: false,
+            }
+        }
+
+        fn with(bodies: Vec<&str>) -> Self {
+            FakeWatchSource {
+                queue: Arc::new(Mutex::new(
+                    bodies.into_iter().map(|b| b.as_bytes().to_vec()).collect(),
+                )),
+                ..FakeWatchSource::empty()
+            }
+        }
+
+        fn failing() -> Self {
+            FakeWatchSource {
+                fail: true,
+                ..FakeWatchSource::empty()
+            }
+        }
+
+        fn unchanged() -> Self {
+            FakeWatchSource {
+                not_modified: true,
+                ..FakeWatchSource::empty()
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl WatchSource for FakeWatchSource {
+        async fn fetch(
+            &self,
+            _url: &Url,
+            etag: Option<&str>,
+        ) -> Result<Fetched<Vec<u8>>, FetchError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.seen_etags
+                .lock()
+                .unwrap()
+                .push(etag.map(str::to_string));
+            if self.fail {
+                return Err(FetchError::Status {
+                    status: 503,
+                    body: "unavailable".to_string(),
+                });
+            }
+            if self.not_modified {
+                return Ok(Fetched::NotModified);
+            }
+            let mut queue = self.queue.lock().unwrap();
+            let body = if queue.len() > 1 {
+                queue.pop_front().unwrap()
+            } else {
+                queue.front().cloned().unwrap_or_default()
+            };
+            Ok(Fetched::Modified {
+                value: body,
+                etag: Some("W/\"fake\"".to_string()),
+            })
+        }
+    }
+
+    /// A scheduler whose watch source is never consulted, for tests that do not
+    /// configure watches.
+    fn sched<N: Notifier, S: StatusSource>(
+        cfg: RunConfig,
+        notifier: N,
+        source: S,
+    ) -> Scheduler<N, S, FakeWatchSource> {
+        Scheduler::new(cfg, notifier, source, FakeWatchSource::unchanged())
+    }
+
     fn mk_run_reminder(name: &str, hour: u32, minute: u32) -> RunReminder {
         use crate::config::{Schedule, TimeOfDay, WeekdaySet};
         RunReminder {
@@ -508,12 +742,22 @@ mod tests {
         reminders: Vec<RunReminder>,
         status_pages: Vec<RunStatusPage>,
     ) -> RunConfig {
+        cfg_with_watches(tag, reminders, status_pages, Vec::new())
+    }
+
+    fn cfg_with_watches(
+        tag: &str,
+        reminders: Vec<RunReminder>,
+        status_pages: Vec<RunStatusPage>,
+        watches: Vec<RunWatch>,
+    ) -> RunConfig {
         RunConfig {
             log_level: LogLevel::Info,
             interval: Duration::from_secs(30),
             timezone: Tokyo,
             reminders,
             status_pages,
+            watches,
             heartbeat_path: hb_path(tag),
         }
     }
@@ -522,7 +766,7 @@ mod tests {
     async fn fires_once_within_same_minute() {
         let notifier = CountingNotifier::new();
         let cfg = cfg_with("fires_once", vec![mk_run_reminder("daily", 9, 30)], vec![]);
-        let mut scheduler = Scheduler::new(cfg, notifier.clone(), FakeSource::empty());
+        let mut scheduler = sched(cfg, notifier.clone(), FakeSource::empty());
 
         scheduler.tick(at(9, 30, 0)).await;
         scheduler.tick(at(9, 30, 30)).await;
@@ -535,7 +779,7 @@ mod tests {
     async fn reminder_payload_is_plain_content() {
         let notifier = CountingNotifier::new();
         let cfg = cfg_with("payload", vec![mk_run_reminder("daily", 9, 30)], vec![]);
-        let mut scheduler = Scheduler::new(cfg, notifier.clone(), FakeSource::empty());
+        let mut scheduler = sched(cfg, notifier.clone(), FakeSource::empty());
 
         scheduler.tick(at(9, 30, 0)).await;
 
@@ -552,7 +796,7 @@ mod tests {
             vec![mk_run_reminder("hourly", 9, 30)],
             vec![],
         );
-        let mut scheduler = Scheduler::new(cfg, notifier.clone(), FakeSource::empty());
+        let mut scheduler = sched(cfg, notifier.clone(), FakeSource::empty());
 
         scheduler.tick(at(9, 30, 0)).await;
         scheduler.tick(at(9, 31, 0)).await;
@@ -568,7 +812,7 @@ mod tests {
             vec![mk_run_reminder("daily", 9, 30)],
             vec![],
         );
-        let mut scheduler = Scheduler::new(cfg, notifier.clone(), FakeSource::empty());
+        let mut scheduler = sched(cfg, notifier.clone(), FakeSource::empty());
 
         scheduler.tick(at(9, 29, 30)).await;
         scheduler.tick(at(9, 31, 0)).await;
@@ -581,7 +825,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut cfg = cfg_with("writes", vec![mk_run_reminder("daily", 9, 30)], vec![]);
         cfg.heartbeat_path = path.clone();
-        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::empty());
+        let mut scheduler = sched(cfg, CountingNotifier::new(), FakeSource::empty());
 
         // Off-schedule time: no reminder fires, but the heartbeat must still be written.
         scheduler.tick(at(0, 0, 0)).await;
@@ -596,7 +840,7 @@ mod tests {
         let source = FakeSource::empty();
         let page = mk_run_status_page("claude", Duration::from_secs(300));
         let cfg = cfg_with("poll_interval", vec![], vec![page]);
-        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), source.clone());
+        let mut scheduler = sched(cfg, CountingNotifier::new(), source.clone());
 
         scheduler.tick(at(9, 0, 0)).await;
         assert_eq!(source.calls(), 1);
@@ -620,7 +864,7 @@ mod tests {
         let notifier = CountingNotifier::new();
         let page = mk_run_status_page("claude", Duration::from_secs(300));
         let cfg = cfg_with("cold_start", vec![], vec![page]);
-        let mut scheduler = Scheduler::new(cfg, notifier.clone(), source);
+        let mut scheduler = sched(cfg, notifier.clone(), source);
 
         scheduler.tick(at(9, 0, 0)).await;
         assert_eq!(notifier.sent(), 0);
@@ -643,7 +887,7 @@ mod tests {
         let notifier = CountingNotifier::new();
         let page = mk_run_status_page("claude", Duration::from_secs(300));
         let cfg = cfg_with("forward", vec![], vec![page]);
-        let mut scheduler = Scheduler::new(cfg, notifier.clone(), source);
+        let mut scheduler = sched(cfg, notifier.clone(), source);
 
         scheduler.tick(at(9, 0, 0)).await;
         scheduler.tick(at(9, 5, 0)).await;
@@ -664,7 +908,7 @@ mod tests {
             vec![mk_run_reminder("daily", 9, 30)],
             vec![page],
         );
-        let mut scheduler = Scheduler::new(cfg, notifier.clone(), source.clone());
+        let mut scheduler = sched(cfg, notifier.clone(), source.clone());
 
         scheduler.tick(at(9, 30, 0)).await;
         scheduler.tick(at(9, 31, 0)).await;
@@ -686,7 +930,7 @@ mod tests {
                 mk_run_status_page("c", Duration::from_secs(60)),
             ],
         );
-        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), source.clone());
+        let mut scheduler = sched(cfg, CountingNotifier::new(), source.clone());
 
         // All three are due on the first tick, but they are spread over three ticks.
         scheduler.tick(at(9, 0, 0)).await;
@@ -712,22 +956,26 @@ mod tests {
                 mk_run_status_page("b", Duration::from_secs(60)),
             ],
         );
-        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::empty());
-        scheduler.last_polled.insert("a".to_string(), at(9, 0, 0));
-        scheduler.last_polled.insert("b".to_string(), at(8, 0, 0));
+        let mut scheduler = sched(cfg, CountingNotifier::new(), FakeSource::empty());
+        scheduler.last_polled.insert(Job::Page(0), at(9, 0, 0));
+        scheduler.last_polled.insert(Job::Page(1), at(8, 0, 0));
 
         // Both are due, but `b` has waited an hour longer.
         scheduler.tick(at(9, 5, 0)).await;
 
-        assert_eq!(scheduler.last_polled["b"], at(9, 5, 0));
-        assert_eq!(scheduler.last_polled["a"], at(9, 0, 0), "a waits its turn");
+        assert_eq!(scheduler.last_polled[&Job::Page(1)], at(9, 5, 0));
+        assert_eq!(
+            scheduler.last_polled[&Job::Page(0)],
+            at(9, 0, 0),
+            "a waits its turn"
+        );
     }
 
     #[tokio::test]
     async fn status_summary_stays_closed_until_the_window_elapses() {
         let page = mk_run_status_page("claude", Duration::from_secs(300));
         let cfg = cfg_with("summary_open", vec![], vec![page]);
-        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::unchanged());
+        let mut scheduler = sched(cfg, CountingNotifier::new(), FakeSource::unchanged());
 
         // The window is anchored to the first tick, so that tick reports nothing.
         scheduler.tick(at(9, 0, 0)).await;
@@ -740,16 +988,16 @@ mod tests {
     async fn status_summary_counts_every_poll_outcome() {
         let page = mk_run_status_page("claude", Duration::from_secs(300));
         let cfg = cfg_with("summary_304", vec![], vec![page]);
-        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::unchanged());
+        let mut scheduler = sched(cfg, CountingNotifier::new(), FakeSource::unchanged());
 
         scheduler.tick(at(9, 0, 0)).await;
         scheduler.tick(at(9, 5, 0)).await;
         scheduler.tick(at(9, 10, 0)).await;
 
-        let (window_sec, stats) = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
-        assert_eq!(window_sec, 3600);
+        let summary = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
+        assert_eq!(summary.window_sec, 3600);
         assert_eq!(
-            stats,
+            summary.pages,
             PollStats {
                 polls: 3,
                 not_modified: 3,
@@ -776,7 +1024,7 @@ mod tests {
         ));
         let page = mk_run_status_page("claude", Duration::from_secs(300));
         let cfg = cfg_with("summary_mixed", vec![], vec![page]);
-        let mut scheduler = Scheduler::new(
+        let mut scheduler = sched(
             cfg,
             CountingNotifier::new(),
             FakeSource::with(vec![backlog, updated]),
@@ -786,7 +1034,7 @@ mod tests {
         scheduler.tick(at(9, 0, 0)).await;
         scheduler.tick(at(9, 5, 0)).await;
 
-        let (_, stats) = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
+        let stats = scheduler.take_due_summary(at(10, 0, 0)).unwrap().pages;
         assert_eq!(stats.polls, 2);
         assert_eq!(stats.updated, 2);
         assert_eq!(stats.forwarded, 1);
@@ -796,10 +1044,10 @@ mod tests {
             vec![],
             vec![mk_run_status_page("claude", Duration::from_secs(300))],
         );
-        let mut scheduler = Scheduler::new(failing, CountingNotifier::new(), FakeSource::failing());
+        let mut scheduler = sched(failing, CountingNotifier::new(), FakeSource::failing());
         scheduler.tick(at(9, 0, 0)).await;
 
-        let (_, stats) = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
+        let stats = scheduler.take_due_summary(at(10, 0, 0)).unwrap().pages;
         assert_eq!(stats.failed, 1);
         assert_eq!(stats.forwarded, 0);
     }
@@ -822,7 +1070,7 @@ mod tests {
             vec![],
             vec![mk_run_status_page("claude", Duration::from_secs(300))],
         );
-        let mut scheduler = Scheduler::new(
+        let mut scheduler = sched(
             cfg,
             RejectingNotifier,
             FakeSource::with(vec![backlog, updated]),
@@ -831,7 +1079,7 @@ mod tests {
         scheduler.tick(at(9, 0, 0)).await;
         scheduler.tick(at(9, 5, 0)).await;
 
-        let (_, stats) = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
+        let stats = scheduler.take_due_summary(at(10, 0, 0)).unwrap().pages;
         assert_eq!(stats.updated, 2);
         assert_eq!(stats.forwarded, 0);
         assert_eq!(stats.send_failed, 1);
@@ -841,7 +1089,7 @@ mod tests {
     async fn status_summary_resets_between_windows() {
         let page = mk_run_status_page("claude", Duration::from_secs(300));
         let cfg = cfg_with("summary_reset", vec![], vec![page]);
-        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::unchanged());
+        let mut scheduler = sched(cfg, CountingNotifier::new(), FakeSource::unchanged());
 
         // Three ticks an hour apart. The middle one closes the first window, and
         // its own poll belongs to the second — every window covers the same number
@@ -850,7 +1098,7 @@ mod tests {
         scheduler.tick(at(10, 0, 0)).await;
         scheduler.tick(at(11, 0, 0)).await;
 
-        let (_, stats) = scheduler.take_due_summary(at(12, 0, 0)).unwrap();
+        let stats = scheduler.take_due_summary(at(12, 0, 0)).unwrap().pages;
         assert_eq!(stats.polls, 1, "only the 11:00 tick is in this window");
         assert_eq!(stats.not_modified, 1);
     }
@@ -859,7 +1107,7 @@ mod tests {
     async fn status_summary_window_length_does_not_drift_on_the_first_window() {
         let page = mk_run_status_page("claude", Duration::from_secs(300));
         let cfg = cfg_with("summary_first_window", vec![], vec![page]);
-        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::unchanged());
+        let mut scheduler = sched(cfg, CountingNotifier::new(), FakeSource::unchanged());
 
         // Ticks every 30 minutes, so each window holds exactly two of them.
         for hour in 9..=12 {
@@ -867,19 +1115,22 @@ mod tests {
             scheduler.tick(at(hour, 30, 0)).await;
         }
 
-        let (window_sec, stats) = scheduler.take_due_summary(at(13, 0, 0)).unwrap();
-        assert_eq!(window_sec, 3600);
-        assert_eq!(stats.polls, 2, "the boundary tick is not counted twice");
+        let summary = scheduler.take_due_summary(at(13, 0, 0)).unwrap();
+        assert_eq!(summary.window_sec, 3600);
+        assert_eq!(
+            summary.pages.polls, 2,
+            "the boundary tick is not counted twice"
+        );
     }
 
     #[tokio::test]
-    async fn status_summary_is_silent_without_status_pages() {
+    async fn summary_is_silent_without_pages_or_watches() {
         let cfg = cfg_with(
             "summary_no_pages",
             vec![mk_run_reminder("daily", 9, 30)],
             vec![],
         );
-        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::empty());
+        let mut scheduler = sched(cfg, CountingNotifier::new(), FakeSource::empty());
 
         scheduler.tick(at(9, 30, 0)).await;
         assert_eq!(scheduler.take_due_summary(at(23, 0, 0)), None);
@@ -889,7 +1140,7 @@ mod tests {
     async fn status_summary_recovers_from_a_backwards_clock() {
         let page = mk_run_status_page("claude", Duration::from_secs(300));
         let cfg = cfg_with("summary_backwards", vec![], vec![page]);
-        let mut scheduler = Scheduler::new(cfg, CountingNotifier::new(), FakeSource::unchanged());
+        let mut scheduler = sched(cfg, CountingNotifier::new(), FakeSource::unchanged());
 
         scheduler.tick(at(9, 0, 0)).await;
         // Stepping backwards re-anchors the window: nothing is reported over the
@@ -898,9 +1149,233 @@ mod tests {
         // The window now runs from the stepped-back time, so the liveness signal
         // returns one interval later rather than being parked until the clock
         // catches up to where it was.
-        let (window_sec, stats) = scheduler.take_due_summary(at(9, 0, 0)).unwrap();
-        assert_eq!(window_sec, 3600);
-        assert_eq!(stats.polls, 1, "the pre-step poll is not discarded");
+        let summary = scheduler.take_due_summary(at(9, 0, 0)).unwrap();
+        assert_eq!(summary.window_sec, 3600);
+        assert_eq!(summary.pages.polls, 1, "the pre-step poll is not discarded");
+    }
+
+    fn one_watch(tag: &str) -> RunConfig {
+        cfg_with_watches(
+            tag,
+            vec![],
+            vec![],
+            vec![mk_run_watch("node", Duration::from_secs(300))],
+        )
+    }
+
+    #[tokio::test]
+    async fn watch_is_polled_once_per_interval() {
+        let source = FakeWatchSource::with(vec![r#"{"version":"1"}"#]);
+        let cfg = one_watch("watch_interval");
+        let mut scheduler = Scheduler::new(
+            cfg,
+            CountingNotifier::new(),
+            FakeSource::empty(),
+            source.clone(),
+        );
+
+        scheduler.tick(at(9, 0, 0)).await;
+        assert_eq!(source.calls(), 1);
+        scheduler.tick(at(9, 4, 59)).await;
+        assert_eq!(source.calls(), 1);
+        scheduler.tick(at(9, 5, 0)).await;
+        assert_eq!(source.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn first_watch_poll_does_not_forward_the_current_version() {
+        let notifier = CountingNotifier::new();
+        let source = FakeWatchSource::with(vec![r#"{"version":"1"}"#]);
+        let cfg = one_watch("watch_cold");
+        let mut scheduler = Scheduler::new(cfg, notifier.clone(), FakeSource::empty(), source);
+
+        scheduler.tick(at(9, 0, 0)).await;
+        assert_eq!(notifier.sent(), 0);
+    }
+
+    #[tokio::test]
+    async fn new_version_is_forwarded_as_an_embed() {
+        let notifier = CountingNotifier::new();
+        let source = FakeWatchSource::with(vec![r#"{"version":"1"}"#, r#"{"version":"2"}"#]);
+        let cfg = one_watch("watch_forward");
+        let mut scheduler = Scheduler::new(cfg, notifier.clone(), FakeSource::empty(), source);
+
+        scheduler.tick(at(9, 0, 0)).await;
+        scheduler.tick(at(9, 5, 0)).await;
+
+        assert_eq!(notifier.sent(), 1);
+        let sent = notifier.messages.lock().unwrap();
+        assert_eq!(sent[0].username.as_deref(), Some("node Releases"));
+        assert!(sent[0].content.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_watch_body_posts_nothing() {
+        let notifier = CountingNotifier::new();
+        let source = FakeWatchSource::with(vec![r#"{"version":"1"}"#]);
+        let cfg = one_watch("watch_same");
+        let mut scheduler =
+            Scheduler::new(cfg, notifier.clone(), FakeSource::empty(), source.clone());
+
+        scheduler.tick(at(9, 0, 0)).await;
+        scheduler.tick(at(9, 5, 0)).await;
+        scheduler.tick(at(9, 10, 0)).await;
+
+        assert_eq!(source.calls(), 3);
+        assert_eq!(notifier.sent(), 0);
+    }
+
+    #[tokio::test]
+    async fn watch_poll_failure_does_not_stop_the_loop() {
+        let notifier = CountingNotifier::new();
+        let source = FakeWatchSource::failing();
+        let cfg = cfg_with_watches(
+            "watch_fail",
+            vec![mk_run_reminder("daily", 9, 30)],
+            vec![],
+            vec![mk_run_watch("node", Duration::from_secs(60))],
+        );
+        let mut scheduler =
+            Scheduler::new(cfg, notifier.clone(), FakeSource::empty(), source.clone());
+
+        scheduler.tick(at(9, 30, 0)).await;
+        scheduler.tick(at(9, 31, 0)).await;
+
+        assert_eq!(source.calls(), 2);
+        assert_eq!(notifier.sent(), 1, "only the reminder was sent");
+    }
+
+    #[tokio::test]
+    async fn extract_failure_does_not_store_the_etag() {
+        let source = FakeWatchSource::with(vec![r#"{"nope":1}"#, r#"{"version":"1"}"#]);
+        let cfg = one_watch("watch_etag");
+        let mut scheduler = Scheduler::new(
+            cfg,
+            CountingNotifier::new(),
+            FakeSource::empty(),
+            source.clone(),
+        );
+
+        scheduler.tick(at(9, 0, 0)).await;
+        scheduler.tick(at(9, 5, 0)).await;
+        scheduler.tick(at(9, 10, 0)).await;
+
+        assert_eq!(
+            *source.seen_etags.lock().unwrap(),
+            vec![None, None, Some("W/\"fake\"".to_string())],
+            "the unreadable body's ETag is not replayed; the readable one's is"
+        );
+    }
+
+    #[tokio::test]
+    async fn pages_and_watches_share_the_one_poll_per_tick_budget() {
+        let pages = FakeSource::empty();
+        let watches = FakeWatchSource::with(vec![r#"{"version":"1"}"#]);
+        let cfg = cfg_with_watches(
+            "shared_budget",
+            vec![],
+            vec![mk_run_status_page("claude", Duration::from_secs(60))],
+            vec![mk_run_watch("node", Duration::from_secs(60))],
+        );
+        let mut scheduler =
+            Scheduler::new(cfg, CountingNotifier::new(), pages.clone(), watches.clone());
+
+        scheduler.tick(at(9, 0, 0)).await;
+        assert_eq!(pages.calls() + watches.calls(), 1);
+        scheduler.tick(at(9, 0, 1)).await;
+        assert_eq!(pages.calls(), 1);
+        assert_eq!(watches.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_most_overdue_job_is_polled_first_across_pages_and_watches() {
+        let cfg = cfg_with_watches(
+            "overdue_mixed",
+            vec![],
+            vec![mk_run_status_page("claude", Duration::from_secs(60))],
+            vec![mk_run_watch("node", Duration::from_secs(60))],
+        );
+        let watches = FakeWatchSource::with(vec![r#"{"version":"1"}"#]);
+        let pages = FakeSource::empty();
+        let mut scheduler =
+            Scheduler::new(cfg, CountingNotifier::new(), pages.clone(), watches.clone());
+        scheduler.last_polled.insert(Job::Page(0), at(9, 0, 0));
+        scheduler.last_polled.insert(Job::Watch(0), at(8, 0, 0));
+
+        scheduler.tick(at(9, 5, 0)).await;
+
+        assert_eq!(watches.calls(), 1, "the watch has waited an hour longer");
+        assert_eq!(pages.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_page_outranks_a_watch_on_an_exact_tie() {
+        let cfg = cfg_with_watches(
+            "overdue_tie",
+            vec![],
+            vec![mk_run_status_page("claude", Duration::from_secs(60))],
+            vec![mk_run_watch("node", Duration::from_secs(60))],
+        );
+        let watches = FakeWatchSource::with(vec![r#"{"version":"1"}"#]);
+        let pages = FakeSource::empty();
+        let mut scheduler =
+            Scheduler::new(cfg, CountingNotifier::new(), pages.clone(), watches.clone());
+
+        // Neither has been polled, so both are infinitely overdue.
+        scheduler.tick(at(9, 0, 0)).await;
+
+        assert_eq!(pages.calls(), 1);
+        assert_eq!(watches.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn watch_summary_counts_every_poll_outcome() {
+        let cfg = cfg_with_watches(
+            "watch_summary",
+            vec![],
+            vec![],
+            vec![
+                mk_run_watch("ok", Duration::from_secs(300)),
+                mk_run_watch("bad", Duration::from_secs(300)),
+            ],
+        );
+        let mut scheduler = Scheduler::new(cfg, RejectingNotifier, FakeSource::empty(), {
+            // `ok` and `bad` share the fake, so its queue is consumed in poll order:
+            // ok=1 (baseline), bad={} (extract failure), ok=2 (change, rejected post).
+            FakeWatchSource::with(vec![r#"{"version":"1"}"#, r#"{}"#, r#"{"version":"2"}"#])
+        });
+
+        scheduler.tick(at(9, 0, 0)).await;
+        scheduler.tick(at(9, 0, 30)).await;
+        scheduler.tick(at(9, 5, 0)).await;
+
+        let summary = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
+        assert_eq!(summary.pages, PollStats::default());
+        assert_eq!(
+            summary.watches,
+            PollStats {
+                polls: 3,
+                not_modified: 0,
+                updated: 2,
+                failed: 1,
+                forwarded: 0,
+                send_failed: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_summary_is_emitted_without_status_pages() {
+        let source = FakeWatchSource::unchanged();
+        let cfg = one_watch("watch_summary_only");
+        let mut scheduler =
+            Scheduler::new(cfg, CountingNotifier::new(), FakeSource::empty(), source);
+
+        scheduler.tick(at(9, 0, 0)).await;
+
+        let summary = scheduler.take_due_summary(at(10, 0, 0)).unwrap();
+        assert_eq!(summary.watches.polls, 1);
+        assert_eq!(summary.watches.not_modified, 1);
     }
 
     #[test]

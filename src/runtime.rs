@@ -10,6 +10,7 @@ use crate::config::{
 };
 use crate::heartbeat::heartbeat_path;
 use crate::status::INCIDENTS_PATH;
+use crate::watch::{Extractor, resolve_source};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WebhookError {
@@ -53,6 +54,18 @@ pub enum ResolveError {
         #[source]
         source: url::ParseError,
     },
+    #[error("watch `{name}`: {source}")]
+    WatchWebhook {
+        name: String,
+        #[source]
+        source: WebhookError,
+    },
+    #[error("watch `{name}`: cannot build source url: {source}")]
+    WatchUrl {
+        name: String,
+        #[source]
+        source: url::ParseError,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +104,23 @@ pub struct RunStatusPage {
     pub avatar_url: Option<String>,
 }
 
+/// A watch with its source URL built, its extractor chosen and its webhook read
+/// from the environment.
+#[derive(Debug, Clone)]
+pub struct RunWatch {
+    pub name: String,
+    /// Embed title prefix, e.g. `Firefox`, `Chrome Stable`, or the watch name for `json`.
+    pub label: String,
+    pub url: Url,
+    /// Shown in the embed footer, e.g. `product-details.mozilla.org`.
+    pub host: String,
+    pub extractor: Extractor,
+    pub webhook_url: Url,
+    pub poll_interval: Duration,
+    pub display_name: String,
+    pub avatar_url: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     pub log_level: LogLevel,
@@ -98,6 +128,7 @@ pub struct RunConfig {
     pub timezone: Tz,
     pub reminders: Vec<RunReminder>,
     pub status_pages: Vec<RunStatusPage>,
+    pub watches: Vec<RunWatch>,
     pub heartbeat_path: PathBuf,
 }
 
@@ -152,6 +183,36 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
             avatar_url: p.avatar_url.map(|a| a.into_string()),
         });
     }
+    let mut watches = Vec::with_capacity(cfg.watches.len());
+    for w in cfg.watches {
+        let name = w.name.as_str().to_string();
+        let webhook_url =
+            resolve_webhook(&w.webhook).map_err(|source| ResolveError::WatchWebhook {
+                name: name.clone(),
+                source,
+            })?;
+        let spec = resolve_source(&name, &w.source).map_err(|source| ResolveError::WatchUrl {
+            name: name.clone(),
+            source,
+        })?;
+        // Defaults to the label rather than `name`, unlike status pages: a watch
+        // name is an identifier, and the label already reads as a sender name.
+        let display_name = w
+            .display_name
+            .map(|d| d.as_str().to_string())
+            .unwrap_or_else(|| spec.label.clone());
+        watches.push(RunWatch {
+            name,
+            host: spec.url.host_str().unwrap_or_default().to_string(),
+            label: spec.label,
+            url: spec.url,
+            extractor: spec.extractor,
+            webhook_url,
+            poll_interval: w.poll_interval_sec.as_duration(),
+            display_name,
+            avatar_url: w.avatar_url.map(|a| a.into_string()),
+        });
+    }
 
     Ok(RunConfig {
         log_level: cfg.system.log_level,
@@ -159,6 +220,7 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
         timezone: cfg.system.timezone,
         reminders,
         status_pages,
+        watches,
         heartbeat_path: heartbeat_path(),
     })
 }
@@ -233,6 +295,23 @@ mod test_support {
             poll_interval,
             min_impact: Impact::None,
             display_name: format!("{name} Status"),
+            avatar_url: None,
+        }
+    }
+
+    pub(crate) fn mk_run_watch(name: &str, poll_interval: Duration) -> RunWatch {
+        RunWatch {
+            name: name.to_string(),
+            label: name.to_string(),
+            url: Url::parse(&format!("https://watch.{name}.example/versions.json")).unwrap(),
+            host: format!("watch.{name}.example"),
+            extractor: Extractor::JsonPointer {
+                pointer: "/version".to_string(),
+                link: None,
+            },
+            webhook_url: Url::parse("https://discord.example/webhook").unwrap(),
+            poll_interval,
+            display_name: format!("{name} Releases"),
             avatar_url: None,
         }
     }
@@ -445,6 +524,136 @@ webhook = "status-nohook"
         assert!(matches!(
             resolve(cfg),
             Err(ResolveError::StatusPageWebhook { name, .. }) if name == "orphan-page"
+        ));
+    }
+
+    #[test]
+    fn resolve_builds_the_firefox_watch_url_and_label() {
+        let _g = EnvGuard::set("CHIME_WEBHOOK_WATCH_FIREFOX", "https://example.com/hook");
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[watches]]
+name = "ff-esr"
+webhook = "watch-firefox"
+source = { kind = "firefox", channel = "esr" }
+"#;
+        let w = resolve(Config::from_toml(toml).unwrap())
+            .unwrap()
+            .watches
+            .remove(0);
+        assert_eq!(w.name, "ff-esr");
+        assert_eq!(w.label, "Firefox ESR");
+        assert_eq!(
+            w.url.as_str(),
+            "https://product-details.mozilla.org/1.0/firefox_versions.json"
+        );
+        assert_eq!(w.host, "product-details.mozilla.org");
+        assert_eq!(w.webhook_url.as_str(), "https://example.com/hook");
+        assert_eq!(w.poll_interval, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn resolve_builds_the_chrome_watch_url_from_platform_and_channel() {
+        let _g = EnvGuard::set("CHIME_WEBHOOK_WATCH_CHROME", "https://example.com/hook");
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[watches]]
+name = "chrome"
+webhook = "watch-chrome"
+source = { kind = "chrome", platform = "linux", channel = "dev" }
+"#;
+        let w = resolve(Config::from_toml(toml).unwrap())
+            .unwrap()
+            .watches
+            .remove(0);
+        assert_eq!(
+            w.url.as_str(),
+            "https://versionhistory.googleapis.com/v1/chrome/platforms/linux/channels/dev/versions/all/releases?order_by=version%20desc&filter=endtime%3Dnone"
+        );
+        assert_eq!(w.host, "versionhistory.googleapis.com");
+        assert_eq!(w.label, "Chrome Dev");
+    }
+
+    #[test]
+    fn resolve_keeps_a_generic_json_watch_url_verbatim() {
+        let _g = EnvGuard::set("CHIME_WEBHOOK_WATCH_JSON", "https://example.com/hook");
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[watches]]
+name = "node"
+webhook = "watch-json"
+source = { kind = "json", url = "https://nodejs.org/dist/index.json", pointer = "/0/version" }
+display_name = "Node.js"
+avatar_url = "https://example.com/node.png"
+"#;
+        let w = resolve(Config::from_toml(toml).unwrap())
+            .unwrap()
+            .watches
+            .remove(0);
+        assert_eq!(w.url.as_str(), "https://nodejs.org/dist/index.json");
+        assert_eq!(w.host, "nodejs.org");
+        assert_eq!(w.label, "node");
+        assert_eq!(w.display_name, "Node.js");
+        assert_eq!(
+            w.avatar_url.as_deref(),
+            Some("https://example.com/node.png")
+        );
+        assert_eq!(
+            w.extractor,
+            Extractor::JsonPointer {
+                pointer: "/0/version".to_string(),
+                link: None,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_defaults_watch_display_name_to_the_label() {
+        let _g = EnvGuard::set("CHIME_WEBHOOK_WATCH_LABEL", "https://example.com/hook");
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[watches]]
+name = "chrome-stable-win"
+webhook = "watch-label"
+source = { kind = "chrome" }
+"#;
+        let w = resolve(Config::from_toml(toml).unwrap())
+            .unwrap()
+            .watches
+            .remove(0);
+        assert_eq!(w.display_name, "Chrome Stable");
+    }
+
+    #[test]
+    fn resolve_reports_missing_webhook_with_watch_name() {
+        let _g1 = EnvGuard::unset("CHIME_WEBHOOK_WATCH_TEAM");
+        let _g2 = EnvGuard::unset("CHIME_WEBHOOK_WATCH_TEAM_FILE");
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[watches]]
+name = "orphan-watch"
+webhook = "watch-team"
+source = { kind = "firefox" }
+"#;
+        let cfg = Config::from_toml(toml).unwrap();
+        assert!(matches!(
+            resolve(cfg),
+            Err(ResolveError::WatchWebhook { name, .. }) if name == "orphan-watch"
         ));
     }
 

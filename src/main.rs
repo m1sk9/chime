@@ -5,6 +5,7 @@ mod notifier;
 mod runtime;
 mod scheduler;
 mod status;
+mod watch;
 
 use std::time::{Duration, SystemTime};
 
@@ -20,6 +21,7 @@ use crate::notifier::Discord;
 use crate::runtime::resolve;
 use crate::scheduler::Scheduler;
 use crate::status::Statuspage;
+use crate::watch::JsonEndpoint;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/chime/config.toml";
 const USER_AGENT: &str = concat!(
@@ -100,6 +102,7 @@ async fn run_daemon() -> Result<()> {
     info!(
         reminders = run_cfg.reminders.len(),
         status_pages = run_cfg.status_pages.len(),
+        watches = run_cfg.watches.len(),
         interval_sec = run_cfg.interval.as_secs(),
         timezone = %run_cfg.timezone,
         "chime starting"
@@ -111,8 +114,9 @@ async fn run_daemon() -> Result<()> {
         .build()
         .context("failed to build HTTP client")?;
     let notifier = Discord::new(client.clone());
+    let watch_source = JsonEndpoint::new(client.clone());
     let source = Statuspage::new(client);
-    let scheduler = Scheduler::new(run_cfg, notifier, source);
+    let scheduler = Scheduler::new(run_cfg, notifier, source, watch_source);
     scheduler
         .run()
         .await
