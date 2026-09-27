@@ -1,6 +1,6 @@
 # chime
 
-IaC-managed Discord webhook reminder. Reads a TOML schedule, runs as a long-lived process, and posts to Discord webhooks at the configured times. It can also watch Atlassian Statuspage instances and forward incident updates to the same webhooks.
+IaC-managed Discord webhook reminder. Reads a TOML schedule, runs as a long-lived process, and posts to Discord webhooks at the configured times. It can also watch Atlassian Statuspage instances and forward incident updates to the same webhooks, and watch the Firefox and Chrome release feeds — or any JSON endpoint — to announce new versions.
 
 ## Features
 
@@ -8,6 +8,7 @@ IaC-managed Discord webhook reminder. Reads a TOML schedule, runs as a long-live
 - Strict, fail-fast config validation (unknown fields, bad timezones, missing secrets — all rejected at startup).
 - Webhook URLs are kept out of `config.toml` and injected via environment variables (or `*_FILE` paths for Docker secrets).
 - Forwards Atlassian Statuspage incidents (Claude, Proton, GitHub, Discord, Cloudflare, …) to Discord as colour-coded embeds. Pull-based: no inbound port, no public ingress.
+- Watches release feeds — Firefox, Chrome, or any JSON endpoint — and posts a new version as an embed. Pull-based, same as status pages.
 - Ships as a distroless container image to `ghcr.io/m1sk9/chime`.
 - Built-in liveness check (`chime health`) usable from a distroless `HEALTHCHECK` — no shell or extra client needed.
 
@@ -131,11 +132,41 @@ avatar_url = "https://example.com/claude.png"
 poll_interval_sec = 300     # optional; 60..=3600 (default: 300)
 min_impact = "minor"        # optional; none | maintenance | minor | major | critical
                             # (default: none — forward everything)
+
+[[watches]]
+name = "firefox"            # non-empty, unique within [[watches]]
+webhook = "team"            # logical name — resolved via env, same as reminders
+source = { kind = "firefox" }
+                            # channel: release | esr | beta | devedition | nightly
+                            # (default: release)
+display_name = "Firefox Releases"
+                            # optional; the Discord username on the message
+                            # (default: the source label, e.g. `Firefox`)
+poll_interval_sec = 3600    # optional; 60..=3600 (default: 3600)
+avatar_url = "https://example.com/firefox.png"
+                            # optional; https only
+
+[[watches]]
+name = "chrome"
+webhook = "team"
+source = { kind = "chrome", platform = "win", channel = "stable", rollout = "started" }
+                            # platform: win | win64 | mac | mac_arm64 | linux |
+                            #           android | webview | ios (default: win)
+                            # channel: stable | extended | beta | dev | canary
+                            #          (default: stable)
+                            # rollout: started | complete (default: started)
+
+[[watches]]
+name = "node"
+webhook = "team"
+source = { kind = "json", url = "https://nodejs.org/dist/index.json", pointer = "/0/version", link = "https://nodejs.org/en/blog/release" }
+                            # url: https only. pointer: RFC 6901, must start with `/`.
+                            # link: optional; https only; put on the embed as-is.
 ```
 
 Each reminder schedules by **either** `days` (weekdays) **or** `day_of_month` (days of the month) — exactly one of the two, never both. `day_of_month` accepts a list of days in `1..=31`; a day that does not exist in a given month (e.g. `31` in February) is simply skipped that month.
 
-A config must define at least one `[[reminders]]` **or** one `[[status_pages]]`; either section alone is fine.
+A config must define at least one `[[reminders]]`, `[[status_pages]]` **or** `[[watches]]`; any section alone is fine.
 
 ### Status pages
 
@@ -167,6 +198,86 @@ The `Status` field of one real incident renders as `✅ Resolved`, `Impact` as `
 
 Long bodies are truncated (postmortems run to thousands of characters); the linked incident page is the authoritative copy.
 
+### Watches
+
+`[[watches]]` polls a release feed and posts when the version it reads there changes. `source` picks the feed; `source = { kind = "firefox" }` and a `[watches.source]` sub-table mean the same thing.
+
+| `kind` | Feed |
+|---|---|
+| `firefox` | Mozilla product-details, `https://product-details.mozilla.org/1.0/firefox_versions.json` |
+| `chrome` | Chrome [VersionHistory API](https://developer.chrome.com/docs/web-platform/versionhistory/reference), `https://versionhistory.googleapis.com/v1/chrome/platforms/{platform}/channels/{channel}/versions/all/releases` |
+| `json` | Any https JSON endpoint you name, read through a JSON pointer |
+
+Safari is not supported: Apple publishes no machine-readable release feed.
+
+#### `firefox`
+
+`channel` selects which product-details key is watched, and where the embed links:
+
+| `channel` | Key | Link |
+|---|---|---|
+| `release` (default) | `LATEST_FIREFOX_VERSION` | `https://www.firefox.com/firefox/{version}/releasenotes/` |
+| `esr` | `FIREFOX_ESR` | same, with the trailing `esr` dropped (`140.16.0esr` → `140.16.0`) |
+| `beta` | `LATEST_FIREFOX_RELEASED_DEVEL_VERSION` | same, with `b5` rewritten to `beta` (`157.0b5` → `157.0beta`) |
+| `devedition` | `FIREFOX_DEVEDITION` | as for `beta` |
+| `nightly` | `FIREFOX_NIGHTLY` | `https://www.firefox.com/firefox/nightly/notes/` |
+
+The feed supports conditional requests, so an unchanged feed costs a `304`. An empty value for the selected channel is a polling failure, not a version.
+
+#### `chrome`
+
+`platform` and `channel` are inserted into the API path as-is. `rollout` decides which version counts as released:
+
+- `started` (default) — the top version being served, as soon as its staged rollout begins, even at 0.5%. A pulled rollout makes the top version go *down*, and that is reported too.
+- `complete` — only the top version served to 100% of users.
+
+A change in rollout fraction alone is not a new release and posts nothing. The VersionHistory API returns no `ETag`, so every poll downloads the (few-kilobyte) response and is counted as `updated` in the [summary](#knowing-the-poller-is-alive). The embed links to the channel's label on the Chrome Releases blog (canary, which is not announced there, links to the blog itself).
+
+#### `json`
+
+chime does not know the shape of the document: `pointer` ([RFC 6901](https://www.rfc-editor.org/rfc/rfc6901)) names the one value that is the version. Segments are separated by `/`, array elements are addressed by index, and `~0` / `~1` escape `~` / `/`. The value must be a string or a number; searching inside an array or combining several fields is not possible.
+
+| Feed | `url` | `pointer` |
+|---|---|---|
+| Node.js | `https://nodejs.org/dist/index.json` | `/0/version` |
+| A GitHub repository | `https://api.github.com/repos/{owner}/{repo}/releases/latest` | `/tag_name` |
+
+A pointer that does not match the document is not caught at startup: like a status page URL that is not a Statuspage instance, it fails at the first poll with a `warn` and keeps failing each interval.
+
+#### Notification semantics
+
+- **The first poll after startup is silent** — it records the current version as a baseline. A restart re-baselines.
+- A post is sent whenever the version string **differs** from the last one seen, including when it goes down. There is no version ordering: `140.16.0esr`, `157.0b5` and `v24.9.0` do not share one.
+- The last-seen version is updated **before** the Discord request, so a failed send is not retried.
+- Polling failures (unreachable feed, non-JSON body, pointer that matches nothing) are logged at `warn` and never posted.
+
+#### What it looks like in Discord
+
+Each new version is one embed, attributed to `display_name`, with the feed's host as the footer. The colour is fixed (Discord blurple) — a release has no severity.
+
+```
+Firefox 156.0.1                          ← links to the release notes
+Previous: 156.0        Channel: Release
+Released: 2026-09-25   Next release: 2026-10-09      ← release channel only
+Channels: Release 156.0.1 · ESR 140.16.0esr · Beta 157.0b5 · Developer Edition 157.0b5 · Nightly 159.0a1
+product-details.mozilla.org · <time chime saw it>
+```
+
+```
+Chrome Stable 155.0.8059.12              ← links to the Chrome Releases blog
+Previous: 154.0.8037.58   Channel: Stable   Platform: win
+Rollout: 0.5%             Milestone: 155
+versionhistory.googleapis.com · <serving start time>
+```
+
+```
+node v24.9.0                             ← links to `link`, if set
+Previous: v24.8.0
+nodejs.org · <time chime saw it>
+```
+
+The timestamp is the Chrome release's own serving start time. product-details and arbitrary JSON carry no publication time, so for `firefox` and `json` it is when chime noticed the change — up to `poll_interval_sec` after the release.
+
 ### Webhook resolution
 
 The `webhook` field is a logical name, not a URL. At startup chime derives an env key from it:
@@ -193,11 +304,15 @@ All of the following are rejected at startup with a descriptive error and a non-
 - A reminder specifying neither or both of `days` / `day_of_month`
 - Empty `message`
 - Webhook env var unset, empty, or not a valid URL
-- Neither reminders nor status pages defined
+- Neither reminders, status pages nor watches defined
 - Duplicate or empty status page `name`
 - Status page `url` or `avatar_url` that is not `https`, or has no host
 - `poll_interval_sec` outside `60..=3600`
 - `min_impact` that is not one of `none` / `maintenance` / `minor` / `major` / `critical`
+- Duplicate or empty watch `name`
+- `source.kind` that is not `firefox` / `chrome` / `json`, or an unknown key inside `source`
+- `firefox.channel` / `chrome.platform` / `chrome.channel` / `chrome.rollout` outside their listed values
+- `json` watch whose `url` / `link` is not https, or whose `pointer` does not start with `/`
 
 ## How it works
 
@@ -207,7 +322,7 @@ chime is a long-running process, not a one-shot cron job. The main loop:
 2. Compute the current local time in the configured timezone.
 3. For each reminder, fire if the current hour and minute match and today matches its schedule — one of `days` (weekday), or one of `day_of_month` (day of the current month).
 4. Per-minute deduplication: each reminder fires at most once per matching minute, even if the tick interval is shorter than 60 seconds (e.g. with `tick_interval_sec = 30` you get exactly one POST per scheduled minute). The dedup record is updated **before** the HTTP request, so a send failure does not cause a retry within the same minute.
-5. Poll **at most one** status page — the one most overdue among those whose `poll_interval_sec` has elapsed — and forward incident updates not seen before.
+5. Poll **at most one** status page or watch — the one most overdue among those whose `poll_interval_sec` has elapsed — and forward incident updates or versions not seen before.
 6. SIGINT and SIGTERM both trigger a clean shutdown.
 
 Status page polling follows the same rules as reminders:
@@ -216,7 +331,7 @@ Status page polling follows the same rules as reminders:
 - The seen-record is written **before** the Discord request, so a failed send is not retried on the next poll.
 - A status page being unreachable is logged at `warn` and retried on its own interval. chime never posts about its own polling failures.
 - Because polling happens on the tick, an update is forwarded up to `poll_interval_sec` after Statuspage published it. The embed timestamp always shows the real publication time.
-- **One page is polled per tick**, so a tick costs a single request no matter how many pages are configured — a set of unreachable pages cannot stall the loop long enough for `chime health` to call the heartbeat stale. Configure at most `poll_interval_sec / tick_interval_sec` pages to keep every page on its nominal interval; beyond that they simply poll less often.
+- **One page or watch is polled per tick**, so a tick costs a single request no matter how many are configured — a set of unreachable endpoints cannot stall the loop long enough for `chime health` to call the heartbeat stale. Configure at most `poll_interval_sec / tick_interval_sec` pages and watches in total to keep every one on its nominal interval; beyond that they simply poll less often.
 - Requests are conditional (`If-None-Match`) and compressed (`Accept-Encoding: gzip`), so a page with no news usually costs a 304 with no body at all. An instance that returns **no `ETag`** — some Statuspage-compatible feeds are served from other infrastructure and do not — cannot be validated, so every poll downloads the whole feed. gzip keeps that in the single-digit kilobytes; nothing else is needed.
 
 ### Knowing the poller is alive
@@ -227,7 +342,15 @@ Once every hour the daemon logs one `status poll summary` line at `info`:
 {"timestamp":"2026-06-05T09:00:00.000000Z","level":"INFO","fields":{"message":"status poll summary","window_sec":3600,"pages":5,"polls":60,"not_modified":55,"updated":4,"failed":1,"forwarded":3,"send_failed":1},"target":"chime::scheduler"}
 ```
 
-Without it, a working poller is silent: a page with no news answers 304, that path only logs at `debug`, and quiet status pages can go days without an incident. The summary makes "nothing is happening" distinguishable from "the poller is dead" without reading the container's network counters. `not_modified` and `updated` are HTTP outcomes — 304 and 200 — not a count of incidents that moved, so an instance that returns no `ETag` reports every poll as `updated` even when the feed is unchanged. `failed` counts fetch failures in the window (each is also logged at `warn` as it happens), `forwarded` counts Discord posts that succeeded, and `send_failed` counts those Discord rejected (each also logged at `error`) — a nonzero `send_failed` is the difference between a page with no news and a webhook that stopped accepting posts. The line is omitted entirely when no `status_pages` are configured. Set `log_level = "debug"` for the per-poll detail.
+Without it, a working poller is silent: a page with no news answers 304, that path only logs at `debug`, and quiet status pages can go days without an incident. The summary makes "nothing is happening" distinguishable from "the poller is dead" without reading the container's network counters. `not_modified` and `updated` are HTTP outcomes — 304 and 200 — not a count of incidents that moved, so an instance that returns no `ETag` reports every poll as `updated` even when the feed is unchanged. `failed` counts fetch failures in the window (each is also logged at `warn` as it happens), `forwarded` counts Discord posts that succeeded, and `send_failed` counts those Discord rejected (each also logged at `error`) — a nonzero `send_failed` is the difference between a page with no news and a webhook that stopped accepting posts. Set `log_level = "debug"` for the per-poll detail.
+
+Watches get their own `watch poll summary` line over the same window, with the same fields except that `pages` becomes `watches` (the number configured):
+
+```json
+{"timestamp":"2026-06-05T09:00:00.000000Z","level":"INFO","fields":{"message":"watch poll summary","window_sec":3600,"watches":2,"polls":2,"not_modified":1,"updated":1,"failed":0,"forwarded":0,"send_failed":0},"target":"chime::scheduler"}
+```
+
+As for status pages, `updated` counts 200 responses, not versions that changed — a Chrome watch reports every poll as `updated`. `failed` also covers a body that was fetched but held no readable version. Each line is omitted when its list is empty.
 
 > [!IMPORTANT]
 >
