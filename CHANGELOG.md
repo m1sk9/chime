@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/m1sk9/chime/compare/chime-v0.6.0...chime-v0.6.1) (2026-10-03)
+
+
+### Miscellaneous
+
+* **deps:** update rust crate tokio to v1.53.2 ([#59](https://github.com/m1sk9/chime/issues/59)) ([2f942f5](https://github.com/m1sk9/chime/commit/2f942f57b5d061bf7be2b19a3eecd9edaa3bd4c6))
+
 ## [0.6.0](https://github.com/m1sk9/chime/compare/chime-v0.5.0...chime-v0.6.0) (2026-09-27)
 
 
