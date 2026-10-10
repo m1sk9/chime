@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.1](https://github.com/m1sk9/chime/compare/chime-v0.6.0...chime-v0.6.1) (2026-10-10)
+
+
+### Miscellaneous
+
+* **deps:** update docker/dockerfile docker tag to v1.28 ([#62](https://github.com/m1sk9/chime/issues/62)) ([6daf786](https://github.com/m1sk9/chime/commit/6daf78634b5b1caf05c25f82addaa7e727202aed))
+* **deps:** update rust crate serde_json to v1.0.152 ([#64](https://github.com/m1sk9/chime/issues/64)) ([975ab3c](https://github.com/m1sk9/chime/commit/975ab3c623960cc55ee8eb3572ef29d34ebb6694))
+* **deps:** update rust crate tokio to v1.53.2 ([#59](https://github.com/m1sk9/chime/issues/59)) ([2f942f5](https://github.com/m1sk9/chime/commit/2f942f57b5d061bf7be2b19a3eecd9edaa3bd4c6))
+* **deps:** update rust crate toml to v1.1.7 ([#61](https://github.com/m1sk9/chime/issues/61)) ([bf83c07](https://github.com/m1sk9/chime/commit/bf83c07dd8c76d97bd33099b934d430a444896f7))
+* **deps:** update rust crate toml to v1.1.8 ([#63](https://github.com/m1sk9/chime/issues/63)) ([2662a98](https://github.com/m1sk9/chime/commit/2662a98f19b6f158898789b23c99ac8848a19056))
+
 ## [0.6.0](https://github.com/m1sk9/chime/compare/chime-v0.5.0...chime-v0.6.0) (2026-09-27)
 
 
