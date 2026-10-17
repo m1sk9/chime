@@ -93,14 +93,11 @@ impl WireActive {
     /// The summary carries only the latest update, so its time is the update's id:
     /// several updates between two polls are forwarded as the last one.
     fn normalize(self) -> Incident {
-        let (message, last_at) = match self.last_update {
-            Some(u) => (u.message, u.created_at),
-            None => (None, None),
-        };
-        let state = self
-            .status
-            .as_deref()
-            .map_or(IncidentState::Unknown, IncidentState::from_wire);
+        let (message, last_at) = self
+            .last_update
+            .map(|u| (u.message, u.created_at))
+            .unwrap_or_default();
+        let state = IncidentState::from_wire_opt(self.status.as_deref());
         let updates = [last_at, self.updated_at, self.started]
             .into_iter()
             .flatten()

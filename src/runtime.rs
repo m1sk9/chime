@@ -183,6 +183,10 @@ pub struct RunConfig {
 }
 
 impl RunConfig {
+    pub fn has_pollers(&self) -> bool {
+        !(self.status_pages.is_empty() && self.feeds.is_empty() && self.rss.is_empty())
+    }
+
     pub fn watch_count(&self) -> usize {
         self.feeds.iter().map(|f| f.watches.len()).sum()
     }
@@ -230,7 +234,7 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
             .unwrap_or_else(|| name.clone());
         let url = p.url.as_url().clone();
         status_pages.push(RunStatusPage {
-            host: url.host_str().unwrap_or_default().to_string(),
+            host: host_of(&url),
             name,
             url,
             api_url: spec.api_url,
@@ -263,7 +267,7 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
             .unwrap_or_else(|| spec.label.clone());
         let watch = RunWatch {
             name,
-            host: spec.url.host_str().unwrap_or_default().to_string(),
+            host: host_of(&spec.url),
             label: spec.label,
             extractor: spec.extractor,
             link: spec.link,
@@ -302,7 +306,7 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
         let url = r.url.as_url().clone();
         rss.push(RunRss {
             name,
-            host: url.host_str().unwrap_or_default().to_string(),
+            host: host_of(&url),
             url,
             webhook_url,
             poll_interval: r.poll_interval_sec.as_duration(),
@@ -321,6 +325,10 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
         rss,
         heartbeat_path: heartbeat_path(),
     })
+}
+
+fn host_of(url: &Url) -> String {
+    url.host_str().unwrap_or_default().to_string()
 }
 
 fn take_string(m: Message) -> String {

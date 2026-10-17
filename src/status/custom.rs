@@ -71,9 +71,7 @@ fn incident(
         components: Vec::new(),
         updates: vec![IncidentUpdate {
             id: update_id,
-            state: status
-                .as_deref()
-                .map_or(IncidentState::Unknown, IncidentState::from_wire),
+            state: IncidentState::from_wire_opt(status.as_deref()),
             body: optional(item, mapping.body.as_ref())?.unwrap_or_default(),
             created_at,
         }],

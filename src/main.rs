@@ -17,13 +17,12 @@ use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 
 use crate::config::{Config, LogLevel};
+use crate::fetch::HttpSource;
 use crate::heartbeat::{check_liveness, heartbeat_path};
 use crate::notifier::Discord;
-use crate::rss::FeedEndpoint;
 use crate::runtime::resolve;
 use crate::scheduler::Scheduler;
 use crate::status::StatusEndpoint;
-use crate::watch::JsonEndpoint;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/chime/config.toml";
 const USER_AGENT: &str = concat!(
@@ -86,13 +85,11 @@ fn run_health() -> Result<()> {
     let cfg = load_config()?;
     let interval = cfg.system.tick_interval_sec.as_duration();
     let path = heartbeat_path();
-    match check_liveness(&path, interval, SystemTime::now()) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
+    if let Err(e) = check_liveness(&path, interval, SystemTime::now()) {
+        eprintln!("{e}");
+        std::process::exit(1);
     }
+    Ok(())
 }
 
 async fn run_daemon() -> Result<()> {
@@ -117,10 +114,9 @@ async fn run_daemon() -> Result<()> {
         .build()
         .context("failed to build HTTP client")?;
     let notifier = Discord::new(client.clone());
-    let watch_source = JsonEndpoint::new(client.clone());
-    let rss_source = FeedEndpoint::new(client.clone());
+    let feeds = HttpSource::new(client.clone());
     let source = StatusEndpoint::new(client);
-    let scheduler = Scheduler::new(run_cfg, notifier, source, watch_source, rss_source);
+    let scheduler = Scheduler::new(run_cfg, notifier, source, feeds);
     scheduler
         .run()
         .await
