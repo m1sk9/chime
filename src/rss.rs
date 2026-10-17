@@ -51,10 +51,12 @@ impl FeedEntry {
         }
     }
 
+    /// One line: an embed title shows a newline as a line break, and a title
+    /// wrapped in the feed source (or containing `<br>`) is still one heading.
     fn rendered_title(&self) -> Option<String> {
         self.title
             .as_ref()
-            .map(Markup::render)
+            .map(|t| t.render().split_whitespace().collect::<Vec<_>>().join(" "))
             .filter(|t| !t.is_empty())
     }
 
@@ -670,6 +672,15 @@ mod tests {
             "<title>a</title><comments>https://blog.example/1#comments</comments><link>https://blog.example/1</link>",
         ));
         assert_eq!(entries[0].link.as_deref(), Some("https://blog.example/1"));
+    }
+
+    #[test]
+    fn a_title_that_spans_lines_is_joined_into_one() {
+        let item = rss_item("<title>Release notes\n      for 2.3</title><guid>g</guid>");
+        assert_eq!(
+            parse(&item)[0].title.as_deref(),
+            Some("Release notes for 2.3")
+        );
     }
 
     #[test]
