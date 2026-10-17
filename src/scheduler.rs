@@ -410,7 +410,7 @@ async fn poll_page<N: Notifier, S: StatusSource>(
     state: &mut PageState,
 ) -> PollOutcome {
     let etag = state.etag.clone();
-    let fetched = match source.fetch(&page.api_url, etag.as_deref()).await {
+    let fetched = match source.fetch(page, etag.as_deref()).await {
         Ok(f) => f,
         Err(e) => {
             // A status page being unreachable is not chime's outage to report:
@@ -631,7 +631,7 @@ mod tests {
     use crate::runtime::{
         RunReminder, mk_run_feed, mk_run_rss, mk_run_status_page, mk_run_watch, mk_shared_feed,
     };
-    use crate::status::{Incident, StatusError, mk_incident, mk_update};
+    use crate::status::{DecodeError, Incident, StatusError, mk_incident, mk_update};
     use chrono::TimeZone;
     use chrono_tz::Asia::Tokyo;
     use std::collections::VecDeque;
@@ -695,13 +695,14 @@ mod tests {
     }
 
     /// Returns the queued incident lists in order, repeating the last one once the
-    /// queue drains. `fail` makes every fetch error instead, `not_modified` makes
-    /// every fetch answer 304.
+    /// queue drains. `fail` makes every fetch error instead, `undecodable` makes
+    /// every body fail to decode, `not_modified` makes every fetch answer 304.
     #[derive(Clone)]
     struct FakeSource {
         calls: Arc<AtomicUsize>,
         queue: Arc<Mutex<VecDeque<Vec<Incident>>>>,
         fail: bool,
+        undecodable: bool,
         not_modified: bool,
     }
 
@@ -711,7 +712,15 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 queue: Arc::new(Mutex::new(VecDeque::new())),
                 fail: false,
+                undecodable: false,
                 not_modified: false,
+            }
+        }
+
+        fn undecodable() -> Self {
+            FakeSource {
+                undecodable: true,
+                ..FakeSource::empty()
             }
         }
 
@@ -744,7 +753,7 @@ mod tests {
     impl StatusSource for FakeSource {
         async fn fetch(
             &self,
-            _url: &Url,
+            _page: &RunStatusPage,
             _etag: Option<&str>,
         ) -> Result<Fetched<Vec<Incident>>, StatusError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -752,6 +761,14 @@ mod tests {
                 return Err(StatusError::Status {
                     status: 503,
                     body: "unavailable".to_string(),
+                });
+            }
+            if self.undecodable {
+                return Err(StatusError::Decode {
+                    kind: "Atlassian Statuspage",
+                    source: DecodeError::Json(
+                        serde_json::from_str::<serde_json::Value>("<html>").unwrap_err(),
+                    ),
                 });
             }
             if self.not_modified {
@@ -1137,6 +1154,31 @@ mod tests {
         assert_eq!(source.calls(), 2);
         // The reminder still fired; the failing status page notified nothing.
         assert_eq!(notifier.sent(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_fails_to_decode_leaves_the_etag_unstored() {
+        // Holds for every decoder: `StatusEndpoint` turns a decode failure into an
+        // `Err`, and only an `Ok` body may replace the stored ETag.
+        let cfg = cfg_with(
+            "decode_fail",
+            vec![],
+            vec![mk_run_status_page("claude", Duration::from_secs(60))],
+        );
+        let mut scheduler = sched(cfg, CountingNotifier::new(), FakeSource::undecodable());
+        let mut state = PageState::default();
+        state.etag = Some("W/\"last-good\"".to_string());
+        scheduler.page_states.insert("claude".to_string(), state);
+
+        scheduler.tick(at(9, 0, 0)).await;
+
+        assert_eq!(
+            scheduler.page_states["claude"].etag.as_deref(),
+            Some("W/\"last-good\"")
+        );
+        let stats = scheduler.take_due_summary(at(10, 0, 0)).unwrap().pages;
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.updated, 0);
     }
 
     #[tokio::test]

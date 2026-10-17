@@ -9,7 +9,7 @@ use crate::config::{
     Config, Impact, LogLevel, Message, Schedule, ScheduleError, ThreadId, TimeOfDay, WebhookRef,
 };
 use crate::heartbeat::heartbeat_path;
-use crate::status::INCIDENTS_PATH;
+use crate::status::{Decoder, SourceError};
 use crate::watch::{Extractor, resolve_source};
 
 #[derive(Debug, thiserror::Error)]
@@ -48,11 +48,11 @@ pub enum ResolveError {
         #[source]
         source: WebhookError,
     },
-    #[error("status page `{name}`: cannot build API url: {source}")]
-    StatusPageUrl {
+    #[error("status page `{name}`: cannot resolve source: {source}")]
+    StatusPageSource {
         name: String,
         #[source]
-        source: url::ParseError,
+        source: SourceError,
     },
     #[error("watch `{name}`: {source}")]
     WatchWebhook {
@@ -95,12 +95,16 @@ impl RunReminder {
     }
 }
 
-/// A status page with everything already resolved: the API endpoint is built, the
-/// webhook URL is read from the environment, and the Discord identity is settled.
+/// A status page with everything already resolved: the fetched URL and its decoder
+/// are chosen, the webhook URL is read from the environment, and the Discord
+/// identity is settled.
 #[derive(Debug, Clone)]
 pub struct RunStatusPage {
     pub name: String,
+    /// The configured page URL, verbatim. Datadog builds incident links from it.
+    pub url: Url,
     pub api_url: Url,
+    pub decoder: Decoder,
     /// Shown in the embed footer, e.g. `status.claude.com`.
     pub host: String,
     pub webhook_url: Url,
@@ -215,22 +219,22 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
                 source,
             }
         })?;
-        let api_url =
-            p.url
-                .as_url()
-                .join(INCIDENTS_PATH)
-                .map_err(|source| ResolveError::StatusPageUrl {
-                    name: name.clone(),
-                    source,
-                })?;
+        let spec = crate::status::resolve_source(p.kind, p.url.as_url(), p.mapping.as_ref())
+            .map_err(|source| ResolveError::StatusPageSource {
+                name: name.clone(),
+                source,
+            })?;
         let display_name = p
             .display_name
             .map(|d| d.as_str().to_string())
             .unwrap_or_else(|| name.clone());
+        let url = p.url.as_url().clone();
         status_pages.push(RunStatusPage {
-            host: p.url.host().to_string(),
+            host: url.host_str().unwrap_or_default().to_string(),
             name,
-            api_url,
+            url,
+            api_url: spec.api_url,
+            decoder: spec.decoder,
             webhook_url,
             poll_interval: p.poll_interval_sec.as_duration(),
             min_impact: p.min_impact,
@@ -400,8 +404,13 @@ mod test_support {
     pub(crate) fn mk_run_status_page(name: &str, poll_interval: Duration) -> RunStatusPage {
         RunStatusPage {
             name: name.to_string(),
-            api_url: Url::parse(&format!("https://status.{name}.example/{INCIDENTS_PATH}"))
-                .unwrap(),
+            url: Url::parse(&format!("https://status.{name}.example")).unwrap(),
+            api_url: Url::parse(&format!(
+                "https://status.{name}.example/{}",
+                crate::status::STATUSPAGE_PATH
+            ))
+            .unwrap(),
+            decoder: Decoder::Statuspage,
             host: format!("status.{name}.example"),
             webhook_url: Url::parse("https://discord.example/webhook").unwrap(),
             poll_interval,
@@ -618,6 +627,112 @@ webhook = "status-team"
         // `display_name` falls back to the logical name so a message is never anonymous.
         assert_eq!(page.display_name, "claude");
         assert_eq!(page.poll_interval, Duration::from_secs(300));
+    }
+
+    /// `webhook` must be unique per test: tests run in parallel, and one guard's
+    /// `Drop` would unset the variable under another test.
+    fn resolve_page(webhook: &str, page: &str) -> RunStatusPage {
+        let key = WebhookRef::try_from(webhook.to_string()).unwrap().env_key();
+        let _g = EnvGuard::set(&key, "https://example.com/hook");
+        let toml = format!(
+            "[system]\ntick_interval_sec = 30\ntimezone = \"Asia/Tokyo\"\n\n[[status_pages]]\nname = \"p\"\nwebhook = \"{webhook}\"\n{page}\n"
+        );
+        resolve(Config::from_toml(&toml).unwrap())
+            .unwrap()
+            .status_pages
+            .remove(0)
+    }
+
+    #[test]
+    fn status_page_api_url_per_kind() {
+        for (kind, url, api_url, decoder) in [
+            (
+                "statuspage",
+                "https://status.claude.com",
+                "https://status.claude.com/api/v2/incidents.json",
+                Decoder::Statuspage,
+            ),
+            (
+                "instatus",
+                "https://instat.us",
+                "https://instat.us/v3/summary.json",
+                Decoder::Instatus,
+            ),
+            (
+                "incidentio",
+                "https://status.incident.io",
+                "https://status.incident.io/feed.atom",
+                Decoder::IncidentIo,
+            ),
+            (
+                "datadog",
+                "https://shopist.statuspage.datadoghq.com/",
+                "https://shopist.statuspage.datadoghq.com/config.json",
+                Decoder::Datadog,
+            ),
+        ] {
+            let page = resolve_page(
+                &format!("status-kind-{kind}"),
+                &format!("kind = \"{kind}\"\nurl = \"{url}\""),
+            );
+            assert_eq!(page.api_url.as_str(), api_url, "{kind}");
+            assert_eq!(page.decoder, decoder, "{kind}");
+        }
+    }
+
+    #[test]
+    fn status_page_url_with_path_keeps_the_path() {
+        let page = resolve_page("status-kind-path", "url = \"https://x.example/status\"");
+        assert_eq!(
+            page.api_url.as_str(),
+            "https://x.example/status/api/v2/incidents.json"
+        );
+        assert_eq!(page.url.as_str(), "https://x.example/status");
+        assert_eq!(page.host, "x.example");
+    }
+
+    #[test]
+    fn custom_page_url_is_used_verbatim() {
+        let page = resolve_page(
+            "status-kind-custom",
+            "kind = \"custom\"\nurl = \"https://x.example/api/incidents.json?limit=5\"\nmapping = { id = \"/id\", title = \"/title\" }",
+        );
+        assert_eq!(
+            page.api_url.as_str(),
+            "https://x.example/api/incidents.json?limit=5"
+        );
+        assert!(matches!(page.decoder, Decoder::Custom(_)));
+    }
+
+    #[test]
+    fn resolve_reports_a_custom_page_without_mapping_by_name() {
+        // `from_toml` rejects this first; clearing the field afterwards exercises
+        // `resolve`'s own defensive check, as for reminder schedules.
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[status_pages]]
+name = "mine"
+kind = "custom"
+url = "https://x.example/i.json"
+webhook = "status-kind-nomapping"
+mapping = { id = "/id", title = "/title" }
+"#;
+        let _g = EnvGuard::set(
+            "CHIME_WEBHOOK_STATUS_KIND_NOMAPPING",
+            "https://example.com/hook",
+        );
+        let mut cfg = Config::from_toml(toml).unwrap();
+        cfg.status_pages[0].mapping = None;
+        assert!(matches!(
+            resolve(cfg),
+            Err(ResolveError::StatusPageSource {
+                name,
+                source: SourceError::MissingMapping,
+            }) if name == "mine"
+        ));
     }
 
     #[test]

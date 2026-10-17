@@ -1,19 +1,34 @@
+mod custom;
+mod datadog;
+mod incidentio;
+mod instatus;
+mod statuspage;
+
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use reqwest::Client;
-use serde::Deserialize;
 use url::Url;
 
-use crate::config::Impact;
-use crate::fetch::{FetchError, Fetched, fetch_json};
+use crate::config::{CustomMapping, Impact, StatusKind};
+use crate::fetch::{FetchError, Fetched, fetch_conditional};
 use crate::notifier::{DiscordMessage, Embed};
+use crate::rss::{FEED_ACCEPT, RssError};
 use crate::runtime::RunStatusPage;
 
-/// Path appended to a status page base URL. `incidents.json` is used rather than
-/// `summary.json` because summary omits resolved incidents, and "resolved" is the
-/// single most useful update to forward.
-pub const INCIDENTS_PATH: &str = "api/v2/incidents.json";
+/// Appended to an Atlassian Statuspage base URL. `incidents.json` is used rather
+/// than `summary.json` because summary omits resolved incidents, and "resolved" is
+/// the single most useful update to forward.
+pub const STATUSPAGE_PATH: &str = "api/v2/incidents.json";
+/// Instatus v3: unlike the legacy `/summary.json`, it carries `lastUpdate` and the
+/// recently resolved incidents.
+pub const INSTATUS_PATH: &str = "v3/summary.json";
+/// Why not incident.io's widget API: it is opt-in per page and its schema is shown
+/// only in the page's admin UI. The Atom feed is public on every page.
+pub const INCIDENTIO_PATH: &str = "feed.atom";
+/// The document the Datadog Status Pages site itself renders from; the product
+/// documents no public API, and its RSS exists only when the page enables it.
+pub const DATADOG_PATH: &str = "config.json";
 
 const COLOR_RESOLVED: u32 = 0x57F287;
 const COLOR_CRITICAL: u32 = 0xED4245;
@@ -27,8 +42,12 @@ pub enum StatusError {
     Request(#[from] reqwest::Error),
     #[error("status page returned HTTP {status}: {body}")]
     Status { status: u16, body: String },
-    #[error("response is not an Atlassian Statuspage incidents feed: {0}")]
-    Decode(#[source] serde_json::Error),
+    #[error("response does not decode as {kind}: {source}")]
+    Decode {
+        kind: &'static str,
+        #[source]
+        source: DecodeError,
+    },
     #[error("status page body exceeded {limit} bytes")]
     TooLarge { limit: usize },
 }
@@ -43,43 +62,124 @@ impl From<FetchError> for StatusError {
     }
 }
 
-// Why not `deny_unknown_fields`: every other struct in chime rejects unknown keys,
-// but these mirror a third-party API. Statuspage adds fields without notice, and a
-// strict decoder would turn a harmless addition into a total outage of the feature.
-// Why not `#[serde(default)]` on `incidents`: a defaulted field makes every JSON
-// object decode, so a URL that is not a Statuspage instance would look like a page
-// with no incidents forever instead of failing the poll with a decode error. Only
-// `id`/`name` are required below — `impact` is optional for the same reason it is
-// parsed leniently: an absent severity must degrade to "Unknown", not silence the
-// page behind a decode error on every poll.
-#[derive(Debug, Deserialize)]
-struct WireResponse {
-    incidents: Vec<WireIncident>,
+#[derive(Debug, thiserror::Error)]
+pub enum DecodeError {
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Feed(#[from] RssError),
+    #[error(transparent)]
+    Mapping(#[from] custom::MappingError),
 }
 
-#[derive(Debug, Deserialize)]
-struct WireIncident {
-    id: String,
-    name: String,
-    impact: Option<String>,
-    shortlink: Option<String>,
-    #[serde(default)]
-    incident_updates: Vec<WireUpdate>,
-    #[serde(default)]
-    components: Vec<WireComponent>,
+#[derive(Debug, thiserror::Error)]
+pub enum SourceError {
+    #[error(transparent)]
+    Url(#[from] url::ParseError),
+    #[error("kind `custom` requires `mapping`")]
+    MissingMapping,
 }
 
-#[derive(Debug, Deserialize)]
-struct WireUpdate {
-    id: String,
-    status: String,
-    body: String,
-    created_at: String,
+/// How a fetched body becomes incidents. Adding a provider is a new variant here
+/// plus the `StatusKind` that selects it; the poller never learns the difference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decoder {
+    Statuspage,
+    Instatus,
+    IncidentIo,
+    Datadog,
+    Custom(custom::Mapping),
 }
 
-#[derive(Debug, Deserialize)]
-struct WireComponent {
-    name: String,
+impl Decoder {
+    /// Sent as `Accept`. The feed needs the feed media types or a server may 406.
+    pub fn accept(&self) -> &'static str {
+        match self {
+            Decoder::IncidentIo => FEED_ACCEPT,
+            _ => "application/json",
+        }
+    }
+
+    /// Names the provider in the decode error.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Decoder::Statuspage => "Atlassian Statuspage",
+            Decoder::Instatus => "Instatus",
+            Decoder::IncidentIo => "incident.io",
+            Decoder::Datadog => "Datadog Status Pages",
+            Decoder::Custom(_) => "custom JSON",
+        }
+    }
+
+    /// Pure. `page_url` is the configured URL (Datadog builds incident links from
+    /// it), `api_url` the fetched one (incident.io's feed base), and `now` the
+    /// timestamp for an update whose body carries none.
+    pub fn decode(
+        &self,
+        body: &[u8],
+        page_url: &Url,
+        api_url: &Url,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Incident>, DecodeError> {
+        match self {
+            Decoder::Statuspage => statuspage::decode(body),
+            Decoder::Instatus => instatus::decode(body),
+            Decoder::IncidentIo => incidentio::decode(body, api_url, now),
+            Decoder::Datadog => datadog::decode(body, page_url),
+            Decoder::Custom(mapping) => custom::decode(mapping, body, now),
+        }
+    }
+}
+
+/// Where a status page is fetched from and how its body is read, settled once at
+/// resolve time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSpec {
+    pub api_url: Url,
+    pub decoder: Decoder,
+}
+
+pub fn resolve_source(
+    kind: StatusKind,
+    url: &Url,
+    mapping: Option<&CustomMapping>,
+) -> Result<SourceSpec, SourceError> {
+    let (path, decoder) = match kind {
+        StatusKind::Statuspage => (STATUSPAGE_PATH, Decoder::Statuspage),
+        StatusKind::Instatus => (INSTATUS_PATH, Decoder::Instatus),
+        StatusKind::Incidentio => (INCIDENTIO_PATH, Decoder::IncidentIo),
+        StatusKind::Datadog => (DATADOG_PATH, Decoder::Datadog),
+        StatusKind::Custom => {
+            let mapping = mapping.ok_or(SourceError::MissingMapping)?;
+            return Ok(SourceSpec {
+                api_url: url.clone(),
+                decoder: Decoder::Custom(custom::Mapping::from(mapping)),
+            });
+        }
+    };
+    Ok(SourceSpec {
+        api_url: join_base(url, path)?,
+        decoder,
+    })
+}
+
+/// `url` with `path` appended below it, whether or not `url` ends in `/`.
+pub fn join_base(url: &Url, path: &str) -> Result<Url, url::ParseError> {
+    // `Url::join` replaces the final path segment unless the base path ends in `/`,
+    // which would turn `https://x.example/status` into `https://x.example/api/...`.
+    let mut base = url.clone();
+    if !base.path().ends_with('/') {
+        let dir = format!("{}/", base.path());
+        base.set_path(&dir);
+    }
+    base.join(path)
+}
+
+/// Parses a wire timestamp; `None` drops the update it belongs to.
+fn parse_time(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,8 +193,9 @@ pub enum IncidentState {
 }
 
 impl IncidentState {
+    /// Case-insensitive: Instatus spells states in upper case, incident.io in title case.
     fn from_wire(s: &str) -> Self {
-        match s {
+        match s.to_ascii_lowercase().as_str() {
             "investigating" => IncidentState::Investigating,
             "identified" => IncidentState::Identified,
             "monitoring" => IncidentState::Monitoring,
@@ -131,13 +232,13 @@ impl IncidentState {
     }
 }
 
-/// A Statuspage incident, normalized: timestamps parsed, severities typed. The
-/// wire types never leave this module.
+/// An incident from any provider, normalized: timestamps parsed, severities typed.
+/// The wire types never leave their provider's module.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Incident {
     pub id: String,
     pub name: String,
-    /// `None` when Statuspage reported a severity chime does not know.
+    /// `None` when the provider reported a severity chime does not know, or none.
     pub impact: Option<Impact>,
     pub link: Option<String>,
     pub components: Vec<String>,
@@ -150,32 +251,6 @@ pub struct IncidentUpdate {
     pub state: IncidentState,
     pub body: String,
     pub created_at: DateTime<Utc>,
-}
-
-impl WireIncident {
-    fn normalize(self) -> Incident {
-        let updates = self
-            .incident_updates
-            .into_iter()
-            .filter_map(|u| {
-                let created_at = DateTime::parse_from_rfc3339(&u.created_at).ok()?;
-                Some(IncidentUpdate {
-                    id: u.id,
-                    state: IncidentState::from_wire(&u.status),
-                    body: u.body,
-                    created_at: created_at.with_timezone(&Utc),
-                })
-            })
-            .collect();
-        Incident {
-            id: self.id,
-            name: self.name,
-            impact: self.impact.as_deref().and_then(Impact::from_wire),
-            link: self.shortlink,
-            components: self.components.into_iter().map(|c| c.name).collect(),
-            updates,
-        }
-    }
 }
 
 /// One notification: the latest update of one incident, at the moment chime first
@@ -249,6 +324,54 @@ pub fn diff(state: &mut PageState, incidents: &[Incident], min_impact: Impact) -
     events
 }
 
+#[allow(async_fn_in_trait)]
+pub(crate) trait StatusSource {
+    async fn fetch(
+        &self,
+        page: &RunStatusPage,
+        etag: Option<&str>,
+    ) -> Result<Fetched<Vec<Incident>>, StatusError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct StatusEndpoint {
+    client: Client,
+}
+
+impl StatusEndpoint {
+    pub fn new(client: Client) -> Self {
+        StatusEndpoint { client }
+    }
+}
+
+impl StatusSource for StatusEndpoint {
+    async fn fetch(
+        &self,
+        page: &RunStatusPage,
+        etag: Option<&str>,
+    ) -> Result<Fetched<Vec<Incident>>, StatusError> {
+        let accept = page.decoder.accept();
+        let (bytes, etag) =
+            match fetch_conditional(&self.client, &page.api_url, etag, accept).await? {
+                Fetched::NotModified => return Ok(Fetched::NotModified),
+                Fetched::Modified { value, etag } => (value, etag),
+            };
+        // Returning the error drops `etag` with it: the scheduler stores an ETag only
+        // from `Ok`, so a body chime cannot read never hides behind later 304s.
+        let incidents = page
+            .decoder
+            .decode(&bytes, &page.url, &page.api_url, Utc::now())
+            .map_err(|source| StatusError::Decode {
+                kind: page.decoder.label(),
+                source,
+            })?;
+        Ok(Fetched::Modified {
+            value: incidents,
+            etag,
+        })
+    }
+}
+
 pub fn build_message(page: &RunStatusPage, event: &StatusEvent) -> DiscordMessage {
     // A resolved incident is green regardless of how severe it was: showing a red
     // bar on "this is fixed" is the one misread worth designing against.
@@ -288,48 +411,6 @@ pub fn build_message(page: &RunStatusPage, event: &StatusEvent) -> DiscordMessag
         .with_timestamp(&event.occurred_at.to_rfc3339());
 
     DiscordMessage::embed(embed).with_identity(&page.display_name, page.avatar_url.as_deref())
-}
-
-#[allow(async_fn_in_trait)]
-pub(crate) trait StatusSource {
-    async fn fetch(
-        &self,
-        url: &Url,
-        etag: Option<&str>,
-    ) -> Result<Fetched<Vec<Incident>>, StatusError>;
-}
-
-#[derive(Debug, Clone)]
-pub struct Statuspage {
-    client: Client,
-}
-
-impl Statuspage {
-    pub fn new(client: Client) -> Self {
-        Statuspage { client }
-    }
-}
-
-impl StatusSource for Statuspage {
-    async fn fetch(
-        &self,
-        url: &Url,
-        etag: Option<&str>,
-    ) -> Result<Fetched<Vec<Incident>>, StatusError> {
-        let (bytes, etag) = match fetch_json(&self.client, url, etag).await? {
-            Fetched::NotModified => return Ok(Fetched::NotModified),
-            Fetched::Modified { value, etag } => (value, etag),
-        };
-        let body: WireResponse = serde_json::from_slice(&bytes).map_err(StatusError::Decode)?;
-        Ok(Fetched::Modified {
-            value: body
-                .incidents
-                .into_iter()
-                .map(WireIncident::normalize)
-                .collect(),
-            etag,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -582,55 +663,6 @@ mod tests {
         assert!(diff(&mut state, &baseline, Impact::None).is_empty());
     }
 
-    #[test]
-    fn wire_response_decodes_real_statuspage_payload() {
-        let json = r#"{
-          "page": {"id": "abc", "name": "Claude"},
-          "incidents": [{
-            "id": "inc1",
-            "name": "Degraded performance on platform.claude.com",
-            "status": "investigating",
-            "created_at": "2026-09-01T17:05:11.462Z",
-            "impact": "minor",
-            "shortlink": "https://stspg.io/4rf459q4pjc3",
-            "future_field_statuspage_added_later": 42,
-            "components": [{"id": "c1", "name": "claude.ai"}],
-            "incident_updates": [{
-              "id": "upd1",
-              "status": "investigating",
-              "body": "We are investigating reports of degraded performance.",
-              "created_at": "2026-09-01T17:05:11.575Z",
-              "deliver_notifications": true
-            }]
-          }]
-        }"#;
-        let parsed: WireResponse = serde_json::from_str(json).unwrap();
-        let incident = parsed.incidents.into_iter().next().unwrap().normalize();
-        assert_eq!(incident.id, "inc1");
-        assert_eq!(incident.impact, Some(Impact::Minor));
-        assert_eq!(incident.components, vec!["claude.ai".to_string()]);
-        assert_eq!(incident.updates.len(), 1);
-        assert_eq!(incident.updates[0].state, IncidentState::Investigating);
-        assert_eq!(
-            incident.updates[0].created_at,
-            ts("2026-09-01T17:05:11.575Z")
-        );
-    }
-
-    #[test]
-    fn unparsable_timestamps_drop_only_that_update() {
-        let json = r#"{"incidents":[{
-            "id":"i","name":"n","impact":"minor",
-            "incident_updates":[
-              {"id":"good","status":"resolved","body":"b","created_at":"2026-09-01T10:00:00Z"},
-              {"id":"bad","status":"resolved","body":"b","created_at":"yesterday"}
-            ]}]}"#;
-        let parsed: WireResponse = serde_json::from_str(json).unwrap();
-        let incident = parsed.incidents.into_iter().next().unwrap().normalize();
-        assert_eq!(incident.updates.len(), 1);
-        assert_eq!(incident.updates[0].id, "good");
-    }
-
     fn event(state: &str, impact: Option<Impact>) -> StatusEvent {
         StatusEvent {
             incident_id: "inc1".to_string(),
@@ -707,6 +739,51 @@ mod tests {
     }
 
     #[test]
+    fn join_base_adds_the_missing_slash() {
+        let url = Url::parse("https://status.claude.com").unwrap();
+        assert_eq!(
+            join_base(&url, STATUSPAGE_PATH).unwrap().as_str(),
+            "https://status.claude.com/api/v2/incidents.json"
+        );
+    }
+
+    #[test]
+    fn join_base_keeps_an_existing_path() {
+        for base in ["https://x.example/status", "https://x.example/status/"] {
+            let url = Url::parse(base).unwrap();
+            assert_eq!(
+                join_base(&url, DATADOG_PATH).unwrap().as_str(),
+                "https://x.example/status/config.json",
+                "{base}"
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_accept_is_feed_types_only_for_incidentio() {
+        assert_eq!(Decoder::IncidentIo.accept(), FEED_ACCEPT);
+        for decoder in [Decoder::Statuspage, Decoder::Instatus, Decoder::Datadog] {
+            assert_eq!(decoder.accept(), "application/json", "{decoder:?}");
+        }
+    }
+
+    #[test]
+    fn state_names_match_case_insensitively() {
+        assert_eq!(
+            IncidentState::from_wire("RESOLVED"),
+            IncidentState::Resolved
+        );
+        assert_eq!(
+            IncidentState::from_wire("Monitoring"),
+            IncidentState::Monitoring
+        );
+        assert_eq!(
+            IncidentState::from_wire("Scheduled"),
+            IncidentState::Unknown
+        );
+    }
+
+    #[test]
     fn message_without_link_or_components_omits_them() {
         let page = crate::runtime::mk_run_status_page("claude", Duration::from_secs(300));
         let mut ev = event("monitoring", Some(Impact::Minor));
@@ -715,27 +792,5 @@ mod tests {
         let msg = build_message(&page, &ev);
         assert!(msg.embeds[0].url.is_none());
         assert_eq!(msg.embeds[0].fields.len(), 2);
-    }
-
-    #[test]
-    fn json_without_an_incidents_array_is_not_a_statuspage_feed() {
-        assert!(serde_json::from_str::<WireResponse>(r#"{"error":"not found"}"#).is_err());
-    }
-
-    #[test]
-    fn a_missing_wire_impact_does_not_fail_the_whole_feed() {
-        let json = r#"{"incidents":[{"id":"i","name":"n","incident_updates":[]}]}"#;
-        let parsed: WireResponse = serde_json::from_str(json).unwrap();
-        let incident = parsed.incidents.into_iter().next().unwrap().normalize();
-        assert!(incident.impact.is_none());
-    }
-
-    #[test]
-    fn unknown_wire_impact_becomes_none() {
-        let json = r#"{"incidents":[{"id":"i","name":"n","impact":"catastrophic","incident_updates":[]}]}"#;
-        let parsed: WireResponse = serde_json::from_str(json).unwrap();
-        let incident = parsed.incidents.into_iter().next().unwrap().normalize();
-        assert!(incident.impact.is_none());
-        assert!(incident.link.is_none());
     }
 }

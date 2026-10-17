@@ -27,11 +27,13 @@ day_of_month = [18]         # 1..=31; use e.g. [1, 15] for multiple days.
 message = "Payday is here."
 webhook = "team"
 
-# Atlassian Statuspage instances to watch. chime polls each page's public
-# `/api/v2/incidents.json` and forwards new incident updates to Discord; it never
-# receives an inbound webhook, so no ports need to be exposed.
+# Status pages to watch. chime polls each page's public incident document and
+# forwards new incident updates to Discord; it never receives an inbound webhook,
+# so no ports need to be exposed.
 [[status_pages]]
 name = "claude"                         # non-empty, unique within the file
+kind = "statuspage"                     # optional; statuspage | instatus | incidentio |
+                                        # datadog | custom (default: statuspage)
 url = "https://status.claude.com"       # https only; the page's base URL
 webhook = "team"                        # logical name — resolved via env, as above
 thread_id = "1234567890123456789"       # optional; same as for reminders
@@ -47,6 +49,34 @@ poll_interval_sec = 600                 # optional; 60..=3600 (default: 300)
 min_impact = "major"                    # optional; none | maintenance | minor |
                                         # major | critical (default: none)
 avatar_url = "https://example.com/proton.png"   # optional
+
+[[status_pages]]
+name = "instatus"
+kind = "instatus"
+url = "https://instat.us"               # chime appends /v3/summary.json
+webhook = "team"
+
+[[status_pages]]
+name = "incidentio"
+kind = "incidentio"
+url = "https://status.incident.io"      # chime appends /feed.atom; the feed has no
+webhook = "team"                        # severity, so min_impact has no effect
+
+[[status_pages]]
+name = "shopist"
+kind = "datadog"
+url = "https://shopist.statuspage.datadoghq.com"   # chime appends /config.json
+webhook = "team"
+
+[[status_pages]]
+name = "my-service"
+kind = "custom"
+url = "https://status.example.com/incidents.json" # requested as written
+webhook = "team"
+# Required with kind = "custom". `incidents` is from the document root (omit it
+# when the document is the array); the rest are relative to one incident. Only
+# `id` and `title` are required.
+mapping = { incidents = "/incidents", id = "/id", title = "/title", status = "/state", body = "/message", updated_at = "/updated_at", link = "/url", impact = "/severity" }
 
 # Release feeds to watch. The first poll records the current version; after
 # that, every change of version is posted as one embed.
