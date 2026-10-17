@@ -12,7 +12,7 @@ The `webhook` field is a logical name, not a URL. At startup chime derives an en
 | `on-call`       | `CHIME_WEBHOOK_ON_CALL`  |
 | `ops.alpha`     | `CHIME_WEBHOOK_OPS_ALPHA` |
 
-Non-alphanumeric characters are mapped to `_` and the result is uppercased. For each env key chime tries `<KEY>_FILE` first (for Docker secrets) and falls back to `<KEY>`. The value must be a valid URL after trimming.
+Non-alphanumeric characters are mapped to `_` and the result is uppercased. For each env key chime tries `<KEY>_FILE` first (for Docker secrets) and falls back to `<KEY>`. The value must be a valid `https` URL after trimming. Redirects are followed only to `https` URLs, for webhooks and polled endpoints alike.
 
 Webhook URLs never appear in `config.toml`.
 

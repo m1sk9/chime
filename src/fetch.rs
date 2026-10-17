@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use reqwest::header::{ACCEPT, ETAG, IF_NONE_MATCH};
+use reqwest::redirect::Policy;
 use reqwest::{Client, Response};
 use url::Url;
 
@@ -19,6 +20,23 @@ pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// real feeds measure 40-300KB, so this sits far above anything legitimate and
 /// only ever fires on an endpoint that has gone wrong.
 pub(crate) const MAX_BODY: usize = 8 * 1024 * 1024;
+
+/// Follow redirects only to https, so a polled endpoint or a webhook cannot move a
+/// request onto cleartext after config validation required https.
+pub(crate) fn https_redirects() -> Policy {
+    Policy::custom(|attempt| {
+        if attempt.url().scheme() != "https" {
+            attempt.error("redirect to a non-https URL")
+        } else if attempt.previous().len() >= MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
+/// reqwest's own default limit.
+const MAX_REDIRECTS: usize = 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
@@ -182,6 +200,28 @@ mod tests {
 
     fn client() -> Client {
         Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_non_https_url_is_refused() {
+        let (url, _server) = serve_once(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/elsewhere\r\nContent-Length: 0\r\n\r\n",
+        );
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(https_redirects())
+            .build()
+            .unwrap();
+
+        let err = HttpSource::new(client)
+            .fetch(&url, None, "application/json")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, FetchError::Request(e) if e.is_redirect()),
+            "{err}"
+        );
     }
 
     #[tokio::test]
