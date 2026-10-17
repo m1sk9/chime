@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -23,6 +23,12 @@ pub enum ConfigError {
     DuplicateWatchName(String),
     #[error("duplicate rss name: {0}")]
     DuplicateRssName(String),
+    #[error("webhooks `{first}` and `{second}` both read env var {key}")]
+    WebhookKeyCollision {
+        first: String,
+        second: String,
+        key: String,
+    },
     #[error("watch `{name}`: chrome has no `extended` channel on `{platform}`")]
     ChromeNoExtendedChannel {
         name: String,
@@ -875,8 +881,40 @@ impl Config {
                 return Err(ConfigError::DuplicateRssName(r.name.as_str().to_string()));
             }
         }
+        check_webhook_keys(&cfg)?;
         Ok(cfg)
     }
+}
+
+/// Two different webhook names must not resolve to one env var: names that differ
+/// only outside ASCII alphanumerics (`チーム` and `日本語` both become
+/// `CHIME_WEBHOOK____`) would silently post to the same channel.
+fn check_webhook_keys(cfg: &Config) -> Result<(), ConfigError> {
+    let refs = cfg
+        .reminders
+        .iter()
+        .map(|r| &r.webhook)
+        .chain(cfg.status_pages.iter().map(|p| &p.webhook))
+        .chain(cfg.watches.iter().map(|w| &w.webhook))
+        .chain(cfg.rss.iter().map(|r| &r.webhook));
+    let mut by_key: HashMap<String, &str> = HashMap::new();
+    for webhook in refs {
+        let key = webhook.env_key();
+        match by_key.get(&key) {
+            Some(first) if *first != webhook.as_str() => {
+                return Err(ConfigError::WebhookKeyCollision {
+                    first: first.to_string(),
+                    second: webhook.as_str().to_string(),
+                    key,
+                });
+            }
+            Some(_) => {}
+            None => {
+                by_key.insert(key, webhook.as_str());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1083,6 +1121,47 @@ webhook = "team"
             cfg.system.tick_interval_sec.as_duration(),
             Duration::from_secs(30)
         );
+    }
+
+    fn two_reminders_with_webhooks(first: &str, second: &str) -> String {
+        format!(
+            r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[reminders]]
+name = "a"
+time = "09:30"
+days = ["mon"]
+message = "a"
+webhook = "{first}"
+
+[[reminders]]
+name = "b"
+time = "10:30"
+days = ["tue"]
+message = "b"
+webhook = "{second}"
+"#
+        )
+    }
+
+    #[test]
+    fn config_rejects_webhook_names_that_share_an_env_var() {
+        for (first, second) in [("チーム", "日本語"), ("team-a", "team_a"), ("Team", "team")]
+        {
+            let err = Config::from_toml(&two_reminders_with_webhooks(first, second)).unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::WebhookKeyCollision { first: f, second: s, .. } if f == first && s == second),
+                "{first} / {second}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_allows_one_webhook_name_used_by_several_entries() {
+        assert!(Config::from_toml(&two_reminders_with_webhooks("チーム", "チーム")).is_ok());
     }
 
     #[test]
