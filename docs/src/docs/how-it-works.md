@@ -11,7 +11,7 @@ chime is a long-running process, not a one-shot cron job. The main loop:
 3. For each reminder, fire if the current hour and minute match and today matches its schedule — one of `days` (weekday), or one of `day_of_month` (day of the current month).
 4. Per-minute deduplication: each reminder fires at most once per matching minute, even if the tick interval is shorter than 60 seconds (e.g. with `tick_interval_sec = 30` you get exactly one POST per scheduled minute). The dedup record is updated **before** the HTTP request, so a send failure does not cause a retry within the same minute.
 5. Poll **at most one** status page, watch or feed — the one most overdue among those whose `poll_interval_sec` has elapsed — and forward incident updates, versions or entries not seen before.
-6. SIGINT and SIGTERM both trigger a clean shutdown.
+6. SIGINT and SIGTERM both trigger a clean shutdown, right away even in the middle of a tick: a poll or post still in flight is abandoned, and since its seen-record was already written it is not sent after a restart either.
 
 ## Polling
 

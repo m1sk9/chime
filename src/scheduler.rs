@@ -154,27 +154,39 @@ impl<N: Notifier, S: StatusSource, B: BodySource> Scheduler<N, S, B> {
         }
     }
 
-    pub async fn run(mut self) -> std::io::Result<()> {
-        let mut ticker = interval(self.cfg.interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
+    pub async fn run(self) -> std::io::Result<()> {
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
+        self.run_until(async move {
+            tokio::select! {
+                _ = sigint.recv() => info!("received SIGINT, shutting down"),
+                _ = sigterm.recv() => info!("received SIGTERM, shutting down"),
+            }
+        })
+        .await;
+        Ok(())
+    }
+
+    /// Ticks until `shutdown` completes, abandoning a tick that is still running.
+    ///
+    /// Why the tick races `shutdown` too: one tick can spend tens of seconds on
+    /// sends, longer than the grace period `docker stop` waits before SIGKILL.
+    /// Dropping it mid-send loses nothing the dedup records do not already treat
+    /// as attempted.
+    async fn run_until(mut self, shutdown: impl Future<Output = ()>) {
+        let mut ticker = interval(self.cfg.interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        tokio::pin!(shutdown);
 
         loop {
             tokio::select! {
-                _ = ticker.tick() => {
-                    let now = Utc::now().with_timezone(&self.cfg.timezone);
-                    self.tick(now).await;
-                }
-                _ = sigint.recv() => {
-                    info!("received SIGINT, shutting down");
-                    return Ok(());
-                }
-                _ = sigterm.recv() => {
-                    info!("received SIGTERM, shutting down");
-                    return Ok(());
-                }
+                _ = ticker.tick() => {}
+                _ = &mut shutdown => return,
+            }
+            let now = Utc::now().with_timezone(&self.cfg.timezone);
+            tokio::select! {
+                _ = self.tick(now) => {}
+                _ = &mut shutdown => return,
             }
         }
     }
@@ -991,6 +1003,37 @@ mod tests {
             rss,
             heartbeat_path: hb_path(tag),
         }
+    }
+
+    /// Never answers, standing in for an endpoint that hangs until its timeout.
+    struct HangingSource;
+
+    impl StatusSource for HangingSource {
+        async fn fetch(
+            &self,
+            _page: &RunStatusPage,
+            _etag: Option<&str>,
+        ) -> Result<Fetched<Vec<Incident>>, StatusError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_a_tick_that_is_still_running() {
+        let cfg = cfg_with(
+            "shutdown_mid_tick",
+            vec![],
+            vec![mk_run_status_page("hangs", Duration::from_secs(60))],
+        );
+        let scheduler = sched(cfg, CountingNotifier::new(), HangingSource);
+
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(60),
+            scheduler.run_until(tokio::time::sleep(Duration::from_secs(1))),
+        )
+        .await;
+
+        assert!(stopped.is_ok(), "the hanging poll held up shutdown");
     }
 
     #[tokio::test]
