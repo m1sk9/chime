@@ -24,15 +24,23 @@ pub(crate) const MAX_BODY: usize = 8 * 1024 * 1024;
 /// Follow redirects only to https, so a polled endpoint or a webhook cannot move a
 /// request onto cleartext after config validation required https.
 pub(crate) fn https_redirects() -> Policy {
-    Policy::custom(|attempt| {
-        if attempt.url().scheme() != "https" {
-            attempt.error("redirect to a non-https URL")
-        } else if attempt.previous().len() >= MAX_REDIRECTS {
-            attempt.error("too many redirects")
-        } else {
-            attempt.follow()
-        }
-    })
+    Policy::custom(
+        |attempt| match refuse_redirect(attempt.url(), attempt.previous().len()) {
+            Some(reason) => attempt.error(reason),
+            None => attempt.follow(),
+        },
+    )
+}
+
+/// Why a redirect to `target` after `hops` earlier requests is not followed.
+fn refuse_redirect(target: &Url, hops: usize) -> Option<&'static str> {
+    if target.scheme() != "https" {
+        Some("redirect to a non-https URL")
+    } else if hops >= MAX_REDIRECTS {
+        Some("too many redirects")
+    } else {
+        None
+    }
 }
 
 /// reqwest's own default limit.
@@ -200,6 +208,15 @@ mod tests {
 
     fn client() -> Client {
         Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[test]
+    fn redirects_are_followed_only_to_https_and_within_the_limit() {
+        let https = Url::parse("https://status.example.com/feed").unwrap();
+        let http = Url::parse("http://status.example.com/feed").unwrap();
+        assert_eq!(refuse_redirect(&https, 1), None);
+        assert!(refuse_redirect(&http, 1).is_some());
+        assert!(refuse_redirect(&https, MAX_REDIRECTS).is_some());
     }
 
     #[tokio::test]
