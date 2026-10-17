@@ -3,6 +3,7 @@ use serde_json::Value;
 
 use super::{DecodeError, Incident, IncidentState, IncidentUpdate, parse_time};
 use crate::config::{CustomMapping, Impact, JsonPointer};
+use crate::watch::{ScalarError, json_scalar};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MappingError {
@@ -96,16 +97,14 @@ fn optional(item: &Value, pointer: Option<&JsonPointer>) -> Result<Option<String
     Ok(scalar(item, pointer.as_str())?.filter(|s| !s.is_empty()))
 }
 
-/// Same rule as a `json` watch: strings and integers only, because a fractional
-/// number goes through `f64` and `1.10` would read back as `1.1`.
 fn scalar(item: &Value, pointer: &str) -> Result<Option<String>, MappingError> {
-    match item.pointer(pointer) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => Ok(Some(s.trim().to_string())),
-        Some(Value::Number(n)) if n.is_i64() || n.is_u64() => Ok(Some(n.to_string())),
-        Some(Value::Number(_)) => Err(MappingError::Fractional(pointer.to_string())),
-        Some(_) => Err(MappingError::NotScalar(pointer.to_string())),
-    }
+    let Some(value) = item.pointer(pointer).filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    json_scalar(value).map(Some).map_err(|e| match e {
+        ScalarError::NotScalar => MappingError::NotScalar(pointer.to_string()),
+        ScalarError::Fractional => MappingError::Fractional(pointer.to_string()),
+    })
 }
 
 #[cfg(test)]
