@@ -7,6 +7,7 @@ use crate::config::{ChromeChannel, ChromePlatform, ChromeRollout, FirefoxChannel
 use crate::fetch::{FetchError, Fetched, fetch_json};
 use crate::notifier::{DiscordMessage, Embed};
 use crate::runtime::RunWatch;
+use crate::status::parse_time;
 
 pub const FIREFOX_VERSIONS_URL: &str =
     "https://product-details.mozilla.org/1.0/firefox_versions.json";
@@ -207,8 +208,7 @@ fn extract_chrome(body: &[u8]) -> Result<Release, WatchError> {
     let serving_since = top
         .serving
         .and_then(|s| s.start_time)
-        .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
-        .map(|t| t.with_timezone(&Utc));
+        .and_then(|t| parse_time(&t));
     Ok(Release {
         version: version.to_string(),
         detail: ReleaseDetail::Chrome {
@@ -603,10 +603,7 @@ mod tests {
     use super::*;
     use crate::config::{HttpsUrl, JsonPointer};
     use crate::runtime::{RunWatch, mk_run_watch};
-
-    fn ts(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
-    }
+    use crate::status::ts;
 
     fn firefox(channel: FirefoxChannel) -> Extractor {
         Extractor::Firefox { channel }

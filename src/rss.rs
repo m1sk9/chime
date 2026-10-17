@@ -129,8 +129,7 @@ pub fn html_to_text(html: &str) -> String {
             continue;
         }
         let Some(close) = tail.find('>') else {
-            push_text(&mut out, &rest[open..], &mut after_space);
-            rest = "";
+            rest = &rest[open..];
             break;
         };
         push_tag(&mut out, &tail[..close], &mut after_space);
@@ -414,6 +413,7 @@ pub(crate) use test_support::*;
 #[cfg(test)]
 mod test_support {
     use super::*;
+    use crate::status::ts;
 
     /// Shaped after the Claude Code changelog as measured on 2026-09-27; the last
     /// item has no `<guid>`.
@@ -463,10 +463,6 @@ mod test_support {
   </entry>
 </feed>"#;
 
-    pub(crate) fn ts(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
-    }
-
     pub(crate) fn mk_entry(id: &str, published: Option<&str>) -> RssEntry {
         RssEntry {
             id: id.to_string(),
@@ -491,6 +487,7 @@ mod tests {
 
     use super::*;
     use crate::runtime::mk_run_rss;
+    use crate::status::ts;
 
     fn feed_url() -> Url {
         Url::parse("https://code.claude.com/docs/en/changelog/rss.xml").unwrap()

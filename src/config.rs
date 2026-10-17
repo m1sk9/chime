@@ -748,7 +748,7 @@ impl Config {
         }
         let mut seen = HashSet::new();
         for r in &cfg.reminders {
-            if !seen.insert(r.name.as_str().to_string()) {
+            if !seen.insert(r.name.as_str()) {
                 return Err(ConfigError::DuplicateName(r.name.as_str().to_string()));
             }
             r.schedule().map_err(|source| ConfigError::Schedule {
@@ -758,7 +758,7 @@ impl Config {
         }
         let mut seen_pages = HashSet::new();
         for p in &cfg.status_pages {
-            if !seen_pages.insert(p.name.as_str().to_string()) {
+            if !seen_pages.insert(p.name.as_str()) {
                 return Err(ConfigError::DuplicateStatusPageName(
                     p.name.as_str().to_string(),
                 ));
@@ -777,7 +777,7 @@ impl Config {
         }
         let mut seen_watches = HashSet::new();
         for w in &cfg.watches {
-            if !seen_watches.insert(w.name.as_str().to_string()) {
+            if !seen_watches.insert(w.name.as_str()) {
                 return Err(ConfigError::DuplicateWatchName(w.name.as_str().to_string()));
             }
             if let WatchKind::Chrome {
@@ -795,7 +795,7 @@ impl Config {
         }
         let mut seen_rss = HashSet::new();
         for r in &cfg.rss {
-            if !seen_rss.insert(r.name.as_str().to_string()) {
+            if !seen_rss.insert(r.name.as_str()) {
                 return Err(ConfigError::DuplicateRssName(r.name.as_str().to_string()));
             }
         }

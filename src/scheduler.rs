@@ -113,7 +113,7 @@ pub struct Scheduler<N: Notifier, S: StatusSource, W: WatchSource, R: RssSource>
     rss_source: R,
     last_fired: HashMap<String, DateTime<Tz>>,
     last_polled: HashMap<Job, DateTime<Tz>>,
-    page_states: HashMap<String, PageState>,
+    page_states: HashMap<usize, PageState>,
     feed_states: HashMap<usize, FeedState>,
     rss_states: HashMap<usize, RssState>,
     stats: PollStats,
@@ -183,30 +183,21 @@ impl<N: Notifier, S: StatusSource, W: WatchSource, R: RssSource> Scheduler<N, S,
 
     async fn fire_reminders(&mut self, now: DateTime<Tz>) {
         let current_minute = truncate_to_minute(&now);
-        let mut to_fire: Vec<(String, Url, String)> = Vec::new();
-        for r in &self.cfg.reminders {
-            if !r.fires_at(&now) {
-                continue;
-            }
-            let already_fired = self
-                .last_fired
-                .get(&r.name)
-                .is_some_and(|t| *t == current_minute);
-            if already_fired {
-                continue;
-            }
-            self.last_fired.insert(r.name.clone(), current_minute);
-            to_fire.push((r.name.clone(), r.webhook_url.clone(), r.message.clone()));
-        }
         let notifier = Heartbeating {
             inner: &self.notifier,
             path: &self.cfg.heartbeat_path,
         };
-        for (name, url, message) in to_fire {
-            let payload = DiscordMessage::text(&message);
-            match notifier.send(&url, &payload).await {
-                Ok(()) => info!(reminder = %name, "reminder fired"),
-                Err(e) => error!(reminder = %name, error = %e, "failed to send reminder"),
+        for r in &self.cfg.reminders {
+            if !r.fires_at(&now) {
+                continue;
+            }
+            if self.last_fired.insert(r.name.clone(), current_minute) == Some(current_minute) {
+                continue;
+            }
+            let payload = DiscordMessage::text(&r.message);
+            match notifier.send(&r.webhook_url, &payload).await {
+                Ok(()) => info!(reminder = %r.name, "reminder fired"),
+                Err(e) => error!(reminder = %r.name, error = %e, "failed to send reminder"),
             }
         }
     }
@@ -237,7 +228,7 @@ impl<N: Notifier, S: StatusSource, W: WatchSource, R: RssSource> Scheduler<N, S,
         match job {
             Job::Page(i) => {
                 let page = &self.cfg.status_pages[i];
-                let state = self.page_states.entry(page.name.clone()).or_default();
+                let state = self.page_states.entry(i).or_default();
                 let outcome = poll_page(&self.source, &notifier, page, state).await;
                 self.stats.record(outcome);
             }
@@ -409,8 +400,7 @@ async fn poll_page<N: Notifier, S: StatusSource>(
     page: &RunStatusPage,
     state: &mut PageState,
 ) -> PollOutcome {
-    let etag = state.etag.clone();
-    let fetched = match source.fetch(page, etag.as_deref()).await {
+    let fetched = match source.fetch(page, state.etag.as_deref()).await {
         Ok(f) => f,
         Err(e) => {
             // A status page being unreachable is not chime's outage to report:
@@ -1169,12 +1159,12 @@ mod tests {
         let mut scheduler = sched(cfg, CountingNotifier::new(), FakeSource::undecodable());
         let mut state = PageState::default();
         state.etag = Some("W/\"last-good\"".to_string());
-        scheduler.page_states.insert("claude".to_string(), state);
+        scheduler.page_states.insert(0, state);
 
         scheduler.tick(at(9, 0, 0)).await;
 
         assert_eq!(
-            scheduler.page_states["claude"].etag.as_deref(),
+            scheduler.page_states[&0].etag.as_deref(),
             Some("W/\"last-good\"")
         );
         let stats = scheduler.take_due_summary(at(10, 0, 0)).unwrap().pages;

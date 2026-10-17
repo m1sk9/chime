@@ -176,7 +176,7 @@ pub fn join_base(url: &Url, path: &str) -> Result<Url, url::ParseError> {
 }
 
 /// Parses a wire timestamp; `None` drops the update it belongs to.
-fn parse_time(s: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_time(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|t| t.with_timezone(&Utc))
@@ -203,6 +203,10 @@ impl IncidentState {
             "postmortem" => IncidentState::Postmortem,
             _ => IncidentState::Unknown,
         }
+    }
+
+    fn from_wire_opt(s: Option<&str>) -> Self {
+        s.map_or(IncidentState::Unknown, IncidentState::from_wire)
     }
 
     pub fn is_resolved(self) -> bool {
@@ -386,10 +390,9 @@ pub fn build_message(page: &RunStatusPage, event: &StatusEvent) -> DiscordMessag
         }
     };
 
-    let impact_label = match event.impact {
-        Some(i) => i.to_string(),
-        None => "Unknown".to_string(),
-    };
+    let impact_label = event
+        .impact
+        .map_or_else(|| "Unknown".to_string(), |i| i.to_string());
 
     let mut embed = Embed::new(&event.title, color)
         .with_description(&event.body)

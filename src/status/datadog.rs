@@ -76,10 +76,7 @@ impl WireIncident {
                 Some(IncidentUpdate {
                     created_at: parse_time(t.created_at.as_deref()?)?,
                     id: t.id,
-                    state: t
-                        .status
-                        .as_deref()
-                        .map_or(IncidentState::Unknown, IncidentState::from_wire),
+                    state: IncidentState::from_wire_opt(t.status.as_deref()),
                     body: t.description.unwrap_or_default(),
                 })
             })

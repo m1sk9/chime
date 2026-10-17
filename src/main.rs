@@ -86,13 +86,11 @@ fn run_health() -> Result<()> {
     let cfg = load_config()?;
     let interval = cfg.system.tick_interval_sec.as_duration();
     let path = heartbeat_path();
-    match check_liveness(&path, interval, SystemTime::now()) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
+    if let Err(e) = check_liveness(&path, interval, SystemTime::now()) {
+        eprintln!("{e}");
+        std::process::exit(1);
     }
+    Ok(())
 }
 
 async fn run_daemon() -> Result<()> {
