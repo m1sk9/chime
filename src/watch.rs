@@ -218,19 +218,36 @@ fn extract_chrome(body: &[u8]) -> Result<Release, WatchError> {
     })
 }
 
-fn extract_pointer(pointer: &str, body: &[u8]) -> Result<Release, WatchError> {
-    let doc: serde_json::Value = serde_json::from_slice(body).map_err(WatchError::Decode)?;
-    let version = match doc.pointer(pointer) {
-        None => return Err(ExtractError::Missing(pointer.to_string()).into()),
-        Some(serde_json::Value::String(s)) => s.trim().to_string(),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScalarError {
+    NotScalar,
+    Fractional,
+}
+
+/// The text of a JSON value addressed by a user's pointer: a trimmed string, or an
+/// integer. Shared with `status::custom` so both read versions and fields alike.
+/// Why it takes the value and not the pointer: a `json` watch reports `null` as
+/// not a scalar, while a custom status mapping reads it as absent.
+pub(crate) fn json_scalar(value: &serde_json::Value) -> Result<String, ScalarError> {
+    match value {
+        serde_json::Value::String(s) => Ok(s.trim().to_string()),
         // Why integers only: a fractional number is parsed as `f64`, so `1.10` would
         // read back as `1.1` and then equal a later, genuinely different `1.1`.
-        Some(serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => n.to_string(),
-        Some(serde_json::Value::Number(_)) => {
-            return Err(ExtractError::Fractional(pointer.to_string()).into());
-        }
-        Some(_) => return Err(ExtractError::NotScalar(pointer.to_string()).into()),
-    };
+        serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => Ok(n.to_string()),
+        serde_json::Value::Number(_) => Err(ScalarError::Fractional),
+        _ => Err(ScalarError::NotScalar),
+    }
+}
+
+fn extract_pointer(pointer: &str, body: &[u8]) -> Result<Release, WatchError> {
+    let doc: serde_json::Value = serde_json::from_slice(body).map_err(WatchError::Decode)?;
+    let value = doc
+        .pointer(pointer)
+        .ok_or_else(|| ExtractError::Missing(pointer.to_string()))?;
+    let version = json_scalar(value).map_err(|e| match e {
+        ScalarError::NotScalar => ExtractError::NotScalar(pointer.to_string()),
+        ScalarError::Fractional => ExtractError::Fractional(pointer.to_string()),
+    })?;
     if version.is_empty() {
         return Err(ExtractError::Empty(pointer.to_string()).into());
     }
