@@ -183,6 +183,10 @@ pub struct RunConfig {
 }
 
 impl RunConfig {
+    pub fn has_pollers(&self) -> bool {
+        !(self.status_pages.is_empty() && self.feeds.is_empty() && self.rss.is_empty())
+    }
+
     pub fn watch_count(&self) -> usize {
         self.feeds.iter().map(|f| f.watches.len()).sum()
     }

@@ -31,18 +31,28 @@ const STATUS_SUMMARY_INTERVAL: Duration = Duration::from_secs(3600);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PollOutcome {
     NotModified,
-    Updated {
-        forwarded: u64,
-        send_failed: u64,
-    },
+    Updated(Sent),
     Failed,
     /// A shared feed was fetched, but at least one watch on it could not read its
     /// version. Counted as `failed`; the watches that could read were still diffed
     /// and sent, and their posts are counted as usual.
-    PartlyUnreadable {
-        forwarded: u64,
-        send_failed: u64,
-    },
+    PartlyUnreadable(Sent),
+}
+
+/// The Discord posts one poll made.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Sent {
+    forwarded: u64,
+    send_failed: u64,
+}
+
+impl Sent {
+    fn record<E>(&mut self, result: &Result<(), E>) {
+        match result {
+            Ok(()) => self.forwarded += 1,
+            Err(_) => self.send_failed += 1,
+        }
+    }
 }
 
 /// Counters for one summary window. Reset when the window closes.
@@ -59,26 +69,26 @@ struct PollStats {
 impl PollStats {
     fn record(&mut self, outcome: PollOutcome) {
         self.polls += 1;
-        match outcome {
-            PollOutcome::NotModified => self.not_modified += 1,
-            PollOutcome::Updated {
-                forwarded,
-                send_failed,
-            } => {
-                self.updated += 1;
-                self.forwarded += forwarded;
-                self.send_failed += send_failed;
+        let sent = match outcome {
+            PollOutcome::NotModified => {
+                self.not_modified += 1;
+                return;
             }
-            PollOutcome::Failed => self.failed += 1,
-            PollOutcome::PartlyUnreadable {
-                forwarded,
-                send_failed,
-            } => {
+            PollOutcome::Failed => {
                 self.failed += 1;
-                self.forwarded += forwarded;
-                self.send_failed += send_failed;
+                return;
             }
-        }
+            PollOutcome::Updated(sent) => {
+                self.updated += 1;
+                sent
+            }
+            PollOutcome::PartlyUnreadable(sent) => {
+                self.failed += 1;
+                sent
+            }
+        };
+        self.forwarded += sent.forwarded;
+        self.send_failed += sent.send_failed;
     }
 }
 
@@ -306,8 +316,7 @@ impl<N: Notifier, S: StatusSource, W: WatchSource, R: RssSource> Scheduler<N, S,
     fn take_due_summary(&mut self, now: DateTime<Tz>) -> Option<Summary> {
         // A reminder-only deployment has no poller to prove alive; staying silent
         // keeps this out of logs that would never contain a poll line anyway.
-        if self.cfg.status_pages.is_empty() && self.cfg.feeds.is_empty() && self.cfg.rss.is_empty()
-        {
+        if !self.cfg.has_pollers() {
             return None;
         }
         let Some(start) = self.summary_window_start else {
@@ -419,35 +428,27 @@ async fn poll_page<N: Notifier, S: StatusSource>(
 
     state.etag = new_etag;
     let events = status::diff(state, &incidents, page.min_impact);
-    let mut forwarded = 0;
-    let mut send_failed = 0;
+    let mut sent = Sent::default();
     for event in events {
         let message = status::build_message(page, &event);
-        match notifier.send(&page.webhook_url, &message).await {
-            Ok(()) => {
-                forwarded += 1;
-                info!(
-                    status_page = %page.name,
-                    incident = %event.incident_id,
-                    state = event.state.label(),
-                    "status update forwarded"
-                )
-            }
-            Err(e) => {
-                send_failed += 1;
-                error!(
-                    status_page = %page.name,
-                    incident = %event.incident_id,
-                    error = %e,
-                    "failed to forward status update"
-                )
-            }
+        let result = notifier.send(&page.webhook_url, &message).await;
+        sent.record(&result);
+        match result {
+            Ok(()) => info!(
+                status_page = %page.name,
+                incident = %event.incident_id,
+                state = event.state.label(),
+                "status update forwarded"
+            ),
+            Err(e) => error!(
+                status_page = %page.name,
+                incident = %event.incident_id,
+                error = %e,
+                "failed to forward status update"
+            ),
         }
     }
-    PollOutcome::Updated {
-        forwarded,
-        send_failed,
-    }
+    PollOutcome::Updated(sent)
 }
 
 async fn poll_feed<N: Notifier, W: WatchSource>(
@@ -474,8 +475,7 @@ async fn poll_feed<N: Notifier, W: WatchSource>(
 
     let results = watch::read_feed(state, &feed.watches, &body, etag);
     let mut unreadable = false;
-    let mut forwarded = 0;
-    let mut send_failed = 0;
+    let mut sent = Sent::default();
     for (w, result) in feed.watches.iter().zip(results) {
         let event = match result {
             Err(e) => {
@@ -494,37 +494,27 @@ async fn poll_feed<N: Notifier, W: WatchSource>(
             Ok(Diff::Changed(event)) => event,
         };
         let message = watch::build_message(w, &event, detected_at);
-        match notifier.send(&w.webhook_url, &message).await {
-            Ok(()) => {
-                forwarded += 1;
-                info!(
-                    watch = %w.name,
-                    version = %event.release.version,
-                    previous = %event.previous,
-                    "release forwarded"
-                );
-            }
-            Err(e) => {
-                send_failed += 1;
-                error!(
-                    watch = %w.name,
-                    version = %event.release.version,
-                    error = %e,
-                    "failed to forward release"
-                );
-            }
+        let result = notifier.send(&w.webhook_url, &message).await;
+        sent.record(&result);
+        match result {
+            Ok(()) => info!(
+                watch = %w.name,
+                version = %event.release.version,
+                previous = %event.previous,
+                "release forwarded"
+            ),
+            Err(e) => error!(
+                watch = %w.name,
+                version = %event.release.version,
+                error = %e,
+                "failed to forward release"
+            ),
         }
     }
     if unreadable {
-        PollOutcome::PartlyUnreadable {
-            forwarded,
-            send_failed,
-        }
+        PollOutcome::PartlyUnreadable(sent)
     } else {
-        PollOutcome::Updated {
-            forwarded,
-            send_failed,
-        }
+        PollOutcome::Updated(sent)
     }
 }
 
@@ -563,30 +553,22 @@ async fn poll_rss<N: Notifier, R: RssSource>(
     if first_poll {
         info!(rss = %feed.name, entries = entry_count, "rss baseline recorded");
     }
-    let mut forwarded = 0;
-    let mut send_failed = 0;
+    let mut sent = Sent::default();
     for entry in events.into_iter().map(rss::FeedEntry::render) {
         let message = rss::build_message(feed, &entry, detected_at);
-        match notifier.send(&feed.webhook_url, &message).await {
-            Ok(()) => {
-                forwarded += 1;
-                info!(rss = %feed.name, entry = %entry.id, "rss entry forwarded");
-            }
-            Err(e) => {
-                send_failed += 1;
-                error!(
-                    rss = %feed.name,
-                    entry = %entry.id,
-                    error = %e,
-                    "failed to forward rss entry"
-                );
-            }
+        let result = notifier.send(&feed.webhook_url, &message).await;
+        sent.record(&result);
+        match result {
+            Ok(()) => info!(rss = %feed.name, entry = %entry.id, "rss entry forwarded"),
+            Err(e) => error!(
+                rss = %feed.name,
+                entry = %entry.id,
+                error = %e,
+                "failed to forward rss entry"
+            ),
         }
     }
-    PollOutcome::Updated {
-        forwarded,
-        send_failed,
-    }
+    PollOutcome::Updated(sent)
 }
 
 fn is_due(last: Option<&DateTime<Tz>>, poll_interval: Duration, now: DateTime<Tz>) -> bool {
