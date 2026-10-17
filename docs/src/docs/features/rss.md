@@ -8,7 +8,7 @@ layout: doc
 
 ## Notification semantics
 
-- **The first poll after startup is silent** — it records the entries currently in the feed as a baseline. A restart re-baselines.
+- **The first poll after startup is silent** — it records the entries currently in the feed as a baseline. A restart re-baselines. A poll that finds no entries does not count: the baseline is taken from the first poll that has some, so the first entry of a feed that starts out empty is not posted.
 - An entry is posted when its **id** has not been seen: `<guid>` in RSS, `<id>` in Atom, `id` in JSON Feed, or, when the feed gives none, a hash of the entry's link and title (the feed URL and title when it has no link). Editing an entry that was already seen does not post it again — unless it has no id of its own: then a new title or link is a new id, and the entry is posted again. Two such entries with the same link and title are one entry.
 - The id is recorded **before** the Discord request, so a failed send is not retried.
 - An entry that drops out of the feed is forgotten; if it comes back, it is reported as new. A feed that answers with no entries at all keeps the baseline.

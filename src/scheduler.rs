@@ -550,7 +550,7 @@ async fn poll_rss<N: Notifier, B: BodySource>(
     let first_poll = !state.is_initialized();
     let entry_count = entries.len();
     let events = rss::diff(state, entries);
-    if first_poll {
+    if first_poll && state.is_initialized() {
         info!(rss = %feed.name, entries = entry_count, "rss baseline recorded");
     }
     let mut sent = Sent::default();
