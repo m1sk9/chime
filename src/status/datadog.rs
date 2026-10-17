@@ -98,6 +98,9 @@ fn incident_link(page_url: &Url, id: &str) -> Option<String> {
     let mut url = page_url.clone();
     url.set_query(None);
     url.set_fragment(None);
+    // Cannot fail: `HttpsUrl` guarantees a host, the only precondition.
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
     url.path_segments_mut().ok()?.pop_if_empty().push(id);
     Some(url.into())
 }
@@ -285,6 +288,15 @@ mod tests {
         assert_eq!(
             incident_link(&url, "https://evil.example").as_deref(),
             Some("https://demo-status-page.statuspage.datadoghq.com/https:%2F%2Fevil.example")
+        );
+    }
+
+    #[test]
+    fn link_does_not_carry_the_page_url_credentials() {
+        let url = Url::parse("https://bot:secret@x.example/status").unwrap();
+        assert_eq!(
+            incident_link(&url, "abc").as_deref(),
+            Some("https://x.example/status/abc")
         );
     }
 

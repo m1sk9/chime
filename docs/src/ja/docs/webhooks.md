@@ -12,7 +12,7 @@ layout: doc
 | `on-call`       | `CHIME_WEBHOOK_ON_CALL`  |
 | `ops.alpha`     | `CHIME_WEBHOOK_OPS_ALPHA` |
 
-英数字以外の文字は `_` に置き換えられ，結果は大文字になります．異なる 2 つの名前が同じキーになる場合は，起動時にエラーになります．各 env キーについて，chime はまず `<KEY>_FILE` (Docker secrets 用) を試し，なければ `<KEY>` にフォールバックします．値は前後の空白を取り除いた後，有効な `https` の URL である必要があります．リダイレクトは，webhook でもポーリング先でも，`https` の URL へのものだけを追従します．
+英数字以外の文字は `_` に置き換えられ，結果は大文字になります．異なる 2 つの名前が同じキーになる場合は，起動時にエラーになります．各 env キーについて，chime はまず `<KEY>_FILE` (Docker secrets 用) を試し，なければ `<KEY>` にフォールバックします．値は前後の空白を取り除いた後，有効な `https` の URL である必要があります．webhook のリダイレクトは `https` の URL へのものだけを追従します．ポーリング先のリダイレクトは一切追従しません ([動作の仕組み](./how-it-works#ポーリング) を参照)．
 
 webhook URL が `config.toml` に現れることはありません．
 

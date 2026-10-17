@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use reqwest::header::{ACCEPT, ETAG, IF_NONE_MATCH};
 use reqwest::redirect::Policy;
-use reqwest::{Client, Response};
+use reqwest::{Client, ClientBuilder, Response};
 use url::Url;
 
 use crate::notifier::read_error_body;
@@ -21,8 +21,9 @@ pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// only ever fires on an endpoint that has gone wrong.
 pub(crate) const MAX_BODY: usize = 8 * 1024 * 1024;
 
-/// Follow redirects only to https, so a polled endpoint or a webhook cannot move a
-/// request onto cleartext after config validation required https.
+/// Follow redirects only to https, so a webhook cannot be moved onto cleartext
+/// after `resolve_webhook` required https. Polling does not follow redirects at
+/// all (`poll_client_builder`).
 pub(crate) fn https_redirects() -> Policy {
     Policy::custom(
         |attempt| match refuse_redirect(attempt.url(), attempt.previous().len()) {
@@ -45,6 +46,18 @@ fn refuse_redirect(target: &Url, hops: usize) -> Option<&'static str> {
 
 /// reqwest's own default limit.
 const MAX_REDIRECTS: usize = 10;
+
+/// Builder for the client every poll goes through. Redirects are not followed:
+/// a 3xx surfaces as `FetchError::Status` like any other non-2xx.
+///
+/// Why not follow redirects with a filter: the `Location` comes from the polled
+/// server, and checking where it leads (scheme, IP literal, resolved address)
+/// still leaves gaps — behind an `HTTPS_PROXY` the proxy resolves the name, and
+/// every other configured host would stay reachable on any port. The configured
+/// URL has to be the final one instead.
+pub(crate) fn poll_client_builder() -> ClientBuilder {
+    Client::builder().redirect(Policy::none())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
@@ -116,7 +129,9 @@ pub(crate) async fn fetch_conditional(
     if let Some(tag) = etag {
         request = request.header(IF_NONE_MATCH, tag);
     }
-    let mut resp = request.send().await?;
+    // Why not keep the URL on the error: a `json` watch or `custom` page can only
+    // authenticate through the query string, and the error is logged verbatim.
+    let mut resp = request.send().await.map_err(reqwest::Error::without_url)?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_MODIFIED {
         return Ok(Fetched::NotModified);
@@ -154,7 +169,7 @@ fn push_capped(buf: &mut Vec<u8>, chunk: &[u8], limit: usize) -> Result<(), Fetc
 /// Buffer the response body, failing once it passes `limit`.
 async fn read_capped(resp: &mut Response, limit: usize) -> Result<Vec<u8>, FetchError> {
     let mut buf = Vec::new();
-    while let Some(chunk) = resp.chunk().await? {
+    while let Some(chunk) = resp.chunk().await.map_err(reqwest::Error::without_url)? {
         push_capped(&mut buf, &chunk, limit)?;
     }
     Ok(buf)
@@ -207,7 +222,48 @@ mod tests {
     }
 
     fn client() -> Client {
-        Client::builder().no_proxy().build().unwrap()
+        poll_client_builder().no_proxy().build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_redirect_from_the_polled_server_is_not_followed() {
+        let (url, server) = serve_once(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/internal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+
+        let err = HttpSource::new(client())
+            .fetch(&url, None, "application/json")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, FetchError::Status { status: 302, .. }),
+            "{err:?}"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_request_error_does_not_reveal_the_url() {
+        // Bind then drop, so the port refuses connections.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/feed?key=secret")).unwrap();
+
+        let err = HttpSource::new(client())
+            .fetch(&url, None, "application/json")
+            .await
+            .unwrap_err();
+
+        let FetchError::Request(ref inner) = err else {
+            panic!("expected a request error, got {err:?}");
+        };
+        assert!(inner.url().is_none());
+        assert!(!err.to_string().contains("secret"), "{err}");
+        assert!(!format!("{err:?}").contains("secret"), "{err:?}");
     }
 
     #[test]

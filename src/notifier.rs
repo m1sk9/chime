@@ -29,9 +29,17 @@ const MAX_FOOTER_TEXT: usize = 2048;
 #[derive(Debug, thiserror::Error)]
 pub enum NotifyError {
     #[error(transparent)]
-    Request(#[from] reqwest::Error),
+    Request(reqwest::Error),
     #[error("webhook returned HTTP {status}: {body}")]
     Status { status: u16, body: String },
+}
+
+// Not `#[from]`: reqwest attaches the request URL to transport errors and prints
+// it, and the request URL here is the webhook, whose path is its token.
+impl From<reqwest::Error> for NotifyError {
+    fn from(e: reqwest::Error) -> Self {
+        NotifyError::Request(e.without_url())
+    }
 }
 
 /// A Discord webhook execution payload. Every constructor enforces Discord's
@@ -505,6 +513,32 @@ mod tests {
         discord.send(&second, &msg).await.unwrap();
 
         assert!(start.elapsed() < Duration::from_millis(400));
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_does_not_reveal_the_webhook_token() {
+        // Never accepted, so the request is left waiting until the client times out.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let webhook = Url::parse(&format!(
+            "http://{}/api/webhooks/1234/secret-token",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+
+        let err = Discord::new(client)
+            .send(&webhook, &DiscordMessage::text("hello"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, NotifyError::Request(_)), "{err}");
+        assert!(!err.to_string().contains("secret-token"), "{err}");
+        assert!(!format!("{err:?}").contains("secret-token"), "{err:?}");
+        drop(listener);
     }
 
     #[test]
