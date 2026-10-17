@@ -1,0 +1,66 @@
+---
+layout: doc
+---
+
+# 動作の仕組み
+
+chime は 1 回きりの cron ジョブではなく，常駐プロセスです．メインループは次のとおりです．
+
+1. `tick_interval_sec` ごとに tick します (`MissedTickBehavior::Skip` — 遅延した tick はまとめて 1 つにされ，再生されません)．
+2. 設定されたタイムゾーンでの現在のローカル時刻を計算します．
+3. 各リマインダーについて，現在の時と分が一致し，かつ今日がそのスケジュール (`days` (曜日) のいずれか，または `day_of_month` (当月の日付) のいずれか) に合致する場合に発火します．
+4. 分単位の重複排除: 各リマインダーは，tick 間隔が 60 秒より短くても，一致した分ごとに最大 1 回だけ発火します (例えば `tick_interval_sec = 30` でも，スケジュールされた分ごとに POST はちょうど 1 回です)．重複排除の記録は HTTP リクエストの**前**に更新されるため，送信に失敗しても同じ分内で再試行されることはありません．
+5. ステータスページ，watch，フィードのうち**最大 1 つ**をポーリングします．`poll_interval_sec` が経過しているもののうち最も遅延しているものが対象で，未確認のインシデント更新，バージョン，エントリを転送します．
+6. SIGINT と SIGTERM はどちらも clean shutdown を引き起こします．
+
+## ポーリング
+
+ステータスページのポーリングはリマインダーと同じルールに従います．
+
+- **起動後の最初のポーリングは通知しません．** どのドキュメントにも既知のインシデントが含まれています (Statuspage の `incidents.json` は直近 50 件，Datadog の `config.json` は履歴全体，Instatus はアクティブなものと最近解決されたもの)．そのため chime はそれらをベースラインとして記録し，何も報告しません．*その後*に変化したものだけが転送されます．したがって再起動はベースラインを取り直すだけで，履歴がチャンネルに再送されることはありません．これは「見逃した分は見逃した通知」という考え方と同じ趣旨です．
+- 既読の記録は Discord へのリクエストの**前**に書き込まれるため，送信に失敗しても次のポーリングで再試行されません．
+- ステータスページに到達できない場合は `warn` でログに残り，そのページ自身の間隔で再試行されます．chime が自身のポーリングの失敗について投稿することはありません．
+- ポーリングは tick 上で行われるため，更新はページが公開してから最大 `poll_interval_sec` 後に転送されます．embed のタイムスタンプには，ドキュメントが公開時刻を持っている場合は実際の公開時刻が表示されます．
+- **tick ごとにポーリングされるページ，watch，フィードは 1 つ**です．そのため設定数にかかわらず 1 tick のコストはリクエスト 1 回で，到達できないエンドポイントが多数あっても，`chime health` が heartbeat を古いと判定するほどループが止まることはありません．各エントリはその予算の `tick_interval_sec / poll_interval_sec` を占めます．`tick_interval_sec = 60` なら，300 のページは 5 分の 1，900 のフィードは 15 分の 1，3600 の watch は 60 分の 1 です．すべてのページ，watch，フィードの占有率の合計が 1 以下である限り，それぞれは本来の間隔を保ちます．それを超えると，単にポーリング頻度が下がります．URL を共有する watch は，共有する間隔で 1 回として数えます．
+- リクエストは条件付き (`If-None-Match`) かつ圧縮 (`Accept-Encoding: gzip`) されるため，更新のないページは通常，本文のない 304 で済みます．**`ETag` を返さない**インスタンス (Instatus と incident.io のページ，および他のインフラで提供される一部の Statuspage 互換フィード) は検証できないため，ポーリングのたびにフィード全体をダウンロードします．Chrome の watch と大半の RSS フィードも同様です．gzip によりそれは数 KB に収まるので，他に必要な対策はありません．
+
+## ポーラーの生存確認 {#knowing-the-poller-is-alive}
+
+デーモンは 1 時間に 1 回，`info` で `status poll summary` を 1 行ログに出力します．
+
+```json
+{"timestamp":"2026-06-05T09:00:00.000000Z","level":"INFO","fields":{"message":"status poll summary","window_sec":3600,"pages":5,"polls":60,"not_modified":55,"updated":4,"failed":1,"forwarded":3,"send_failed":1},"target":"chime::scheduler"}
+```
+
+これがないと，正常に動いているポーラーは何も出力しません．更新のないページは 304 を返し，その経路は `debug` でしかログに残らず，静かなステータスページは何日もインシデントなしで過ぎることがあります．このサマリーにより，コンテナのネットワークカウンタを読まなくても，「何も起きていない」ことと「ポーラーが死んでいる」ことを区別できます．
+
+- `not_modified` と `updated` は HTTP の結果 (304 と 200) であり，動いたインシデントの数ではありません．そのため `ETag` を返さないインスタンスは，フィードが変わっていなくてもすべてのポーリングを `updated` と報告します．
+- `failed` はウィンドウ内の fetch 失敗の数です (それぞれ発生時に `warn` でもログに残ります)．
+- `forwarded` は成功した Discord への投稿の数，`send_failed` は Discord に拒否された投稿の数です (それぞれ `error` でもログに残ります)．`send_failed` が 0 でなければ，それは更新のないページではなく，webhook が投稿を受け付けなくなったことを意味します．
+
+ポーリングごとの詳細を見るには，`log_level = "debug"` を設定してください．
+
+watch には同じウィンドウで独自の `watch poll summary` 行があり，`pages` が `watches` (設定された数) になる点を除いてフィールドは同じです．
+
+```json
+{"timestamp":"2026-06-05T09:00:00.000000Z","level":"INFO","fields":{"message":"watch poll summary","window_sec":3600,"watches":2,"polls":2,"not_modified":1,"updated":1,"failed":0,"forwarded":0,"send_failed":0},"target":"chime::scheduler"}
+```
+
+ステータスページと同様に，`polls`，`not_modified`，`updated` はリクエストを数えます (URL を共有する watch は 1 リクエストです)．また `updated` は 200 レスポンスの数であり，変化したバージョンの数ではないため，Chrome の watch はすべてのポーリングを `updated` と報告します．`failed` には，本文は取得できたものの，その上の watch の少なくとも 1 つが読み取れなかった場合も含まれます．読み取れた watch の投稿は，引き続き `forwarded` / `send_failed` に数えられます．
+
+RSS フィードには 3 つ目の行 `rss poll summary` があり，`pages` の代わりに `feeds` (設定された数) を持ちます．
+
+```json
+{"timestamp":"2026-06-05T09:00:00.000000Z","level":"INFO","fields":{"message":"rss poll summary","window_sec":3600,"feeds":1,"polls":4,"not_modified":0,"updated":4,"failed":0,"forwarded":1,"send_failed":0},"target":"chime::scheduler"}
+```
+
+`ETag` を返さないフィードはすべてのポーリングを `updated` と報告し，`failed` には，取得できたもののフィードではない本文も含まれます．各行は，そのリストが空の場合は出力されません．
+
+::: warning Docker を使わない場合の注意
+
+- chime は自分自身を daemonize せず，PID ファイルを書かず，fork もしません．クラッシュや終了時に再起動するスーパーバイザ (`systemd`，`launchd`，`runit` など) の下で実行してください．
+- プロセスはシングルスレッド (`tokio` の current-thread ランタイム) です．動かしっぱなしにしても負荷は小さいです．
+- 見逃した分は見逃した通知であり，catch-up はありません．09:30 にホストがスリープしていた場合，復帰しても 09:30 のリマインダーは発火しません．これは cron 的な考え方と一致します．
+- ログは stdout への行区切り JSON です．スーパーバイザが提供する手段 (`journalctl -u chime`，コンテナのログドライバなど) で取得してください．
+
+:::
