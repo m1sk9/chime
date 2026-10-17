@@ -27,6 +27,70 @@ pub enum RssError {
     Decode(#[source] ParseFeedError),
 }
 
+/// An entry as parsed, its title and body not yet rendered.
+///
+/// Why not render in `parse_feed`: every 200 carries the whole feed, and all but
+/// the new entries are dropped by `diff`, so rendering them all would be work
+/// thrown away on almost every poll.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeedEntry {
+    pub id: String,
+    pub link: Option<String>,
+    pub published: Option<DateTime<Utc>>,
+    title: Option<Markup>,
+    /// Summary first, then content: the first that renders non-empty is the body.
+    bodies: Vec<Markup>,
+}
+
+impl FeedEntry {
+    pub fn render(self) -> RssEntry {
+        RssEntry {
+            title: self.rendered_title(),
+            body: self.rendered_body(),
+            id: self.id,
+            link: self.link,
+            published: self.published,
+        }
+    }
+
+    fn rendered_title(&self) -> Option<String> {
+        self.title
+            .as_ref()
+            .map(Markup::render)
+            .filter(|t| !t.is_empty())
+    }
+
+    fn rendered_body(&self) -> Option<String> {
+        self.bodies
+            .iter()
+            .map(Markup::render)
+            .find(|b| !b.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Markup {
+    text: String,
+    plain: bool,
+}
+
+impl Markup {
+    fn new(text: String, media: &str, trust_plain: bool) -> Self {
+        Markup {
+            text,
+            plain: trust_plain && media == "text/plain",
+        }
+    }
+
+    fn render(&self) -> String {
+        if self.plain {
+            tidy_lines(&self.text)
+        } else {
+            html_to_text(&self.text)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RssEntry {
     /// The dedup key: the feed's own id, or feed-rs's hash of link + title.
@@ -41,7 +105,7 @@ pub struct RssEntry {
 
 /// Pure. `url` is the base for relative links and for the id of an entry that has
 /// a title but no link (feed-rs would otherwise mint a random UUID per parse).
-pub fn parse_feed(body: &[u8], url: &Url) -> Result<Vec<RssEntry>, RssError> {
+pub fn parse_feed(body: &[u8], url: &Url) -> Result<Vec<FeedEntry>, RssError> {
     let feed = feed_rs::parser::Builder::new()
         .base_uri(Some(url.as_str()))
         .id_generator(stable_id)
@@ -68,14 +132,13 @@ fn stable_id(links: &[Link], title: &Option<Text>, uri: Option<&str>) -> String 
     feed_rs::parser::generate_id(links, title, uri)
 }
 
-fn normalize(e: Entry, typed: bool) -> Option<RssEntry> {
+fn normalize(e: Entry, typed: bool) -> Option<FeedEntry> {
     if e.id.is_empty() {
         return None;
     }
     let title = e
         .title
-        .map(|t| render(&t.content, t.content_type.as_str(), true))
-        .filter(|t| !t.is_empty());
+        .map(|t| Markup::new(t.content, t.content_type.as_str(), true));
     // Why not the first link that has no `rel`: RSS `<comments>` has none either,
     // and may come before `<link>`.
     let link = e
@@ -84,32 +147,27 @@ fn normalize(e: Entry, typed: bool) -> Option<RssEntry> {
         .find(|l| l.target.is_none() && l.rel.as_deref().is_none_or(|r| r == "alternate"))
         .or(e.links.first())
         .map(|l| l.href.clone());
-    let body = [
+    let bodies = [
         e.summary.map(|t| (t.content, t.content_type)),
         e.content.and_then(|c| Some((c.body?, c.content_type))),
     ]
     .into_iter()
     .flatten()
-    .map(|(text, media)| render(&text, media.as_str(), typed))
-    .find(|s| !s.is_empty());
-    if title.is_none() && link.is_none() && body.is_none() {
+    .map(|(text, media)| Markup::new(text, media.as_str(), typed))
+    .collect();
+    let entry = FeedEntry {
+        id: e.id,
+        link,
+        published: e.published.or(e.updated),
+        title,
+        bodies,
+    };
+    // Rendered here only without a link: whether such an entry has anything to
+    // show depends on the rendered text, and entries without a link are rare.
+    if entry.link.is_none() && entry.rendered_title().is_none() && entry.rendered_body().is_none() {
         return None;
     }
-    Some(RssEntry {
-        id: e.id,
-        title,
-        link,
-        body,
-        published: e.published.or(e.updated),
-    })
-}
-
-fn render(text: &str, media: &str, trust_plain: bool) -> String {
-    if trust_plain && media == "text/plain" {
-        tidy_lines(text)
-    } else {
-        html_to_text(text)
-    }
+    Some(entry)
 }
 
 /// Renders an entry body to the plain text an embed description can show.
@@ -328,7 +386,7 @@ pub fn read_feed(
     body: &[u8],
     url: &Url,
     etag: Option<String>,
-) -> Result<Vec<RssEntry>, RssError> {
+) -> Result<Vec<FeedEntry>, RssError> {
     let entries = parse_feed(body, url)?;
     state.etag = etag;
     Ok(entries)
@@ -337,7 +395,7 @@ pub fn read_feed(
 /// Every entry whose id has not been seen, oldest first. The first call is the
 /// cold-start baseline: it records every id and reports nothing. Ids are inserted
 /// *before* returning, so a Discord failure never re-sends an entry.
-pub fn diff(state: &mut RssState, entries: &[RssEntry]) -> Vec<RssEntry> {
+pub fn diff(state: &mut RssState, entries: Vec<FeedEntry>) -> Vec<FeedEntry> {
     // Prune only against a non-empty feed (same reasoning as status: an empty
     // body must not drop the baseline and replay the whole feed when it returns).
     if !entries.is_empty() {
@@ -346,10 +404,9 @@ pub fn diff(state: &mut RssState, entries: &[RssEntry]) -> Vec<RssEntry> {
     }
     let first_poll = !state.initialized;
     state.initialized = true;
-    let mut events: Vec<RssEntry> = entries
-        .iter()
+    let mut events: Vec<FeedEntry> = entries
+        .into_iter()
         .filter(|e| state.seen.insert(e.id.clone()) && !first_poll)
-        .cloned()
         .collect();
     // Dated entries ascending; undated ones after them in feed order. `sort_by_key`
     // is stable, and `(true, None)` compares equal, so feed order is what survives.
@@ -463,20 +520,21 @@ mod test_support {
   </entry>
 </feed>"#;
 
-    pub(crate) fn mk_entry(id: &str, published: Option<&str>) -> RssEntry {
-        RssEntry {
+    pub(crate) fn mk_entry(id: &str, published: Option<&str>) -> FeedEntry {
+        let plain = |text: String| Markup::new(text, "text/plain", true);
+        FeedEntry {
             id: id.to_string(),
-            title: Some(format!("entry {id}")),
             link: Some(format!("https://blog.example/{id}")),
-            body: Some(format!("body of {id}")),
             published: published.map(ts),
+            title: Some(plain(format!("entry {id}"))),
+            bodies: vec![plain(format!("body of {id}"))],
         }
     }
 
     /// Drive a state past its cold-start baseline so a test can assert on real diffs.
-    pub(crate) fn baselined(entries: &[RssEntry]) -> RssState {
+    pub(crate) fn baselined(entries: &[FeedEntry]) -> RssState {
         let mut state = RssState::default();
-        assert!(diff(&mut state, entries).is_empty());
+        assert!(diff(&mut state, entries.to_vec()).is_empty());
         state
     }
 }
@@ -494,7 +552,11 @@ mod tests {
     }
 
     fn parse(body: &str) -> Vec<RssEntry> {
-        parse_feed(body.as_bytes(), &feed_url()).unwrap()
+        parse_feed(body.as_bytes(), &feed_url())
+            .unwrap()
+            .into_iter()
+            .map(FeedEntry::render)
+            .collect()
     }
 
     fn rss_item(inner: &str) -> String {
@@ -562,6 +624,14 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, "note-1");
         assert_eq!(entries[0].body.as_deref(), Some("just a note"));
+    }
+
+    #[test]
+    fn an_item_whose_only_text_renders_empty_is_dropped() {
+        let entries = parse(&rss_item(
+            "<guid>g</guid><description>&lt;br&gt;&lt;p&gt;&lt;/p&gt;</description>",
+        ));
+        assert!(entries.is_empty());
     }
 
     #[test]
@@ -778,7 +848,7 @@ second line</summary></entry></feed>"#;
         let mut state = RssState::default();
         assert!(!state.is_initialized());
         let entries = vec![mk_entry("a", None), mk_entry("b", None)];
-        assert!(diff(&mut state, &entries).is_empty());
+        assert!(diff(&mut state, entries).is_empty());
         assert!(state.is_initialized());
         assert_eq!(state.seen.len(), 2);
     }
@@ -788,7 +858,7 @@ second line</summary></entry></feed>"#;
         let a = mk_entry("a", Some("2026-09-01T00:00:00Z"));
         let b = mk_entry("b", Some("2026-09-02T00:00:00Z"));
         let mut state = baselined(std::slice::from_ref(&a));
-        assert_eq!(diff(&mut state, &[b.clone(), a]), vec![b]);
+        assert_eq!(diff(&mut state, vec![b.clone(), a]), vec![b]);
     }
 
     #[test]
@@ -796,32 +866,32 @@ second line</summary></entry></feed>"#;
         let a = mk_entry("a", None);
         let b = mk_entry("b", None);
         let mut state = baselined(std::slice::from_ref(&a));
-        let next = [b, a];
-        assert_eq!(diff(&mut state, &next).len(), 1);
-        assert!(diff(&mut state, &next).is_empty());
+        let next = vec![b, a];
+        assert_eq!(diff(&mut state, next.clone()).len(), 1);
+        assert!(diff(&mut state, next).is_empty());
     }
 
     #[test]
     fn new_entries_are_ordered_oldest_first() {
         let mut state = baselined(&[mk_entry("old", Some("2026-08-01T00:00:00Z"))]);
-        let next = [
+        let next = vec![
             mk_entry("late", Some("2026-09-03T00:00:00Z")),
             mk_entry("early", Some("2026-09-01T00:00:00Z")),
             mk_entry("old", Some("2026-08-01T00:00:00Z")),
         ];
-        let ids: Vec<String> = diff(&mut state, &next).into_iter().map(|e| e.id).collect();
+        let ids: Vec<String> = diff(&mut state, next).into_iter().map(|e| e.id).collect();
         assert_eq!(ids, ["early", "late"]);
     }
 
     #[test]
     fn undated_entries_come_after_dated_ones_in_feed_order() {
         let mut state = baselined(&[mk_entry("old", None)]);
-        let next = [
+        let next = vec![
             mk_entry("u1", None),
             mk_entry("dated", Some("2026-09-01T00:00:00Z")),
             mk_entry("u2", None),
         ];
-        let ids: Vec<String> = diff(&mut state, &next).into_iter().map(|e| e.id).collect();
+        let ids: Vec<String> = diff(&mut state, next).into_iter().map(|e| e.id).collect();
         assert_eq!(ids, ["dated", "u1", "u2"]);
     }
 
@@ -832,11 +902,11 @@ second line</summary></entry></feed>"#;
         let mut state = baselined(&[a.clone(), b.clone()]);
 
         // `a` aged out of the feed; `b` is unchanged.
-        assert!(diff(&mut state, std::slice::from_ref(&b)).is_empty());
+        assert!(diff(&mut state, vec![b.clone()]).is_empty());
         assert_eq!(state.seen.len(), 1);
 
         // `a` reappearing is treated as new, not as already-seen.
-        let events = diff(&mut state, &[a, b]);
+        let events = diff(&mut state, vec![a, b]);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, "a");
     }
@@ -845,8 +915,8 @@ second line</summary></entry></feed>"#;
     fn an_empty_feed_keeps_the_baseline() {
         let entries = vec![mk_entry("a", None)];
         let mut state = baselined(&entries);
-        assert!(diff(&mut state, &[]).is_empty());
-        assert!(diff(&mut state, &entries).is_empty());
+        assert!(diff(&mut state, vec![]).is_empty());
+        assert!(diff(&mut state, entries).is_empty());
     }
 
     // --- build_message ---
@@ -859,7 +929,7 @@ second line</summary></entry></feed>"#;
     fn message_carries_the_feed_identity_entry_link_and_body() {
         let mut feed = mk_run_rss("news", Duration::from_secs(900));
         feed.avatar_url = Some("https://example.com/a.png".to_string());
-        let msg = build_message(&feed, &mk_entry("a", None), detected());
+        let msg = build_message(&feed, &mk_entry("a", None).render(), detected());
 
         assert_eq!(msg.username.as_deref(), Some("news Feed"));
         assert_eq!(msg.avatar_url.as_deref(), Some("https://example.com/a.png"));
@@ -873,7 +943,7 @@ second line</summary></entry></feed>"#;
     #[test]
     fn message_title_falls_back_to_the_feed_name() {
         let feed = mk_run_rss("news", Duration::from_secs(900));
-        let mut entry = mk_entry("a", None);
+        let mut entry = mk_entry("a", None).render();
         entry.title = None;
         assert_eq!(
             build_message(&feed, &entry, detected()).embeds[0].title,
@@ -886,7 +956,7 @@ second line</summary></entry></feed>"#;
         let feed = mk_run_rss("news", Duration::from_secs(900));
         let msg = build_message(
             &feed,
-            &mk_entry("a", Some("2026-09-26T18:05:00Z")),
+            &mk_entry("a", Some("2026-09-26T18:05:00Z")).render(),
             detected(),
         );
         let embed = &msg.embeds[0];
@@ -921,7 +991,7 @@ second line</summary></entry></feed>"#;
     #[test]
     fn embed_color_is_the_entry_colour() {
         let feed = mk_run_rss("news", Duration::from_secs(900));
-        let msg = build_message(&feed, &mk_entry("a", None), detected());
+        let msg = build_message(&feed, &mk_entry("a", None).render(), detected());
         assert_eq!(msg.embeds[0].color, COLOR_ENTRY);
     }
 }

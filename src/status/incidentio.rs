@@ -17,7 +17,7 @@ pub(super) fn decode(
 ) -> Result<Vec<Incident>, DecodeError> {
     Ok(parse_feed(body, feed_url)?
         .into_iter()
-        .filter_map(|e| normalize(e, now))
+        .filter_map(|e| normalize(e.render(), now))
         .collect())
 }
 

@@ -558,14 +558,15 @@ async fn poll_rss<N: Notifier, R: RssSource>(
     };
 
     let first_poll = !state.is_initialized();
-    let events = rss::diff(state, &entries);
+    let entry_count = entries.len();
+    let events = rss::diff(state, entries);
     if first_poll {
-        info!(rss = %feed.name, entries = entries.len(), "rss baseline recorded");
+        info!(rss = %feed.name, entries = entry_count, "rss baseline recorded");
     }
     let mut forwarded = 0;
     let mut send_failed = 0;
-    for entry in &events {
-        let message = rss::build_message(feed, entry, detected_at);
+    for entry in events.into_iter().map(rss::FeedEntry::render) {
+        let message = rss::build_message(feed, &entry, detected_at);
         match notifier.send(&feed.webhook_url, &message).await {
             Ok(()) => {
                 forwarded += 1;
