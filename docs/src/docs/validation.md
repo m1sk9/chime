@@ -12,6 +12,7 @@ All of the following are rejected at startup with a descriptive error and a non-
 - `tick_interval_sec` outside `1..=60`
 - Unknown IANA timezone
 - Webhook env var unset, empty, or not a valid `https` URL
+- Two different `webhook` names that map to the same env var (e.g. `team-a` and `team_a`)
 - `thread_id` that is empty, not all digits, zero or beyond 64 bits (or written as a TOML integer)
 - Neither reminders, status pages, watches nor rss feeds defined
 - `poll_interval_sec` outside `60..=3600`

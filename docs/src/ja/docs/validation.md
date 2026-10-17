@@ -12,6 +12,7 @@ layout: doc
 - `1..=60` の範囲外の `tick_interval_sec`
 - 未知の IANA タイムゾーン
 - 未設定，空，または有効な `https` の URL ではない webhook env 変数
+- 同じ env 変数に対応する 2 つの異なる `webhook` 名 (例: `team-a` と `team_a`)
 - 空，数字のみでない，0，64 ビットを超える，または TOML の整数として書かれた `thread_id`
 - リマインダー，ステータスページ，watch，rss フィードのいずれも定義されていない
 - `60..=3600` の範囲外の `poll_interval_sec`
