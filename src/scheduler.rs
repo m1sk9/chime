@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
 use chrono_tz::Tz;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::{MissedTickBehavior, interval};
@@ -121,7 +121,7 @@ pub struct Scheduler<N: Notifier, S: StatusSource, B: BodySource> {
     source: S,
     /// Serves both watch feeds and rss feeds; each poller sends its own `Accept`.
     feed_source: B,
-    last_fired: HashMap<String, DateTime<Tz>>,
+    last_fired: HashMap<String, NaiveDateTime>,
     last_polled: HashMap<Job, DateTime<Tz>>,
     page_states: HashMap<usize, PageState>,
     feed_states: HashMap<usize, FeedState>,
@@ -590,10 +590,15 @@ fn overdue_secs(last: Option<&DateTime<Tz>>, now: DateTime<Tz>) -> i64 {
     }
 }
 
-fn truncate_to_minute(t: &DateTime<Tz>) -> DateTime<Tz> {
-    t.with_second(0)
+// Wall-clock, not `DateTime<Tz>`: truncating an ambiguous local time fails in
+// chrono, and the two instants of a repeated DST minute compare unequal, so either
+// would send a reminder more than once in the hour that falls back.
+fn truncate_to_minute(t: &DateTime<Tz>) -> NaiveDateTime {
+    let local = t.naive_local();
+    local
+        .with_second(0)
         .and_then(|t| t.with_nanosecond(0))
-        .unwrap_or(*t)
+        .unwrap_or(local)
 }
 
 #[cfg(test)]
@@ -997,6 +1002,48 @@ mod tests {
         scheduler.tick(at(9, 30, 0)).await;
         scheduler.tick(at(9, 30, 30)).await;
         scheduler.tick(at(9, 30, 59)).await;
+
+        assert_eq!(notifier.sent(), 1);
+    }
+
+    /// 2026-11-01 is the DST fall-back day in New York: 01:00-01:59 occurs twice.
+    fn new_york_fall_back(hour_utc: u32, minute: u32, second: u32) -> DateTime<Tz> {
+        Utc.with_ymd_and_hms(2026, 11, 1, hour_utc, minute, second)
+            .unwrap()
+            .with_timezone(&chrono_tz::America::New_York)
+    }
+
+    #[tokio::test]
+    async fn fires_once_within_an_ambiguous_minute() {
+        let notifier = CountingNotifier::new();
+        let cfg = cfg_with(
+            "ambiguous_minute",
+            vec![mk_run_reminder("night", 1, 30)],
+            vec![],
+        );
+        let mut scheduler = sched(cfg, notifier.clone(), FakeSource::empty());
+
+        // 05:30 UTC is 01:30 EDT, the first of the two 01:30s.
+        scheduler.tick(new_york_fall_back(5, 30, 0)).await;
+        scheduler.tick(new_york_fall_back(5, 30, 30)).await;
+        scheduler.tick(new_york_fall_back(5, 30, 59)).await;
+
+        assert_eq!(notifier.sent(), 1);
+    }
+
+    #[tokio::test]
+    async fn fires_once_across_a_repeated_wall_clock_minute() {
+        let notifier = CountingNotifier::new();
+        let cfg = cfg_with(
+            "repeated_minute",
+            vec![mk_run_reminder("night", 1, 30)],
+            vec![],
+        );
+        let mut scheduler = sched(cfg, notifier.clone(), FakeSource::empty());
+
+        // 01:30 EDT, then 01:30 EST an hour later.
+        scheduler.tick(new_york_fall_back(5, 30, 0)).await;
+        scheduler.tick(new_york_fall_back(6, 30, 0)).await;
 
         assert_eq!(notifier.sent(), 1);
     }

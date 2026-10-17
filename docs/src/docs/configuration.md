@@ -41,6 +41,8 @@ webhook = "team"
 
 Each reminder schedules by **either** `days` (weekdays) **or** `day_of_month` (days of the month) — exactly one of the two, never both. `day_of_month` accepts a list of days in `1..=31`; a day that does not exist in a given month (e.g. `31` in February) is simply skipped that month.
 
+`time` is wall-clock time in `system.timezone`. On a daylight-saving change, a time that occurs twice (the hour that falls back) fires once, at its first occurrence, and a time that does not exist that day (the hour that springs forward) does not fire.
+
 `webhook` and `thread_id` are explained in [Webhooks](./webhooks).
 
 ## `[[status_pages]]`
