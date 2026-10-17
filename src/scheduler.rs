@@ -613,6 +613,8 @@ mod tests {
 
     #[derive(Clone)]
     struct CountingNotifier {
+        /// Every send is still counted, then answered with an error.
+        reject: bool,
         count: Arc<AtomicUsize>,
         messages: Arc<Mutex<Vec<DiscordMessage>>>,
         timestamps: Arc<Mutex<Vec<Option<String>>>>,
@@ -622,10 +624,18 @@ mod tests {
     impl CountingNotifier {
         fn new() -> Self {
             CountingNotifier {
+                reject: false,
                 count: Arc::new(AtomicUsize::new(0)),
                 messages: Arc::new(Mutex::new(Vec::new())),
                 timestamps: Arc::new(Mutex::new(Vec::new())),
                 titles: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn rejecting() -> Self {
+            CountingNotifier {
+                reject: true,
+                ..CountingNotifier::new()
             }
         }
 
@@ -650,6 +660,12 @@ mod tests {
                 avatar_url: message.avatar_url.clone(),
                 embeds: Vec::new(),
             });
+            if self.reject {
+                return Err(NotifyError::Status {
+                    status: 404,
+                    body: "unknown webhook".to_string(),
+                });
+            }
             Ok(())
         }
     }
@@ -981,6 +997,22 @@ mod tests {
         scheduler.tick(at(9, 30, 0)).await;
         scheduler.tick(at(9, 30, 30)).await;
         scheduler.tick(at(9, 30, 59)).await;
+
+        assert_eq!(notifier.sent(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_reminder_send_is_not_retried_in_the_same_minute() {
+        let notifier = CountingNotifier::rejecting();
+        let cfg = cfg_with(
+            "reminder_fail",
+            vec![mk_run_reminder("daily", 9, 30)],
+            vec![],
+        );
+        let mut scheduler = sched(cfg, notifier.clone(), FakeSource::empty());
+
+        scheduler.tick(at(9, 30, 0)).await;
+        scheduler.tick(at(9, 30, 30)).await;
 
         assert_eq!(notifier.sent(), 1);
     }
