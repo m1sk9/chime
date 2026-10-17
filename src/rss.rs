@@ -180,11 +180,18 @@ pub fn html_to_text(html: &str) -> String {
     while let Some(open) = rest.find('<') {
         push_text(&mut out, &rest[..open], &mut after_space);
         let tail = &rest[open + 1..];
+        // As in HTML, only `<` followed by a letter, `/`, `!` or `?` opens a tag;
+        // `a < b` is text.
+        if !tail.starts_with(|c: char| c.is_ascii_alphabetic() || matches!(c, '/' | '!' | '?')) {
+            push_text(&mut out, "<", &mut after_space);
+            rest = tail;
+            continue;
+        }
         if let Some(after) = skip_unrendered(tail) {
             rest = after;
             continue;
         }
-        let Some(close) = tail.find('>') else {
+        let Some(close) = tag_end(tail) else {
             rest = &rest[open..];
             break;
         };
@@ -194,6 +201,27 @@ pub fn html_to_text(html: &str) -> String {
     push_text(&mut out, rest, &mut after_space);
 
     tidy_lines(&decode_entities(&out))
+}
+
+/// The `>` that ends the tag, skipping any inside a quoted attribute value
+/// (`<img alt="a>b">`). A quote opens a value only right after `=`, as in HTML, so
+/// an apostrophe elsewhere in the tag does not swallow the rest of the body.
+fn tag_end(tail: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut after_equals = false;
+    for (i, b) in tail.bytes().enumerate() {
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'>' => return Some(i),
+            None if after_equals && (b == b'"' || b == b'\'') => quote = Some(b),
+            None => {}
+        }
+        if !b.is_ascii_whitespace() {
+            after_equals = quote.is_none() && b == b'=';
+        }
+    }
+    None
 }
 
 fn tidy_lines(text: &str) -> String {
@@ -211,6 +239,13 @@ fn tidy_lines(text: &str) -> String {
 /// bodies are not text a reader would ever see.
 fn skip_unrendered(tail: &str) -> Option<&str> {
     if let Some(comment) = tail.strip_prefix("!--") {
+        // `<!-->` and `<!--->` are complete (empty) comments in HTML; without this
+        // they would never find a `-->` and take the rest of the body with them.
+        for abrupt in [">", "->"] {
+            if let Some(after) = comment.strip_prefix(abrupt) {
+                return Some(after);
+            }
+        }
         return Some(comment.find("-->").map_or("", |end| &comment[end + 3..]));
     }
     let name_len = tail.bytes().take_while(u8::is_ascii_alphanumeric).count();
@@ -251,13 +286,14 @@ fn push_tag(out: &mut String, inner: &str, after_space: &mut bool) {
         Some(n) => (true, n),
         None => (false, inner),
     };
+    // `-` included so a custom element such as `<p-card>` is not read as `<p>`.
     let name: String = name
         .chars()
-        .take_while(char::is_ascii_alphanumeric)
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
         .map(|c| c.to_ascii_lowercase())
         .collect();
     match name.as_str() {
-        "br" => push_break(out),
+        "br" | "hr" => push_break(out),
         "li" if !closing => {
             // Why not always a newline: after a nested list's `</ul>` the line is
             // already open, and a second break would leave a blank line in the list.
@@ -346,13 +382,25 @@ fn decode_entity(name: &str) -> Option<char> {
         "deg" => Some('\u{B0}'),
         "times" => Some('\u{D7}'),
         "euro" => Some('\u{20AC}'),
+        "ensp" => Some('\u{2002}'),
+        "emsp" => Some('\u{2003}'),
+        "thinsp" => Some('\u{2009}'),
+        "larr" => Some('\u{2190}'),
+        "uarr" => Some('\u{2191}'),
+        "rarr" => Some('\u{2192}'),
+        "darr" => Some('\u{2193}'),
+        "harr" => Some('\u{2194}'),
         _ => {
             let num = name.strip_prefix('#')?;
             let code = match num.strip_prefix(['x', 'X']) {
                 Some(hex) => u32::from_str_radix(hex, 16).ok()?,
                 None => num.parse().ok()?,
             };
-            char::from_u32(code)
+            // HTML maps a NUL reference to U+FFFD rather than emitting a NUL.
+            match code {
+                0 => Some('\u{FFFD}'),
+                _ => char::from_u32(code),
+            }
         }
     }
 }
@@ -802,6 +850,41 @@ second line</summary></entry></feed>"#;
     #[test]
     fn runs_of_blank_lines_collapse_to_one() {
         assert_eq!(html_to_text("a<br><br><br><br>b"), "a\n\nb");
+    }
+
+    #[test]
+    fn a_less_than_sign_that_opens_no_tag_is_text() {
+        assert_eq!(html_to_text("a < b and c > d"), "a < b and c > d");
+        assert_eq!(html_to_text("<3 it"), "<3 it");
+    }
+
+    #[test]
+    fn a_gt_inside_a_quoted_attribute_does_not_end_the_tag() {
+        assert_eq!(html_to_text(r#"x <img alt="a>b"> y"#), "x y");
+        assert_eq!(html_to_text("x <img alt='a>b'> y"), "x y");
+        assert_eq!(html_to_text("<p class=it's>body</p>"), "body");
+    }
+
+    #[test]
+    fn an_empty_comment_does_not_swallow_the_body() {
+        assert_eq!(html_to_text("a<!-->b"), "ab");
+        assert_eq!(html_to_text("a<!--->b"), "ab");
+    }
+
+    #[test]
+    fn a_custom_element_is_not_read_as_a_known_tag() {
+        assert_eq!(html_to_text("a<p-card>b</p-card>c"), "abc");
+    }
+
+    #[test]
+    fn a_horizontal_rule_breaks_the_line() {
+        assert_eq!(html_to_text("a<hr>b"), "a\nb");
+    }
+
+    #[test]
+    fn arrows_and_spaces_are_decoded_and_a_nul_reference_is_replaced() {
+        assert_eq!(html_to_text("a &rarr; b"), "a \u{2192} b");
+        assert_eq!(html_to_text("a&#0;b"), "a\u{FFFD}b");
     }
 
     #[test]
