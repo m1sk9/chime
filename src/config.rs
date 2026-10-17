@@ -2014,12 +2014,20 @@ webhook = "team"
         let page = first_status_page(&format!(
             "[[status_pages]]\nname = \"x\"\nkind = \"custom\"\nurl = \"https://x.example/i.json\"\nwebhook = \"team\"\n{MAPPING}\n"
         ));
-        let StatusProvider::Custom(mapping) = page.provider else {
-            panic!("expected custom, got {:?}", page.provider);
-        };
-        assert_eq!(mapping.incidents.unwrap().as_str(), "/incidents");
-        assert_eq!(mapping.id.as_str(), "/id");
-        assert!(mapping.status.is_none());
+        let pointer = |p: &str| JsonPointer::try_from(p.to_string()).unwrap();
+        assert_eq!(
+            page.provider,
+            StatusProvider::Custom(CustomMapping {
+                incidents: Some(pointer("/incidents")),
+                id: pointer("/id"),
+                title: pointer("/title"),
+                status: None,
+                body: None,
+                updated_at: None,
+                link: None,
+                impact: None,
+            })
+        );
     }
 
     #[test]
