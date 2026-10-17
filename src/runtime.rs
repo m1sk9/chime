@@ -5,8 +5,12 @@ use chrono::{DateTime, Datelike, Timelike};
 use chrono_tz::Tz;
 use url::Url;
 
-use crate::config::{Config, Impact, LogLevel, Message, Schedule, ThreadId, TimeOfDay, WebhookRef};
+use crate::config::{
+    Config, DisplayName, HttpsUrl, Impact, LogLevel, Message, Schedule, ThreadId, TimeOfDay,
+    WebhookRef,
+};
 use crate::heartbeat::heartbeat_path;
+use crate::notifier::DiscordMessage;
 use crate::status::Decoder;
 use crate::watch::{Extractor, resolve_source};
 
@@ -28,14 +32,11 @@ pub enum WebhookError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
-    #[error("reminder `{name}`: {source}")]
+    /// `kind` is the config list the entry came from: `reminder`, `status page`,
+    /// `watch` or `rss`.
+    #[error("{kind} `{name}`: {source}")]
     Webhook {
-        name: String,
-        #[source]
-        source: WebhookError,
-    },
-    #[error("status page `{name}`: {source}")]
-    StatusPageWebhook {
+        kind: &'static str,
         name: String,
         #[source]
         source: WebhookError,
@@ -46,23 +47,11 @@ pub enum ResolveError {
         #[source]
         source: url::ParseError,
     },
-    #[error("watch `{name}`: {source}")]
-    WatchWebhook {
-        name: String,
-        #[source]
-        source: WebhookError,
-    },
     #[error("watch `{name}`: cannot build source url: {source}")]
     WatchUrl {
         name: String,
         #[source]
         source: url::ParseError,
-    },
-    #[error("rss `{name}`: {source}")]
-    RssWebhook {
-        name: String,
-        #[source]
-        source: WebhookError,
     },
 }
 
@@ -87,6 +76,33 @@ impl RunReminder {
     }
 }
 
+/// The Discord sender name and avatar a status page, watch or feed posts under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub display_name: String,
+    pub avatar_url: Option<String>,
+}
+
+impl Identity {
+    /// `default` is used when `display_name` is unset, so a message is never
+    /// anonymous; what it is differs per list.
+    fn resolve(
+        display_name: Option<DisplayName>,
+        default: &str,
+        avatar_url: Option<HttpsUrl>,
+    ) -> Self {
+        Identity {
+            display_name: display_name
+                .map_or_else(|| default.to_string(), |d| d.as_str().to_string()),
+            avatar_url: avatar_url.map(HttpsUrl::into_string),
+        }
+    }
+
+    pub fn apply(&self, message: DiscordMessage) -> DiscordMessage {
+        message.with_identity(&self.display_name, self.avatar_url.as_deref())
+    }
+}
+
 /// A status page with everything already resolved: the fetched URL and its decoder
 /// are chosen, the webhook URL is read from the environment, and the Discord
 /// identity is settled.
@@ -102,8 +118,7 @@ pub struct RunStatusPage {
     pub webhook_url: Url,
     pub poll_interval: Duration,
     pub min_impact: Impact,
-    pub display_name: String,
-    pub avatar_url: Option<String>,
+    pub identity: Identity,
 }
 
 /// A watch with its extractor chosen and its webhook read from the environment.
@@ -117,8 +132,7 @@ pub struct RunWatch {
     pub host: String,
     pub extractor: Extractor,
     pub webhook_url: Url,
-    pub display_name: String,
-    pub avatar_url: Option<String>,
+    pub identity: Identity,
 }
 
 /// Every watch that reads one URL, polled with a single request.
@@ -156,8 +170,7 @@ pub struct RunRss {
     pub host: String,
     pub webhook_url: Url,
     pub poll_interval: Duration,
-    pub display_name: String,
-    pub avatar_url: Option<String>,
+    pub identity: Identity,
 }
 
 #[derive(Debug, Clone)]
@@ -186,12 +199,7 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
     let mut reminders = Vec::with_capacity(cfg.reminders.len());
     for r in cfg.reminders {
         let name = r.name.as_str().to_string();
-        let webhook_url = resolve_webhook(&r.webhook, r.thread_id.as_ref()).map_err(|source| {
-            ResolveError::Webhook {
-                name: name.clone(),
-                source,
-            }
-        })?;
+        let webhook_url = webhook_for("reminder", &name, &r.webhook, r.thread_id.as_ref())?;
         reminders.push(RunReminder {
             name,
             time: r.time,
@@ -203,12 +211,7 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
     let mut status_pages = Vec::with_capacity(cfg.status_pages.len());
     for p in cfg.status_pages {
         let name = p.name.as_str().to_string();
-        let webhook_url = resolve_webhook(&p.webhook, p.thread_id.as_ref()).map_err(|source| {
-            ResolveError::StatusPageWebhook {
-                name: name.clone(),
-                source,
-            }
-        })?;
+        let webhook_url = webhook_for("status page", &name, &p.webhook, p.thread_id.as_ref())?;
         let spec =
             crate::status::resolve_source(&p.provider, p.url.as_url()).map_err(|source| {
                 ResolveError::StatusPageSource {
@@ -216,10 +219,7 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
                     source,
                 }
             })?;
-        let display_name = p
-            .display_name
-            .map(|d| d.as_str().to_string())
-            .unwrap_or_else(|| name.clone());
+        let identity = Identity::resolve(p.display_name, &name, p.avatar_url);
         let url = p.url.as_url().clone();
         status_pages.push(RunStatusPage {
             host: host_of(&url),
@@ -230,37 +230,27 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
             webhook_url,
             poll_interval: p.poll_interval_sec.as_duration(),
             min_impact: p.min_impact,
-            display_name,
-            avatar_url: p.avatar_url.map(|a| a.into_string()),
+            identity,
         });
     }
     let mut feeds: Vec<RunFeed> = Vec::new();
     for w in cfg.watches {
         let name = w.name.as_str().to_string();
-        let webhook_url = resolve_webhook(&w.webhook, w.thread_id.as_ref()).map_err(|source| {
-            ResolveError::WatchWebhook {
-                name: name.clone(),
-                source,
-            }
-        })?;
+        let webhook_url = webhook_for("watch", &name, &w.webhook, w.thread_id.as_ref())?;
         let spec = resolve_source(&name, &w.source).map_err(|source| ResolveError::WatchUrl {
             name: name.clone(),
             source,
         })?;
         // Defaults to the label rather than `name`, unlike status pages: a watch
         // name is an identifier, and the label already reads as a sender name.
-        let display_name = w
-            .display_name
-            .map(|d| d.as_str().to_string())
-            .unwrap_or_else(|| spec.label.clone());
+        let identity = Identity::resolve(w.display_name, &spec.label, w.avatar_url);
         let watch = RunWatch {
             name,
             host: host_of(&spec.url),
             label: spec.label,
             extractor: spec.extractor,
             webhook_url,
-            display_name,
-            avatar_url: w.avatar_url.map(|a| a.into_string()),
+            identity,
         };
         let poll_interval = w.poll_interval_sec.as_duration();
         match feeds.iter_mut().find(|f| f.url == spec.url) {
@@ -278,18 +268,10 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
     let mut rss = Vec::with_capacity(cfg.rss.len());
     for r in cfg.rss {
         let name = r.name.as_str().to_string();
-        let webhook_url = resolve_webhook(&r.webhook, r.thread_id.as_ref()).map_err(|source| {
-            ResolveError::RssWebhook {
-                name: name.clone(),
-                source,
-            }
-        })?;
+        let webhook_url = webhook_for("rss", &name, &r.webhook, r.thread_id.as_ref())?;
         // Why not the feed's own `<title>`: it is unknown until the first fetch and
         // can change without notice, so the sender name would depend on the network.
-        let display_name = r
-            .display_name
-            .map(|d| d.as_str().to_string())
-            .unwrap_or_else(|| name.clone());
+        let identity = Identity::resolve(r.display_name, &name, r.avatar_url);
         let url = r.url.as_url().clone();
         rss.push(RunRss {
             name,
@@ -297,8 +279,7 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
             url,
             webhook_url,
             poll_interval: r.poll_interval_sec.as_duration(),
-            display_name,
-            avatar_url: r.avatar_url.map(|a| a.into_string()),
+            identity,
         });
     }
 
@@ -311,6 +292,19 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
         feeds,
         rss,
         heartbeat_path: heartbeat_path(),
+    })
+}
+
+fn webhook_for(
+    kind: &'static str,
+    name: &str,
+    reference: &WebhookRef,
+    thread_id: Option<&ThreadId>,
+) -> Result<Url, ResolveError> {
+    resolve_webhook(reference, thread_id).map_err(|source| ResolveError::Webhook {
+        kind,
+        name: name.to_string(),
+        source,
     })
 }
 
@@ -410,8 +404,10 @@ mod test_support {
             webhook_url: Url::parse("https://discord.example/webhook").unwrap(),
             poll_interval,
             min_impact: Impact::None,
-            display_name: format!("{name} Status"),
-            avatar_url: None,
+            identity: Identity {
+                display_name: format!("{name} Status"),
+                avatar_url: None,
+            },
         }
     }
 
@@ -426,8 +422,10 @@ mod test_support {
                 link: None,
             },
             webhook_url: Url::parse("https://discord.example/webhook").unwrap(),
-            display_name: format!("{name} Releases"),
-            avatar_url: None,
+            identity: Identity {
+                display_name: format!("{name} Releases"),
+                avatar_url: None,
+            },
         }
     }
 
@@ -455,8 +453,10 @@ mod test_support {
             host: format!("rss.{name}.example"),
             webhook_url: Url::parse("https://discord.example/webhook").unwrap(),
             poll_interval,
-            display_name: format!("{name} Feed"),
-            avatar_url: None,
+            identity: Identity {
+                display_name: format!("{name} Feed"),
+                avatar_url: None,
+            },
         }
     }
 }
@@ -568,7 +568,7 @@ webhook = "resolve-nohook"
         let cfg = Config::from_toml(toml).unwrap();
         assert!(matches!(
             resolve(cfg),
-            Err(ResolveError::Webhook { name, .. }) if name == "orphan"
+            Err(ResolveError::Webhook { kind: "reminder", name, .. }) if name == "orphan"
         ));
     }
 
@@ -595,7 +595,7 @@ webhook = "status-team"
         assert_eq!(page.host, "status.claude.com");
         assert_eq!(page.webhook_url.as_str(), "https://example.com/hook");
         // `display_name` falls back to the logical name so a message is never anonymous.
-        assert_eq!(page.display_name, "claude");
+        assert_eq!(page.identity.display_name, "claude");
         assert_eq!(page.poll_interval, Duration::from_secs(300));
     }
 
@@ -692,9 +692,9 @@ min_impact = "major"
 "#;
         let cfg = Config::from_toml(toml).unwrap();
         let page = resolve(cfg).unwrap().status_pages.remove(0);
-        assert_eq!(page.display_name, "Claude Status");
+        assert_eq!(page.identity.display_name, "Claude Status");
         assert_eq!(
-            page.avatar_url.as_deref(),
+            page.identity.avatar_url.as_deref(),
             Some("https://example.com/claude.png")
         );
         assert_eq!(page.min_impact, Impact::Major);
@@ -717,7 +717,7 @@ webhook = "status-nohook"
         let cfg = Config::from_toml(toml).unwrap();
         assert!(matches!(
             resolve(cfg),
-            Err(ResolveError::StatusPageWebhook { name, .. }) if name == "orphan-page"
+            Err(ResolveError::Webhook { kind: "status page", name, .. }) if name == "orphan-page"
         ));
     }
 
@@ -799,9 +799,9 @@ avatar_url = "https://example.com/node.png"
         assert_eq!(feed.url.as_str(), "https://nodejs.org/dist/index.json");
         assert_eq!(w.host, "nodejs.org");
         assert_eq!(w.label, "node");
-        assert_eq!(w.display_name, "Node.js");
+        assert_eq!(w.identity.display_name, "Node.js");
         assert_eq!(
-            w.avatar_url.as_deref(),
+            w.identity.avatar_url.as_deref(),
             Some("https://example.com/node.png")
         );
         assert_eq!(
@@ -873,7 +873,7 @@ source = { kind = "chrome" }
             .feeds
             .remove(0);
         let w = &feed.watches[0];
-        assert_eq!(w.display_name, "Chrome Stable");
+        assert_eq!(w.identity.display_name, "Chrome Stable");
     }
 
     #[test]
@@ -893,7 +893,7 @@ source = { kind = "firefox" }
         let cfg = Config::from_toml(toml).unwrap();
         assert!(matches!(
             resolve(cfg),
-            Err(ResolveError::WatchWebhook { name, .. }) if name == "orphan-watch"
+            Err(ResolveError::Webhook { kind: "watch", name, .. }) if name == "orphan-watch"
         ));
     }
 
@@ -940,8 +940,8 @@ webhook = "rss-name"
             .unwrap()
             .rss
             .remove(0);
-        assert_eq!(feed.display_name, "changelog");
-        assert!(feed.avatar_url.is_none());
+        assert_eq!(feed.identity.display_name, "changelog");
+        assert!(feed.identity.avatar_url.is_none());
     }
 
     #[test]
@@ -963,9 +963,9 @@ avatar_url = "https://example.com/claude.png"
             .unwrap()
             .rss
             .remove(0);
-        assert_eq!(feed.display_name, "Claude Code Changelog");
+        assert_eq!(feed.identity.display_name, "Claude Code Changelog");
         assert_eq!(
-            feed.avatar_url.as_deref(),
+            feed.identity.avatar_url.as_deref(),
             Some("https://example.com/claude.png")
         );
     }
@@ -987,7 +987,7 @@ webhook = "rss-nohook"
         let cfg = Config::from_toml(toml).unwrap();
         assert!(matches!(
             resolve(cfg),
-            Err(ResolveError::RssWebhook { name, .. }) if name == "orphan-feed"
+            Err(ResolveError::Webhook { kind: "rss", name, .. }) if name == "orphan-feed"
         ));
     }
 

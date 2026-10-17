@@ -436,7 +436,7 @@ pub fn build_message(
     embed = embed
         .with_footer(&feed.host)
         .with_timestamp(&detected_at.to_rfc3339());
-    DiscordMessage::embed(embed).with_identity(&feed.display_name, feed.avatar_url.as_deref())
+    feed.identity.apply(DiscordMessage::embed(embed))
 }
 
 #[cfg(test)]
@@ -904,7 +904,7 @@ second line</summary></entry></feed>"#;
     #[test]
     fn message_carries_the_feed_identity_entry_link_and_body() {
         let mut feed = mk_run_rss("news", Duration::from_secs(900));
-        feed.avatar_url = Some("https://example.com/a.png".to_string());
+        feed.identity.avatar_url = Some("https://example.com/a.png".to_string());
         let msg = build_message(&feed, &mk_entry("a", None).render(), detected());
 
         assert_eq!(msg.username.as_deref(), Some("news Feed"));

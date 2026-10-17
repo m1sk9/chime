@@ -400,7 +400,7 @@ pub fn build_message(page: &RunStatusPage, event: &StatusEvent) -> DiscordMessag
         .with_footer(&page.host)
         .with_timestamp(&event.occurred_at.to_rfc3339());
 
-    DiscordMessage::embed(embed).with_identity(&page.display_name, page.avatar_url.as_deref())
+    page.identity.apply(DiscordMessage::embed(embed))
 }
 
 #[cfg(test)]
