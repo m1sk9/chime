@@ -367,7 +367,8 @@ pub struct RssState {
 }
 
 impl RssState {
-    /// `false` until the first `diff` — the scheduler logs the baseline once.
+    /// `false` until the first `diff` of a non-empty feed — the scheduler logs the
+    /// baseline once.
     pub fn is_initialized(&self) -> bool {
         self.initialized
     }
@@ -390,16 +391,21 @@ pub fn read_feed(
     Ok(entries)
 }
 
-/// Every entry whose id has not been seen, oldest first. The first call is the
-/// cold-start baseline: it records every id and reports nothing. Ids are inserted
-/// *before* returning, so a Discord failure never re-sends an entry.
+/// Every entry whose id has not been seen, oldest first. The first call with a
+/// non-empty feed is the cold-start baseline: it records every id and reports
+/// nothing. Ids are inserted *before* returning, so a Discord failure never
+/// re-sends an entry.
 pub fn diff(state: &mut RssState, entries: Vec<FeedEntry>) -> Vec<FeedEntry> {
-    // Prune only against a non-empty feed (same reasoning as status: an empty
-    // body must not drop the baseline and replay the whole feed when it returns).
-    if !entries.is_empty() {
-        let current: HashSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
-        state.seen.retain(|id| current.contains(id.as_str()));
+    // An empty body neither prunes nor baselines: either would replay the whole
+    // feed once it returns. Unlike status, where an empty list is the normal quiet
+    // state, an empty feed is a transient fault far more often than a new one, so
+    // the cost is that the first entry of a feed that starts empty is baselined
+    // rather than posted.
+    if entries.is_empty() {
+        return Vec::new();
     }
+    let current: HashSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+    state.seen.retain(|id| current.contains(id.as_str()));
     let first_poll = !state.initialized;
     state.initialized = true;
     let mut events: Vec<FeedEntry> = entries
@@ -885,6 +891,17 @@ second line</summary></entry></feed>"#;
         let events = diff(&mut state, vec![a, b]);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, "a");
+    }
+
+    #[test]
+    fn an_empty_first_poll_does_not_record_a_baseline() {
+        let mut state = RssState::default();
+        assert!(diff(&mut state, vec![]).is_empty());
+        assert!(!state.is_initialized());
+
+        let entries = vec![mk_entry("a", None), mk_entry("b", None)];
+        assert!(diff(&mut state, entries).is_empty());
+        assert!(state.is_initialized());
     }
 
     #[test]
