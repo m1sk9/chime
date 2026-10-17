@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`chime` is a long-running Rust process that reads a TOML schedule, posts to Discord webhooks at the configured times, polls status pages (Atlassian Statuspage, Instatus, incident.io, Datadog Status Pages, or any JSON endpoint via a pointer mapping) to forward incident updates to the same webhooks, polls release feeds (Firefox, Chrome, arbitrary JSON) to announce new versions, and polls RSS / Atom / JSON Feed syndication feeds to post new entries. Distributed as a single static binary and a distroless container at `ghcr.io/m1sk9/chime`. See `README.md` for the user-facing manual (config schema, webhook resolution, runtime semantics).
+`chime` is a long-running Rust process that reads a TOML schedule, posts to Discord webhooks at the configured times, polls status pages (Atlassian Statuspage, Instatus, incident.io, Datadog Status Pages, or any JSON endpoint via a pointer mapping) to forward incident updates to the same webhooks, polls release feeds (Firefox, Chrome, arbitrary JSON) to announce new versions, and polls RSS / Atom / JSON Feed syndication feeds to post new entries. Distributed as a single static binary and a distroless container at `ghcr.io/m1sk9/chime`. See `README.md` for the user-facing manual (config schema, webhook resolution, runtime semantics). The same content is published as a VitePress site (en + ja) from `docs/` to `chime.m1sk9.dev` (see "Documentation site" below).
 
 ## Common commands
 
@@ -47,6 +47,10 @@ Modules wired together in `src/main.rs`:
 - **`notifier`** — `Notifier` trait + `Discord` impl. `Discord::send` POSTs a `DiscordMessage` (content and/or embeds, plus `username`/`avatar_url`) with a 10s reqwest timeout. Reminders serialize to exactly `{"content": …}` as before. All Discord length limits are enforced in the `Embed`/`DiscordMessage` constructors, counted in `chars()` not bytes, so an over-long message cannot be built. On non-2xx, the body is read through `read_error_body`, which stops copying at `MAX_ERROR_BODY` (512 bytes) rather than buffering the response and truncating afterwards — `fetch::fetch_conditional` calls the same helper, so keep the cap in one place; both Discord and Statuspage answer failures with large HTML pages, and with the client's `gzip` feature on, the transferred size no longer bounds what `Response::bytes` would cost. The trait exists so scheduler tests can inject a counting fake.
 
 Runtime is `#[tokio::main(flavor = "current_thread")]` — single-threaded by design. Don't reach for the multi-threaded runtime without a real reason.
+
+## Documentation site
+
+`docs/` is a VitePress site (bun, biome) deployed to Cloudflare Workers static assets as `chime-docs` by `.github/workflows/docs-site.yaml` on push to `main` (`docs/**` only). `docs/wrangler.jsonc` owns the hostname (`custom_domain: true`); nothing in m1sk9/infra routes `chime.m1sk9.dev`. Pages live in `docs/src/` (English) and `docs/src/ja/` (Japanese) and must be edited together, along with `README.md` when the behaviour they describe changes. Dev loop, from `docs/`: `bun install`, `bun run dev`, and the CI gates `bun run format:check && bun run lint && bun run build`. Never run `wrangler deploy` by hand — the workflow owns it.
 
 ## Conventions specific to this repo
 

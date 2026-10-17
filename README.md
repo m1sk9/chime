@@ -12,6 +12,8 @@ IaC-managed Discord webhook reminder. Reads a TOML schedule, runs as a long-live
 docker pull ghcr.io/m1sk9/chime:v0
 ```
 
+Documentation: <https://chime.m1sk9.dev>
+
 ## Features
 
 - Single static binary, no runtime dependencies.
@@ -30,24 +32,24 @@ docker pull ghcr.io/m1sk9/chime:v0
 1. Copy the example files:
 
     ```sh
-    cp config.toml.example config.toml
-    cp .env.example .env
+    cp config/config.toml.example config/config.toml
+    cp config/.env.example config/.env
     ```
 
-2. Edit `config.toml` with your reminders and `.env` with your webhook URLs.
+2. Edit `config/config.toml` with your reminders and `config/.env` with your webhook URLs.
 3. Start it:
 
     ```sh
-    docker compose up -d
+    docker compose -f docker/compose.yml up -d
     ```
 
-Compose pulls `ghcr.io/m1sk9/chime:latest` by default. To pin a specific version, change the `image:` tag in `docker-compose.yml` (any of `vX`, `vX.Y`, `vX.Y.Z`, `latest`, or a commit SHA are published per release).
+Compose pulls `ghcr.io/m1sk9/chime:latest` by default. To pin a specific version, change the `image:` tag in `docker/compose.yml` (any of `vX`, `vX.Y`, `vX.Y.Z`, `latest`, or a commit SHA are published per release).
 
-To build the image locally instead, uncomment the `build:` block in `docker-compose.yml` and remove the `image:` line.
+To build the image locally instead, uncomment the `build:` block in `docker/compose.yml` and remove the `image:` line.
 
 #### Docker secrets (alternative to `.env`)
 
-Swap `env_file:` for the `secrets:` block shown commented in `docker-compose.yml`, and reference each secret via the `_FILE` convention:
+Swap `env_file:` for the `secrets:` block shown commented in `docker/compose.yml`, and reference each secret via the `_FILE` convention:
 
 ```yaml
 environment:
@@ -504,7 +506,7 @@ How it works:
 - On every tick the daemon writes the current timestamp to a heartbeat file (default `/tmp/chime.heartbeat`, override with `CHIME_HEARTBEAT_PATH`). The write happens **before** any Discord request, so the signal is independent of network reachability, and is repeated after every Discord request, so a tick that sends several messages to a slow Discord is not mistaken for a hung one.
 - The `chime health` subcommand reads that file's mtime and exits `0` when it is fresh — `now - mtime <= 2 * tick_interval_sec` — and non-zero with a one-line stderr message otherwise (stale, missing, or unreadable). It reads the tick interval from the same `CHIME_CONFIG`, and does **not** require any webhook env var.
 
-The container image already wires this into a `HEALTHCHECK` (exec-form, since distroless has no shell), so `docker ps` / `docker inspect` report health automatically. To set it explicitly in `docker-compose.yml`:
+The container image already wires this into a `HEALTHCHECK` (exec-form, since distroless has no shell), so `docker ps` / `docker inspect` report health automatically. To set it explicitly in `docker/compose.yml`:
 
 ```yaml
 healthcheck:
