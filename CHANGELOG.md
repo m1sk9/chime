@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.7.0](https://github.com/m1sk9/chime/compare/chime-v0.6.0...chime-v0.7.0) (2026-10-17)
+
+
+### Features
+
+* support Instatus, incident.io, Datadog Status Pages and custom JSON feeds in [[status_pages]] ([#67](https://github.com/m1sk9/chime/issues/67)) ([3d4fd46](https://github.com/m1sk9/chime/commit/3d4fd46132fe6db92a3c6c5166db975d3b8c786d))
+
+
+### Bug Fixes
+
+* **deps:** bump rustls to 0.23.45 ([58a914e](https://github.com/m1sk9/chime/commit/58a914eed53b4ffaf595d439438d52582463abca))
+* do not take the rss baseline from a feed with no entries ([#75](https://github.com/m1sk9/chime/issues/75)) ([7cda22e](https://github.com/m1sk9/chime/commit/7cda22e73f02fc00f035208c585f9bebe1d8a4f2))
+* keep text the rss html renderer used to drop or mangle ([#80](https://github.com/m1sk9/chime/issues/80)) ([a62b67a](https://github.com/m1sk9/chime/commit/a62b67a78ae07890272bdb394eb6528f4811620a))
+* pace posts to a webhook by Discord's rate-limit headers ([#77](https://github.com/m1sk9/chime/issues/77)) ([c9e968a](https://github.com/m1sk9/chime/commit/c9e968abd2da3b30d74f958c38ab2a72395e3fad))
+* reject webhook names that resolve to the same env var ([#81](https://github.com/m1sk9/chime/issues/81)) ([95dd6e1](https://github.com/m1sk9/chime/commit/95dd6e146d3ee637bd0972db5b1727f68d675c64))
+* render rss entry titles on one line ([#83](https://github.com/m1sk9/chime/issues/83)) ([38687ab](https://github.com/m1sk9/chime/commit/38687abf85670c46b1c61f805bde5fd1daf290ff))
+* require https for webhook URLs and redirect targets ([#78](https://github.com/m1sk9/chime/issues/78)) ([d36b0bf](https://github.com/m1sk9/chime/commit/d36b0bf619448d89d81a15f5e7a8189f22cecb2c))
+* send a reminder once when its time repeats on a DST fall-back ([#74](https://github.com/m1sk9/chime/issues/74)) ([91989fd](https://github.com/m1sk9/chime/commit/91989fdaf10585516548e18311cfc31da87f076e))
+* shut down on SIGTERM even while a tick is running ([#79](https://github.com/m1sk9/chime/issues/79)) ([eaf2055](https://github.com/m1sk9/chime/commit/eaf2055e60d629201fe6232d97e8b1456d5669cf))
+* stop re-posting status incidents that share an id ([#82](https://github.com/m1sk9/chime/issues/82)) ([6fdae04](https://github.com/m1sk9/chime/commit/6fdae043d2e0d09ce395391aa0ce0e0435e848f6))
+
+
+### Performance
+
+* render RSS entries only when they are new and streamline the polling loop ([#68](https://github.com/m1sk9/chime/issues/68)) ([0e08c19](https://github.com/m1sk9/chime/commit/0e08c19449695081d590ffea47da6af7d475b975))
+
+
+### Documentation
+
+* add VitePress documentation site at chime.m1sk9.dev ([#71](https://github.com/m1sk9/chime/issues/71)) ([02bd382](https://github.com/m1sk9/chime/commit/02bd3820d0f513707bdceb2386d702b6989eda55))
+* slim the README and point to the docs site and llms.txt ([774d018](https://github.com/m1sk9/chime/commit/774d018f39707ad9920180aef60f6f8d72c32295))
+
+
+### Miscellaneous
+
+* **deps:** update dependency wrangler to v4.151.1 ([#72](https://github.com/m1sk9/chime/issues/72)) ([a480dc9](https://github.com/m1sk9/chime/commit/a480dc93adfc818c627207052a99dab3b80e7d2c))
+* **deps:** update docker/dockerfile docker tag to v1.28 ([#62](https://github.com/m1sk9/chime/issues/62)) ([6daf786](https://github.com/m1sk9/chime/commit/6daf78634b5b1caf05c25f82addaa7e727202aed))
+* **deps:** update rust crate serde_json to v1.0.152 ([#64](https://github.com/m1sk9/chime/issues/64)) ([975ab3c](https://github.com/m1sk9/chime/commit/975ab3c623960cc55ee8eb3572ef29d34ebb6694))
+* **deps:** update rust crate serde_json to v1.0.154 ([#65](https://github.com/m1sk9/chime/issues/65)) ([562b8e2](https://github.com/m1sk9/chime/commit/562b8e2a3ea1f6e6d482fb71607e58f2e27c776f))
+* **deps:** update rust crate tokio to v1.53.2 ([#59](https://github.com/m1sk9/chime/issues/59)) ([2f942f5](https://github.com/m1sk9/chime/commit/2f942f57b5d061bf7be2b19a3eecd9edaa3bd4c6))
+* **deps:** update rust crate tokio to v1.53.3 ([#66](https://github.com/m1sk9/chime/issues/66)) ([b315c05](https://github.com/m1sk9/chime/commit/b315c050715a5fc3898de895653f522c6f74f7f6))
+* **deps:** update rust crate toml to v1.1.7 ([#61](https://github.com/m1sk9/chime/issues/61)) ([bf83c07](https://github.com/m1sk9/chime/commit/bf83c07dd8c76d97bd33099b934d430a444896f7))
+* **deps:** update rust crate toml to v1.1.8 ([#63](https://github.com/m1sk9/chime/issues/63)) ([2662a98](https://github.com/m1sk9/chime/commit/2662a98f19b6f158898789b23c99ac8848a19056))
+* **deps:** update taiki-e/install-action digest to 8cca091 ([#58](https://github.com/m1sk9/chime/issues/58)) ([6c96e64](https://github.com/m1sk9/chime/commit/6c96e6459dcdab97992e92f6725ada9c53ad982e))
+* list perf and docs commits in the changelog ([#85](https://github.com/m1sk9/chime/issues/85)) ([9b6b9aa](https://github.com/m1sk9/chime/commit/9b6b9aa181e0aae2bd16c5902409c30c16c63bd8))
+
+
+### CI
+
+* drop the unused cross install and build the image on PRs ([#84](https://github.com/m1sk9/chime/issues/84)) ([fcd6518](https://github.com/m1sk9/chime/commit/fcd651879335fabcb0bb5f8b765c6208517fa1a8))
+
 ## [0.6.0](https://github.com/m1sk9/chime/compare/chime-v0.5.0...chime-v0.6.0) (2026-09-27)
 
 
