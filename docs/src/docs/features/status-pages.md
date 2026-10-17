@@ -62,7 +62,7 @@ mapping = { incidents = "/incidents", id = "/id", title = "/title", status = "/s
 
 Every key but `incidents` is a pointer **into one incident**, so `/id` reads the `id` of each element and `/meta/0/id` reaches deeper. Values must be strings or integers, as for a [`json` watch](./watches#json). An incident is reported again whenever its `updated_at` changes; without `updated_at`, whenever its `status` changes; without either, only when it first appears. Without `updated_at` the embed is timed when chime saw the change. Each incident is one update: an array of updates nested inside an incident is not read.
 
-A mapping that does not fit the document — an `id` or `title` that is missing or empty, a value that is an object or a fractional number, an `incidents` pointer that is not an array, an `updated_at` that is not RFC 3339 — fails the whole poll with a `warn` rather than skipping the incident, so a mistake in the mapping is visible on every poll instead of silently dropping incidents. A field that is absent, `null` or empty in one incident is just absent.
+A mapping that does not fit the document — an `id` or `title` that is missing or empty, a value that is an object or a fractional number, an `incidents` pointer that is not an array, an `updated_at` that is not RFC 3339 — fails the whole poll with a `warn` rather than skipping the incident, so a mistake in the mapping is visible on every poll instead of silently dropping incidents. A field that is absent, `null` or empty in one incident is just absent. The `id` must be unique per incident: when several incidents share one, only the first in the document is tracked.
 
 ## Notification semantics
 
