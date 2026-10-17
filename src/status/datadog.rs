@@ -245,6 +245,17 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_component_status_does_not_count_toward_impact() {
+        assert_eq!(component_impact("melting"), None);
+        let decoded = decode(
+            br#"{"incidents":[{"id":"i","title":"t","timeline":[{"id":"a","createdAt":"2026-06-29T14:00:00Z","componentsAffected":[{"name":"API","status":"melting"},{"name":"Web","status":"degraded"}]}]}]}"#,
+            &page_url(),
+        )
+        .unwrap();
+        assert_eq!(decoded[0].impact, Some(Impact::Minor));
+    }
+
+    #[test]
     fn maintenances_are_ignored() {
         assert_eq!(incidents().len(), 1);
     }

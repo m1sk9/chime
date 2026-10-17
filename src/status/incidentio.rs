@@ -187,6 +187,8 @@ Between 13:00 and 15:08 UTC there were periods of increased latency from some Mi
     fn affected_components_become_component_names_without_their_status() {
         assert_eq!(incidents()[0].components, ["Slack app"]);
         assert_eq!(incidents()[1].components, ["Microsoft Teams app"]);
+        assert_eq!(component_name("Slack app"), "Slack app");
+        assert_eq!(component_name("API (EU) beta"), "API (EU) beta");
     }
 
     #[test]

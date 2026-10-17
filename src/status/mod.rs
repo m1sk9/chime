@@ -768,6 +768,72 @@ mod tests {
     }
 
     #[test]
+    fn decoder_hands_the_body_to_its_provider() {
+        let page_url = Url::parse("https://x.example/status").unwrap();
+        let api_url = Url::parse("https://x.example/status/feed.atom").unwrap();
+        let now = ts("2026-10-17T14:00:00Z");
+        let mapping: CustomMapping = toml::from_str(
+            r#"id = "/id"
+title = "/name""#,
+        )
+        .unwrap();
+        for (decoder, body) in [
+            (
+                Decoder::Statuspage,
+                r#"{"incidents":[{"id":"i","name":"Down"}]}"#,
+            ),
+            (
+                Decoder::Instatus,
+                r#"{"page":{"status":"HASISSUES"},"activeIncidents":[{"id":"i","name":"Down"}]}"#,
+            ),
+            (
+                Decoder::IncidentIo,
+                r#"<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><id>i</id><title>Down</title></entry></feed>"#,
+            ),
+            (
+                Decoder::Datadog,
+                r#"{"incidents":[{"id":"i","title":"Down"}]}"#,
+            ),
+            (Decoder::Custom(mapping), r#"[{"id":"i","name":"Down"}]"#),
+        ] {
+            let incidents = decoder
+                .decode(body.as_bytes(), &page_url, &api_url, now)
+                .unwrap_or_else(|e| panic!("{}: {e}", decoder.label()));
+            assert_eq!(incidents.len(), 1, "{}", decoder.label());
+            assert_eq!(incidents[0].name, "Down", "{}", decoder.label());
+        }
+    }
+
+    #[test]
+    fn decode_error_names_the_provider() {
+        let url = Url::parse("https://x.example").unwrap();
+        let now = ts("2026-10-17T14:00:00Z");
+        let mapping: CustomMapping = toml::from_str(
+            r#"id = "/id"
+title = "/name""#,
+        )
+        .unwrap();
+        for (decoder, label) in [
+            (Decoder::Statuspage, "Atlassian Statuspage"),
+            (Decoder::Instatus, "Instatus"),
+            (Decoder::IncidentIo, "incident.io"),
+            (Decoder::Datadog, "Datadog Status Pages"),
+            (Decoder::Custom(mapping), "custom JSON"),
+        ] {
+            let source = decoder.decode(b"<html>", &url, &url, now).unwrap_err();
+            let err = StatusError::Decode {
+                kind: decoder.label(),
+                source,
+            };
+            assert!(
+                err.to_string()
+                    .starts_with(&format!("response does not decode as {label}: ")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
     fn state_names_match_case_insensitively() {
         assert_eq!(
             IncidentState::from_wire("RESOLVED"),
