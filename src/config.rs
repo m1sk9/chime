@@ -384,7 +384,7 @@ fn parse_https(s: &str) -> Result<Url, HttpsUrlError> {
 }
 
 /// Any https URL, kept verbatim: avatars, watch sources, watch links and status
-/// pages. Why not normalize a trailing `/` here for `Url::join`: that would turn
+/// pages. Why not normalize a trailing `/` here: that would turn
 /// `https://x/api/v.json` into `.../v.json/`, so it is done where a path is joined
 /// (`status::join_base`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

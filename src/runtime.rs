@@ -41,12 +41,6 @@ pub enum ResolveError {
         #[source]
         source: WebhookError,
     },
-    #[error("status page `{name}`: cannot resolve source: {source}")]
-    StatusPageSource {
-        name: String,
-        #[source]
-        source: url::ParseError,
-    },
     #[error("watch `{name}`: cannot build source url: {source}")]
     WatchUrl {
         name: String,
@@ -212,13 +206,7 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
     for p in cfg.status_pages {
         let name = p.name.as_str().to_string();
         let webhook_url = webhook_for("status page", &name, &p.webhook, p.thread_id.as_ref())?;
-        let spec =
-            crate::status::resolve_source(&p.provider, p.url.as_url()).map_err(|source| {
-                ResolveError::StatusPageSource {
-                    name: name.clone(),
-                    source,
-                }
-            })?;
+        let spec = crate::status::resolve_source(&p.provider, p.url.as_url());
         let identity = Identity::resolve(p.display_name, &name, p.avatar_url);
         let url = p.url.as_url().clone();
         status_pages.push(RunStatusPage {
