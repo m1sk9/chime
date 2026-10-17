@@ -289,7 +289,14 @@ pub fn diff(state: &mut PageState, incidents: &[Incident], min_impact: Impact) -
     state.initialized = true;
 
     let mut events = Vec::new();
+    let mut handled: HashSet<&str> = HashSet::new();
     for incident in incidents {
+        // Only the first incident with a given id counts. A repeated id (a `custom`
+        // mapping whose `id` pointer is not unique) would otherwise overwrite the
+        // record with each copy's update in turn and report both on every poll.
+        if !handled.insert(incident.id.as_str()) {
+            continue;
+        }
         let Some(latest) = incident.updates.iter().max_by_key(|u| u.created_at) else {
             continue;
         };
@@ -617,6 +624,33 @@ mod tests {
         let events = diff(&mut state, &next, Impact::None);
         assert_eq!(events[0].incident_id, "early");
         assert_eq!(events[1].incident_id, "late");
+    }
+
+    #[test]
+    fn a_repeated_incident_id_is_reported_once_and_not_on_every_poll() {
+        let feed = vec![
+            mk_incident(
+                "dup",
+                Impact::Major,
+                vec![mk_update("u1", "investigating", "2026-06-01T00:00:00Z")],
+            ),
+            mk_incident(
+                "dup",
+                Impact::Major,
+                vec![mk_update("u2", "investigating", "2026-06-01T00:05:00Z")],
+            ),
+        ];
+        let mut state = baselined(&feed);
+        assert!(diff(&mut state, &feed, Impact::None).is_empty());
+
+        let mut next = feed.clone();
+        next[0]
+            .updates
+            .push(mk_update("u3", "identified", "2026-06-01T00:10:00Z"));
+        let events = diff(&mut state, &next, Impact::None);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].body, "body of u3");
+        assert!(diff(&mut state, &next, Impact::None).is_empty());
     }
 
     #[test]
