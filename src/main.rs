@@ -22,7 +22,7 @@ use crate::notifier::Discord;
 use crate::rss::FeedEndpoint;
 use crate::runtime::resolve;
 use crate::scheduler::Scheduler;
-use crate::status::Statuspage;
+use crate::status::StatusEndpoint;
 use crate::watch::JsonEndpoint;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/chime/config.toml";
@@ -119,7 +119,7 @@ async fn run_daemon() -> Result<()> {
     let notifier = Discord::new(client.clone());
     let watch_source = JsonEndpoint::new(client.clone());
     let rss_source = FeedEndpoint::new(client.clone());
-    let source = Statuspage::new(client);
+    let source = StatusEndpoint::new(client);
     let scheduler = Scheduler::new(run_cfg, notifier, source, watch_source, rss_source);
     scheduler
         .run()

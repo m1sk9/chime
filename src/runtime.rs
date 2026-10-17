@@ -6,10 +6,10 @@ use chrono_tz::Tz;
 use url::Url;
 
 use crate::config::{
-    Config, Impact, LogLevel, Message, Schedule, ScheduleError, TimeOfDay, WebhookRef,
+    Config, Impact, LogLevel, Message, Schedule, ScheduleError, ThreadId, TimeOfDay, WebhookRef,
 };
 use crate::heartbeat::heartbeat_path;
-use crate::status::INCIDENTS_PATH;
+use crate::status::{Decoder, SourceError};
 use crate::watch::{Extractor, resolve_source};
 
 #[derive(Debug, thiserror::Error)]
@@ -48,11 +48,11 @@ pub enum ResolveError {
         #[source]
         source: WebhookError,
     },
-    #[error("status page `{name}`: cannot build API url: {source}")]
-    StatusPageUrl {
+    #[error("status page `{name}`: cannot resolve source: {source}")]
+    StatusPageSource {
         name: String,
         #[source]
-        source: url::ParseError,
+        source: SourceError,
     },
     #[error("watch `{name}`: {source}")]
     WatchWebhook {
@@ -95,12 +95,16 @@ impl RunReminder {
     }
 }
 
-/// A status page with everything already resolved: the API endpoint is built, the
-/// webhook URL is read from the environment, and the Discord identity is settled.
+/// A status page with everything already resolved: the fetched URL and its decoder
+/// are chosen, the webhook URL is read from the environment, and the Discord
+/// identity is settled.
 #[derive(Debug, Clone)]
 pub struct RunStatusPage {
     pub name: String,
+    /// The configured page URL, verbatim. Datadog builds incident links from it.
+    pub url: Url,
     pub api_url: Url,
+    pub decoder: Decoder,
     /// Shown in the embed footer, e.g. `status.claude.com`.
     pub host: String,
     pub webhook_url: Url,
@@ -192,9 +196,11 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
             name: name.clone(),
             source,
         })?;
-        let webhook_url = resolve_webhook(&r.webhook).map_err(|source| ResolveError::Webhook {
-            name: name.clone(),
-            source,
+        let webhook_url = resolve_webhook(&r.webhook, r.thread_id.as_ref()).map_err(|source| {
+            ResolveError::Webhook {
+                name: name.clone(),
+                source,
+            }
         })?;
         reminders.push(RunReminder {
             name,
@@ -207,27 +213,28 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
     let mut status_pages = Vec::with_capacity(cfg.status_pages.len());
     for p in cfg.status_pages {
         let name = p.name.as_str().to_string();
-        let webhook_url =
-            resolve_webhook(&p.webhook).map_err(|source| ResolveError::StatusPageWebhook {
+        let webhook_url = resolve_webhook(&p.webhook, p.thread_id.as_ref()).map_err(|source| {
+            ResolveError::StatusPageWebhook {
+                name: name.clone(),
+                source,
+            }
+        })?;
+        let spec = crate::status::resolve_source(p.kind, p.url.as_url(), p.mapping.as_ref())
+            .map_err(|source| ResolveError::StatusPageSource {
                 name: name.clone(),
                 source,
             })?;
-        let api_url =
-            p.url
-                .as_url()
-                .join(INCIDENTS_PATH)
-                .map_err(|source| ResolveError::StatusPageUrl {
-                    name: name.clone(),
-                    source,
-                })?;
         let display_name = p
             .display_name
             .map(|d| d.as_str().to_string())
             .unwrap_or_else(|| name.clone());
+        let url = p.url.as_url().clone();
         status_pages.push(RunStatusPage {
-            host: p.url.host().to_string(),
+            host: url.host_str().unwrap_or_default().to_string(),
             name,
-            api_url,
+            url,
+            api_url: spec.api_url,
+            decoder: spec.decoder,
             webhook_url,
             poll_interval: p.poll_interval_sec.as_duration(),
             min_impact: p.min_impact,
@@ -238,11 +245,12 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
     let mut feeds: Vec<RunFeed> = Vec::new();
     for w in cfg.watches {
         let name = w.name.as_str().to_string();
-        let webhook_url =
-            resolve_webhook(&w.webhook).map_err(|source| ResolveError::WatchWebhook {
+        let webhook_url = resolve_webhook(&w.webhook, w.thread_id.as_ref()).map_err(|source| {
+            ResolveError::WatchWebhook {
                 name: name.clone(),
                 source,
-            })?;
+            }
+        })?;
         let spec = resolve_source(&name, &w.source).map_err(|source| ResolveError::WatchUrl {
             name: name.clone(),
             source,
@@ -279,11 +287,12 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
     let mut rss = Vec::with_capacity(cfg.rss.len());
     for r in cfg.rss {
         let name = r.name.as_str().to_string();
-        let webhook_url =
-            resolve_webhook(&r.webhook).map_err(|source| ResolveError::RssWebhook {
+        let webhook_url = resolve_webhook(&r.webhook, r.thread_id.as_ref()).map_err(|source| {
+            ResolveError::RssWebhook {
                 name: name.clone(),
                 source,
-            })?;
+            }
+        })?;
         // Why not the feed's own `<title>`: it is unknown until the first fetch and
         // can change without notice, so the sender name would depend on the network.
         let display_name = r
@@ -318,7 +327,10 @@ fn take_string(m: Message) -> String {
     m.as_str().to_string()
 }
 
-fn resolve_webhook(reference: &WebhookRef) -> Result<Url, WebhookError> {
+fn resolve_webhook(
+    reference: &WebhookRef,
+    thread_id: Option<&ThreadId>,
+) -> Result<Url, WebhookError> {
     let key = reference.env_key();
     let file_key = format!("{key}_FILE");
     let raw = match std::env::var(&file_key) {
@@ -331,7 +343,22 @@ fn resolve_webhook(reference: &WebhookRef) -> Result<Url, WebhookError> {
     if trimmed.is_empty() {
         return Err(WebhookError::Empty);
     }
-    Ok(Url::parse(trimmed)?)
+    let mut url = Url::parse(trimmed)?;
+    if let Some(id) = thread_id {
+        // Why replace rather than append: one webhook name may serve entries that
+        // post to different threads, so the entry's `thread_id` has to win over one
+        // baked into the env URL instead of sending both to Discord.
+        let kept: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(k, _)| k != "thread_id")
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        url.query_pairs_mut()
+            .clear()
+            .extend_pairs(kept)
+            .append_pair("thread_id", id.as_str());
+    }
+    Ok(url)
 }
 
 #[cfg(test)]
@@ -377,8 +404,13 @@ mod test_support {
     pub(crate) fn mk_run_status_page(name: &str, poll_interval: Duration) -> RunStatusPage {
         RunStatusPage {
             name: name.to_string(),
-            api_url: Url::parse(&format!("https://status.{name}.example/{INCIDENTS_PATH}"))
-                .unwrap(),
+            url: Url::parse(&format!("https://status.{name}.example")).unwrap(),
+            api_url: Url::parse(&format!(
+                "https://status.{name}.example/{}",
+                crate::status::STATUSPAGE_PATH
+            ))
+            .unwrap(),
+            decoder: Decoder::Statuspage,
             host: format!("status.{name}.example"),
             webhook_url: Url::parse("https://discord.example/webhook").unwrap(),
             poll_interval,
@@ -595,6 +627,112 @@ webhook = "status-team"
         // `display_name` falls back to the logical name so a message is never anonymous.
         assert_eq!(page.display_name, "claude");
         assert_eq!(page.poll_interval, Duration::from_secs(300));
+    }
+
+    /// `webhook` must be unique per test: tests run in parallel, and one guard's
+    /// `Drop` would unset the variable under another test.
+    fn resolve_page(webhook: &str, page: &str) -> RunStatusPage {
+        let key = WebhookRef::try_from(webhook.to_string()).unwrap().env_key();
+        let _g = EnvGuard::set(&key, "https://example.com/hook");
+        let toml = format!(
+            "[system]\ntick_interval_sec = 30\ntimezone = \"Asia/Tokyo\"\n\n[[status_pages]]\nname = \"p\"\nwebhook = \"{webhook}\"\n{page}\n"
+        );
+        resolve(Config::from_toml(&toml).unwrap())
+            .unwrap()
+            .status_pages
+            .remove(0)
+    }
+
+    #[test]
+    fn status_page_api_url_per_kind() {
+        for (kind, url, api_url, decoder) in [
+            (
+                "statuspage",
+                "https://status.claude.com",
+                "https://status.claude.com/api/v2/incidents.json",
+                Decoder::Statuspage,
+            ),
+            (
+                "instatus",
+                "https://instat.us",
+                "https://instat.us/v3/summary.json",
+                Decoder::Instatus,
+            ),
+            (
+                "incidentio",
+                "https://status.incident.io",
+                "https://status.incident.io/feed.atom",
+                Decoder::IncidentIo,
+            ),
+            (
+                "datadog",
+                "https://shopist.statuspage.datadoghq.com/",
+                "https://shopist.statuspage.datadoghq.com/config.json",
+                Decoder::Datadog,
+            ),
+        ] {
+            let page = resolve_page(
+                &format!("status-kind-{kind}"),
+                &format!("kind = \"{kind}\"\nurl = \"{url}\""),
+            );
+            assert_eq!(page.api_url.as_str(), api_url, "{kind}");
+            assert_eq!(page.decoder, decoder, "{kind}");
+        }
+    }
+
+    #[test]
+    fn status_page_url_with_path_keeps_the_path() {
+        let page = resolve_page("status-kind-path", "url = \"https://x.example/status\"");
+        assert_eq!(
+            page.api_url.as_str(),
+            "https://x.example/status/api/v2/incidents.json"
+        );
+        assert_eq!(page.url.as_str(), "https://x.example/status");
+        assert_eq!(page.host, "x.example");
+    }
+
+    #[test]
+    fn custom_page_url_is_used_verbatim() {
+        let page = resolve_page(
+            "status-kind-custom",
+            "kind = \"custom\"\nurl = \"https://x.example/api/incidents.json?limit=5\"\nmapping = { id = \"/id\", title = \"/title\" }",
+        );
+        assert_eq!(
+            page.api_url.as_str(),
+            "https://x.example/api/incidents.json?limit=5"
+        );
+        assert!(matches!(page.decoder, Decoder::Custom(_)));
+    }
+
+    #[test]
+    fn resolve_reports_a_custom_page_without_mapping_by_name() {
+        // `from_toml` rejects this first; clearing the field afterwards exercises
+        // `resolve`'s own defensive check, as for reminder schedules.
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[status_pages]]
+name = "mine"
+kind = "custom"
+url = "https://x.example/i.json"
+webhook = "status-kind-nomapping"
+mapping = { id = "/id", title = "/title" }
+"#;
+        let _g = EnvGuard::set(
+            "CHIME_WEBHOOK_STATUS_KIND_NOMAPPING",
+            "https://example.com/hook",
+        );
+        let mut cfg = Config::from_toml(toml).unwrap();
+        cfg.status_pages[0].mapping = None;
+        assert!(matches!(
+            resolve(cfg),
+            Err(ResolveError::StatusPageSource {
+                name,
+                source: SourceError::MissingMapping,
+            }) if name == "mine"
+        ));
     }
 
     #[test]
@@ -928,7 +1066,7 @@ webhook = "rss-nohook"
     fn resolve_webhook_reads_env() {
         let _g = EnvGuard::set("CHIME_WEBHOOK_TEST_DIRECT", "https://example.com/hook");
         let r = WebhookRef::try_from("test-direct".to_string()).unwrap();
-        let url = resolve_webhook(&r).unwrap();
+        let url = resolve_webhook(&r, None).unwrap();
         assert_eq!(url.as_str(), "https://example.com/hook");
     }
 
@@ -940,7 +1078,7 @@ webhook = "rss-nohook"
         let _g_file = EnvGuard::set("CHIME_WEBHOOK_TEST_FILE_FILE", path.to_str().unwrap());
         let _g_direct = EnvGuard::set("CHIME_WEBHOOK_TEST_FILE", "https://example.com/direct");
         let r = WebhookRef::try_from("test-file".to_string()).unwrap();
-        let url = resolve_webhook(&r).unwrap();
+        let url = resolve_webhook(&r, None).unwrap();
         assert_eq!(url.as_str(), "https://example.com/from-file");
         let _ = std::fs::remove_file(&path);
     }
@@ -950,21 +1088,149 @@ webhook = "rss-nohook"
         let r = WebhookRef::try_from("unset-name".to_string()).unwrap();
         let _g1 = EnvGuard::unset("CHIME_WEBHOOK_UNSET_NAME");
         let _g2 = EnvGuard::unset("CHIME_WEBHOOK_UNSET_NAME_FILE");
-        assert!(matches!(resolve_webhook(&r), Err(WebhookError::Missing(_))));
+        assert!(matches!(
+            resolve_webhook(&r, None),
+            Err(WebhookError::Missing(_))
+        ));
     }
 
     #[test]
     fn resolve_webhook_empty_errors() {
         let _g = EnvGuard::set("CHIME_WEBHOOK_TEST_EMPTY", "   ");
         let r = WebhookRef::try_from("test-empty".to_string()).unwrap();
-        assert!(matches!(resolve_webhook(&r), Err(WebhookError::Empty)));
+        assert!(matches!(
+            resolve_webhook(&r, None),
+            Err(WebhookError::Empty)
+        ));
+    }
+
+    #[test]
+    fn webhook_without_thread_id_is_untouched() {
+        let _g = EnvGuard::set(
+            "CHIME_WEBHOOK_TEST_NOTHREAD",
+            "https://example.com/hook?wait=true",
+        );
+        let r = WebhookRef::try_from("test-nothread".to_string()).unwrap();
+        let url = resolve_webhook(&r, None).unwrap();
+        assert_eq!(url.as_str(), "https://example.com/hook?wait=true");
+    }
+
+    #[test]
+    fn thread_id_is_appended_to_the_webhook_url() {
+        let _g = EnvGuard::set("CHIME_WEBHOOK_TEST_THREAD", "https://example.com/hook");
+        let r = WebhookRef::try_from("test-thread".to_string()).unwrap();
+        let id = ThreadId::try_from("123".to_string()).unwrap();
+        let url = resolve_webhook(&r, Some(&id)).unwrap();
+        assert_eq!(url.as_str(), "https://example.com/hook?thread_id=123");
+    }
+
+    #[test]
+    fn thread_id_keeps_other_query_params() {
+        let _g = EnvGuard::set(
+            "CHIME_WEBHOOK_TEST_THREAD_WAIT",
+            "https://example.com/hook?wait=true",
+        );
+        let r = WebhookRef::try_from("test-thread-wait".to_string()).unwrap();
+        let id = ThreadId::try_from("123".to_string()).unwrap();
+        let url = resolve_webhook(&r, Some(&id)).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://example.com/hook?wait=true&thread_id=123"
+        );
+    }
+
+    #[test]
+    fn thread_id_in_config_replaces_one_in_the_env_url() {
+        let _g = EnvGuard::set(
+            "CHIME_WEBHOOK_TEST_THREAD_DUP",
+            "https://example.com/hook?thread_id=999&wait=true",
+        );
+        let r = WebhookRef::try_from("test-thread-dup".to_string()).unwrap();
+        let id = ThreadId::try_from("123".to_string()).unwrap();
+        let url = resolve_webhook(&r, Some(&id)).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://example.com/hook?wait=true&thread_id=123"
+        );
+    }
+
+    #[test]
+    fn every_webhook_section_posts_to_its_thread() {
+        let _g = EnvGuard::set("CHIME_WEBHOOK_THREAD_ALL", "https://example.com/hook");
+        let toml = r#"
+[system]
+tick_interval_sec = 30
+timezone = "Asia/Tokyo"
+
+[[reminders]]
+name = "standup"
+time = "09:30"
+days = ["mon"]
+message = "hi"
+webhook = "thread-all"
+thread_id = "1"
+
+[[status_pages]]
+name = "claude"
+url = "https://status.claude.com"
+webhook = "thread-all"
+thread_id = "2"
+
+[[watches]]
+name = "ff"
+webhook = "thread-all"
+source = { kind = "firefox" }
+thread_id = "3"
+
+[[watches]]
+name = "ff-esr"
+webhook = "thread-all"
+source = { kind = "firefox", channel = "esr" }
+
+[[rss]]
+name = "changelog"
+url = "https://code.claude.com/docs/en/changelog/rss.xml"
+webhook = "thread-all"
+thread_id = "4"
+"#;
+        let run = resolve(Config::from_toml(toml).unwrap()).unwrap();
+        assert_eq!(
+            run.reminders[0].webhook_url.as_str(),
+            "https://example.com/hook?thread_id=1"
+        );
+        assert_eq!(
+            run.status_pages[0].webhook_url.as_str(),
+            "https://example.com/hook?thread_id=2"
+        );
+        let feed = &run.feeds[0];
+        assert_eq!(
+            feed.watches.len(),
+            2,
+            "one shared request for both channels"
+        );
+        assert_eq!(
+            feed.watches[0].webhook_url.as_str(),
+            "https://example.com/hook?thread_id=3"
+        );
+        assert_eq!(
+            feed.watches[1].webhook_url.as_str(),
+            "https://example.com/hook",
+            "a watch sharing the feed keeps its own destination"
+        );
+        assert_eq!(
+            run.rss[0].webhook_url.as_str(),
+            "https://example.com/hook?thread_id=4"
+        );
     }
 
     #[test]
     fn resolve_webhook_bad_url_errors() {
         let _g = EnvGuard::set("CHIME_WEBHOOK_TEST_BADURL", "not a url");
         let r = WebhookRef::try_from("test-badurl".to_string()).unwrap();
-        assert!(matches!(resolve_webhook(&r), Err(WebhookError::Url(_))));
+        assert!(matches!(
+            resolve_webhook(&r, None),
+            Err(WebhookError::Url(_))
+        ));
     }
 }
 

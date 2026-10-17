@@ -28,6 +28,10 @@ pub enum ConfigError {
         name: String,
         platform: &'static str,
     },
+    #[error("status page `{0}`: kind `custom` requires `mapping`")]
+    CustomMappingMissing(String),
+    #[error("status page `{0}`: `mapping` is only allowed with kind `custom`")]
+    MappingNotCustom(String),
     #[error("reminder `{name}`: {source}")]
     Schedule {
         name: String,
@@ -96,6 +100,12 @@ pub enum HttpsUrlError {
 pub enum JsonPointerError {
     #[error("pointer must start with `/` (RFC 6901), got {0:?}")]
     NotAbsolute(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ThreadIdError {
+    #[error("thread_id must be a Discord snowflake (non-zero digits within 64 bits), got {0:?}")]
+    NotSnowflake(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -265,6 +275,36 @@ impl WebhookRef {
     }
 }
 
+/// A Discord thread inside the webhook's channel.
+///
+/// Why a string, not an integer: a snowflake is a `u64` and a TOML integer is an
+/// `i64`, and Discord itself carries snowflakes as JSON strings. A quoted value
+/// keeps overflow out of the config type altogether.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct ThreadId(String);
+
+impl ThreadId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ThreadId {
+    type Error = ThreadIdError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        let trimmed = s.trim();
+        // Why the digit check on top of `parse`: `u64::from_str` also accepts a
+        // leading `+`, which Discord would reject.
+        let is_snowflake = trimmed.bytes().all(|b| b.is_ascii_digit())
+            && trimmed.parse::<u64>().is_ok_and(|n| n != 0);
+        if !is_snowflake {
+            return Err(ThreadIdError::NotSnowflake(s));
+        }
+        Ok(ThreadId(trimmed.to_string()))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "i64")]
 pub struct TickInterval(Duration);
@@ -337,38 +377,10 @@ fn parse_https(s: &str) -> Result<Url, HttpsUrlError> {
     Ok(url)
 }
 
-/// Base URL of an Atlassian Statuspage instance.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "String")]
-pub struct StatusUrl(Url);
-
-impl StatusUrl {
-    pub fn as_url(&self) -> &Url {
-        &self.0
-    }
-
-    pub fn host(&self) -> &str {
-        self.0.host_str().unwrap_or_default()
-    }
-}
-
-impl TryFrom<String> for StatusUrl {
-    type Error = HttpsUrlError;
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        let mut url = parse_https(&s)?;
-        // `Url::join` replaces the final path segment unless the base path ends in
-        // `/`, so normalize once here instead of guessing at every call site.
-        if !url.path().ends_with('/') {
-            let path = format!("{}/", url.path());
-            url.set_path(&path);
-        }
-        Ok(StatusUrl(url))
-    }
-}
-
-/// Any https URL, kept verbatim: avatars, watch sources and watch links. Why not
-/// `StatusUrl`: that type appends a trailing `/` for `Url::join`, which would turn
-/// `https://x/api/v.json` into `.../v.json/`.
+/// Any https URL, kept verbatim: avatars, watch sources, watch links and status
+/// pages. Why not normalize a trailing `/` here for `Url::join`: that would turn
+/// `https://x/api/v.json` into `.../v.json/`, so it is done where a path is joined
+/// (`status::join_base`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub struct HttpsUrl(Url);
@@ -469,6 +481,7 @@ pub struct Reminder {
     pub day_of_month: Option<DayOfMonthSet>,
     pub message: Message,
     pub webhook: WebhookRef,
+    pub thread_id: Option<ThreadId>,
 }
 
 impl Reminder {
@@ -486,14 +499,49 @@ fn default_poll_interval() -> PollInterval {
     PollInterval(Duration::from_secs(300))
 }
 
-/// An Atlassian Statuspage instance to watch. Incidents are pulled from its public
-/// `/api/v2/incidents.json`; chime never receives an inbound webhook.
+/// Which status page software serves `url`, and so which document is fetched.
+// Why a flat unit enum rather than a nested `source` table like `WatchKind`: a unit
+// variant needs no `flatten`, so `deny_unknown_fields` still holds, and existing
+// configs keep their top-level `url` unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StatusKind {
+    #[default]
+    Statuspage,
+    Instatus,
+    Incidentio,
+    Datadog,
+    Custom,
+}
+
+/// Where the fields of a `custom` status page live. `incidents` addresses the
+/// incident array in the document; every other pointer is relative to one element.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomMapping {
+    /// Absent means the document itself is the array.
+    pub incidents: Option<JsonPointer>,
+    pub id: JsonPointer,
+    pub title: JsonPointer,
+    pub status: Option<JsonPointer>,
+    pub body: Option<JsonPointer>,
+    pub updated_at: Option<JsonPointer>,
+    pub link: Option<JsonPointer>,
+    pub impact: Option<JsonPointer>,
+}
+
+/// A status page to watch. Incidents are pulled from a public document chosen by
+/// `kind`; chime never receives an inbound webhook.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatusPage {
     pub name: StatusPageName,
-    pub url: StatusUrl,
+    #[serde(default)]
+    pub kind: StatusKind,
+    pub url: HttpsUrl,
+    pub mapping: Option<CustomMapping>,
     pub webhook: WebhookRef,
+    pub thread_id: Option<ThreadId>,
     #[serde(default = "default_poll_interval")]
     pub poll_interval_sec: PollInterval,
     #[serde(default)]
@@ -647,6 +695,7 @@ fn default_watch_poll_interval() -> PollInterval {
 pub struct Watch {
     pub name: WatchName,
     pub webhook: WebhookRef,
+    pub thread_id: Option<ThreadId>,
     pub source: WatchKind,
     #[serde(default = "default_watch_poll_interval")]
     pub poll_interval_sec: PollInterval,
@@ -666,6 +715,7 @@ pub struct Rss {
     pub name: RssName,
     pub url: HttpsUrl,
     pub webhook: WebhookRef,
+    pub thread_id: Option<ThreadId>,
     #[serde(default = "default_rss_poll_interval")]
     pub poll_interval_sec: PollInterval,
     pub display_name: Option<DisplayName>,
@@ -712,6 +762,17 @@ impl Config {
                 return Err(ConfigError::DuplicateStatusPageName(
                     p.name.as_str().to_string(),
                 ));
+            }
+            match (p.kind, &p.mapping) {
+                (StatusKind::Custom, None) => {
+                    return Err(ConfigError::CustomMappingMissing(
+                        p.name.as_str().to_string(),
+                    ));
+                }
+                (kind, Some(_)) if kind != StatusKind::Custom => {
+                    return Err(ConfigError::MappingNotCustom(p.name.as_str().to_string()));
+                }
+                _ => {}
             }
         }
         let mut seen_watches = HashSet::new();
@@ -1073,32 +1134,23 @@ webhook = "team"
     }
 
     #[test]
-    fn status_url_requires_https_and_host() {
-        assert!(matches!(
-            StatusUrl::try_from("http://status.claude.com".to_string()),
-            Err(HttpsUrlError::Scheme(_))
+    fn status_page_url_requires_https_and_is_kept_verbatim() {
+        let r = Config::from_toml(&format!(
+            "{SYSTEM}[[status_pages]]\nname = \"x\"\nurl = \"http://status.claude.com\"\nwebhook = \"team\"\n"
         ));
-        assert!(matches!(
-            StatusUrl::try_from("ftp://status.claude.com".to_string()),
-            Err(HttpsUrlError::Scheme(_))
-        ));
-        assert!(StatusUrl::try_from("not a url".to_string()).is_err());
-    }
+        assert!(matches!(r, Err(ConfigError::Toml(_))));
 
-    #[test]
-    fn status_url_normalizes_trailing_slash_for_join() {
-        // Without the trailing slash, `join` would drop the final path segment.
-        let u = StatusUrl::try_from("https://example.com/status".to_string()).unwrap();
-        assert_eq!(
-            u.as_url().join("api/v2/incidents.json").unwrap().as_str(),
-            "https://example.com/status/api/v2/incidents.json"
+        // The trailing `/` that `Url::join` needs is added per kind at resolve time,
+        // so a `custom` URL naming a file is not turned into a directory.
+        let page = first_status_page(
+            r#"
+[[status_pages]]
+name = "x"
+url = "https://example.com/status"
+webhook = "team"
+"#,
         );
-        let u = StatusUrl::try_from("https://status.claude.com".to_string()).unwrap();
-        assert_eq!(
-            u.as_url().join("api/v2/incidents.json").unwrap().as_str(),
-            "https://status.claude.com/api/v2/incidents.json"
-        );
-        assert_eq!(u.host(), "status.claude.com");
+        assert_eq!(page.url.as_url().as_str(), "https://example.com/status");
     }
 
     #[test]
@@ -1503,10 +1555,16 @@ min_impact = "major"
 
     #[test]
     fn json_watch_url_requires_https_and_is_not_slash_normalized() {
-        assert!(matches!(
-            HttpsUrl::try_from("http://x.example/api/v.json".to_string()),
-            Err(HttpsUrlError::Scheme(_))
-        ));
+        for bad in ["http://x.example/api/v.json", "ftp://x.example/v.json"] {
+            assert!(
+                matches!(
+                    HttpsUrl::try_from(bad.to_string()),
+                    Err(HttpsUrlError::Scheme(_))
+                ),
+                "{bad}"
+            );
+        }
+        assert!(HttpsUrl::try_from("not a url".to_string()).is_err());
         let w = first_watch(
             r#"
 [[watches]]
@@ -1761,5 +1819,194 @@ webhook = "team"
         .unwrap();
         assert_eq!(cfg.watches.len(), 1);
         assert_eq!(cfg.rss.len(), 1);
+    }
+
+    #[test]
+    fn thread_id_accepts_a_digit_string() {
+        let id = ThreadId::try_from(" 1234567890123456789 ".to_string()).unwrap();
+        assert_eq!(id.as_str(), "1234567890123456789");
+    }
+
+    #[test]
+    fn thread_id_rejects_empty_and_non_digits() {
+        for bad in ["", " ", "abc", "12 34", "-1", "+1", "12a"] {
+            assert!(
+                matches!(
+                    ThreadId::try_from(bad.to_string()),
+                    Err(ThreadIdError::NotSnowflake(_))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thread_id_rejects_zero_and_values_beyond_u64() {
+        for bad in [
+            "0",
+            "18446744073709551616",
+            "123456789012345678901234567890",
+        ] {
+            assert!(
+                matches!(
+                    ThreadId::try_from(bad.to_string()),
+                    Err(ThreadIdError::NotSnowflake(_))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thread_id_as_toml_integer_is_rejected() {
+        let r = Config::from_toml(&format!(
+            "{SYSTEM}[[rss]]\nname = \"a\"\nurl = \"https://a.example/rss.xml\"\nwebhook = \"team\"\nthread_id = 1234\n"
+        ));
+        assert!(matches!(r, Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn every_webhook_section_accepts_thread_id() {
+        let cfg = Config::from_toml(&format!(
+            r#"{SYSTEM}
+[[reminders]]
+name = "standup"
+time = "09:30"
+days = ["mon"]
+message = "Standup!"
+webhook = "team"
+thread_id = "1"
+
+[[status_pages]]
+name = "claude"
+url = "https://status.claude.com"
+webhook = "team"
+thread_id = "2"
+
+[[watches]]
+name = "firefox"
+webhook = "team"
+source = {{ kind = "firefox" }}
+thread_id = "3"
+
+[[rss]]
+name = "changelog"
+url = "https://example.com/rss.xml"
+webhook = "team"
+thread_id = "4"
+"#
+        ))
+        .unwrap();
+        let ids = [
+            cfg.reminders[0].thread_id.as_ref(),
+            cfg.status_pages[0].thread_id.as_ref(),
+            cfg.watches[0].thread_id.as_ref(),
+            cfg.rss[0].thread_id.as_ref(),
+        ]
+        .map(|t| t.map(ThreadId::as_str));
+        assert_eq!(ids, [Some("1"), Some("2"), Some("3"), Some("4")]);
+    }
+
+    fn first_status_page(body: &str) -> StatusPage {
+        Config::from_toml(&format!("{SYSTEM}{body}"))
+            .unwrap()
+            .status_pages
+            .remove(0)
+    }
+
+    const MAPPING: &str = r#"mapping = { incidents = "/incidents", id = "/id", title = "/title" }"#;
+
+    #[test]
+    fn status_page_kind_defaults_to_statuspage() {
+        let page = first_status_page(
+            r#"
+[[status_pages]]
+name = "claude"
+url = "https://status.claude.com"
+webhook = "team"
+"#,
+        );
+        assert_eq!(page.kind, StatusKind::Statuspage);
+        assert!(page.mapping.is_none());
+    }
+
+    #[test]
+    fn status_page_accepts_each_kind() {
+        for (name, kind) in [
+            ("statuspage", StatusKind::Statuspage),
+            ("instatus", StatusKind::Instatus),
+            ("incidentio", StatusKind::Incidentio),
+            ("datadog", StatusKind::Datadog),
+        ] {
+            let page = first_status_page(&format!(
+                "[[status_pages]]\nname = \"x\"\nkind = \"{name}\"\nurl = \"https://x.example\"\nwebhook = \"team\"\n"
+            ));
+            assert_eq!(page.kind, kind, "{name}");
+        }
+        let page = first_status_page(&format!(
+            "[[status_pages]]\nname = \"x\"\nkind = \"custom\"\nurl = \"https://x.example/i.json\"\nwebhook = \"team\"\n{MAPPING}\n"
+        ));
+        assert_eq!(page.kind, StatusKind::Custom);
+        let mapping = page.mapping.unwrap();
+        assert_eq!(mapping.incidents.unwrap().as_str(), "/incidents");
+        assert_eq!(mapping.id.as_str(), "/id");
+        assert!(mapping.status.is_none());
+    }
+
+    #[test]
+    fn status_page_rejects_unknown_kind() {
+        for kind in ["uptimerobot", "Statuspage", "incident.io"] {
+            let r = Config::from_toml(&format!(
+                "{SYSTEM}[[status_pages]]\nname = \"x\"\nkind = \"{kind}\"\nurl = \"https://x.example\"\nwebhook = \"team\"\n"
+            ));
+            assert!(matches!(r, Err(ConfigError::Toml(_))), "{kind}");
+        }
+    }
+
+    #[test]
+    fn custom_status_page_requires_mapping() {
+        let r = Config::from_toml(&format!(
+            "{SYSTEM}[[status_pages]]\nname = \"mine\"\nkind = \"custom\"\nurl = \"https://x.example/i.json\"\nwebhook = \"team\"\n"
+        ));
+        assert!(matches!(r, Err(ConfigError::CustomMappingMissing(n)) if n == "mine"));
+    }
+
+    #[test]
+    fn mapping_is_rejected_on_non_custom_page() {
+        for kind in ["", "kind = \"datadog\"\n"] {
+            let r = Config::from_toml(&format!(
+                "{SYSTEM}[[status_pages]]\nname = \"mine\"\n{kind}url = \"https://x.example\"\nwebhook = \"team\"\n{MAPPING}\n"
+            ));
+            assert!(
+                matches!(&r, Err(ConfigError::MappingNotCustom(n)) if n == "mine"),
+                "{kind:?}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mapping_rejects_unknown_key() {
+        let r = Config::from_toml(&format!(
+            "{SYSTEM}[[status_pages]]\nname = \"x\"\nkind = \"custom\"\nurl = \"https://x.example/i.json\"\nwebhook = \"team\"\nmapping = {{ id = \"/id\", title = \"/t\", severity = \"/s\" }}\n"
+        ));
+        assert!(matches!(r, Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn mapping_requires_id_and_title() {
+        for mapping in [r#"{ id = "/id" }"#, r#"{ title = "/t" }"#] {
+            let r = Config::from_toml(&format!(
+                "{SYSTEM}[[status_pages]]\nname = \"x\"\nkind = \"custom\"\nurl = \"https://x.example/i.json\"\nwebhook = \"team\"\nmapping = {mapping}\n"
+            ));
+            assert!(matches!(r, Err(ConfigError::Toml(_))), "{mapping}");
+        }
+    }
+
+    #[test]
+    fn mapping_pointer_must_be_absolute() {
+        let r = Config::from_toml(&format!(
+            "{SYSTEM}[[status_pages]]\nname = \"x\"\nkind = \"custom\"\nurl = \"https://x.example/i.json\"\nwebhook = \"team\"\nmapping = {{ id = \"id\", title = \"/t\" }}\n"
+        ));
+        assert!(matches!(r, Err(ConfigError::Toml(_))));
     }
 }

@@ -6,7 +6,7 @@
 [![codecov](https://codecov.io/gh/m1sk9/chime/graph/badge.svg?token=7FMYFTZ2XU)](https://codecov.io/gh/m1sk9/chime)
 
 
-IaC-managed Discord webhook reminder. Reads a TOML schedule, runs as a long-lived process, and posts to Discord webhooks at the configured times. It can also watch Atlassian Statuspage instances and forward incident updates to the same webhooks, watch the Firefox and Chrome release feeds — or any JSON endpoint — to announce new versions, and subscribe to RSS, Atom or JSON feeds to post new entries.
+IaC-managed Discord webhook reminder. Reads a TOML schedule, runs as a long-lived process, and posts to Discord webhooks at the configured times. It can also watch status pages (Atlassian Statuspage, Instatus, incident.io, Datadog Status Pages, or any JSON endpoint) and forward incident updates to the same webhooks, watch the Firefox and Chrome release feeds — or any JSON endpoint — to announce new versions, and subscribe to RSS, Atom or JSON feeds to post new entries.
 
 ```sh
 docker pull ghcr.io/m1sk9/chime:v0
@@ -17,7 +17,7 @@ docker pull ghcr.io/m1sk9/chime:v0
 - Single static binary, no runtime dependencies.
 - Strict, fail-fast config validation (unknown fields, bad timezones, missing secrets — all rejected at startup).
 - Webhook URLs are kept out of `config.toml` and injected via environment variables (or `*_FILE` paths for Docker secrets).
-- Forwards Atlassian Statuspage incidents (Claude, Proton, GitHub, Discord, Cloudflare, …) to Discord as colour-coded embeds. Pull-based: no inbound port, no public ingress.
+- Forwards status page incidents — Atlassian Statuspage (Claude, Proton, GitHub, Discord, Cloudflare, …), Instatus, incident.io, Datadog Status Pages, or any JSON endpoint — to Discord as colour-coded embeds. Pull-based: no inbound port, no public ingress.
 - Watches release feeds — Firefox, Chrome, or any JSON endpoint — and posts a new version as an embed. Pull-based, same as status pages.
 - Subscribes to RSS, Atom and JSON feeds and posts each new entry as an embed. Pull-based, same as the others.
 - Ships as a distroless container image to `ghcr.io/m1sk9/chime`.
@@ -122,6 +122,9 @@ days = ["mon", "tue", "wed", "thu", "fri"]
                             # sun/mon/tue/wed/thu/fri/sat, or ["every"]
 message = "Time for standup."
 webhook = "team"            # logical name — resolved via env (see below)
+thread_id = "1234567890123456789"
+                            # optional; post into this thread of the webhook's
+                            # channel (quoted digits, see below)
 
 [[reminders]]
 name = "salary-day"
@@ -132,9 +135,14 @@ webhook = "team"
 
 [[status_pages]]
 name = "claude"             # non-empty, unique within the file
+kind = "statuspage"         # optional; statuspage | instatus | incidentio | datadog |
+                            # custom (default: statuspage)
 url = "https://status.claude.com"
                             # https only; the status page's base URL
+                            # (`custom`: the JSON document itself)
 webhook = "team"            # logical name — resolved via env, same as reminders
+thread_id = "1234567890123456789"
+                            # optional; same as for reminders
 display_name = "Claude Status"
                             # optional; the Discord username on the message
                             # (default: the `name` above)
@@ -147,6 +155,8 @@ min_impact = "minor"        # optional; none | maintenance | minor | major | cri
 [[watches]]
 name = "firefox"            # non-empty, unique within [[watches]]
 webhook = "team"            # logical name — resolved via env, same as reminders
+thread_id = "1234567890123456789"
+                            # optional; same as for reminders
 source = { kind = "firefox" }
                             # channel: release | esr | beta | devedition | nightly
                             # (default: release)
@@ -180,6 +190,8 @@ name = "claude-code-changelog"
 url = "https://code.claude.com/docs/en/changelog/rss.xml"
                             # https only; the feed URL itself
 webhook = "team"            # logical name — resolved via env, same as reminders
+thread_id = "1234567890123456789"
+                            # optional; same as for reminders
 display_name = "Claude Code Changelog"
                             # optional; the Discord username on the message
                             # (default: the `name` above)
@@ -194,15 +206,65 @@ A config must define at least one `[[reminders]]`, `[[status_pages]]`, `[[watche
 
 ### Status pages
 
-`[[status_pages]]` watches an [Atlassian Statuspage](https://www.atlassian.com/software/statuspage) instance — the software behind `status.claude.com`, `status.proton.me`, `www.githubstatus.com`, `discordstatus.com`, `www.cloudflarestatus.com` and many others. `url` is the page's base URL; chime appends `/api/v2/incidents.json` itself.
+`[[status_pages]]` watches a public status page. `kind` names the software behind it and decides which document chime fetches; it defaults to `statuspage`, so a config written before `kind` existed keeps working unchanged.
 
-chime **polls** that endpoint — it does not receive an inbound webhook. Nothing needs to be exposed, no ports are opened, and no subscription has to be registered out-of-band, so a page is added by editing `config.toml` alone. Requests are conditional (`If-None-Match`), so an unchanged page costs a `304` and no body.
+| `kind` | Software | Fetched | `ETag` | Severity |
+|---|---|---|---|---|
+| `statuspage` (default) | [Atlassian Statuspage](https://www.atlassian.com/software/statuspage) — `status.claude.com`, `status.proton.me`, `www.githubstatus.com`, `discordstatus.com`, `www.cloudflarestatus.com`, … | `<url>/api/v2/incidents.json` | yes | yes |
+| `instatus` | [Instatus](https://instatus.com/help/api/public-data) | `<url>/v3/summary.json` | no | yes |
+| `incidentio` | [incident.io](https://docs.incident.io/status-pages/subscriptions) | `<url>/feed.atom` | no | **no** |
+| `datadog` | [Datadog Status Pages](https://docs.datadoghq.com/service_management/status_pages/) — `<prefix>.statuspage.datadoghq.com` | `<url>/config.json` | yes | yes |
+| `custom` | anything that serves incidents as JSON | `url`, as written | if the server sends one | if `mapping.impact` is set |
 
-Only Atlassian Statuspage is supported. A URL that is not a Statuspage instance fails at the first poll with `response is not an Atlassian Statuspage incidents feed` — this is logged, not fatal.
+For every kind but `custom`, `url` is the page's base URL and chime appends the path itself — `https://example.com/status` becomes `https://example.com/status/api/v2/incidents.json`, with or without a trailing `/`. For `custom`, `url` is the JSON document and is requested exactly as written.
+
+chime **polls** that document — it does not receive an inbound webhook. Nothing needs to be exposed, no ports are opened, and no subscription has to be registered out-of-band, so a page is added by editing `config.toml` alone. Requests are conditional (`If-None-Match`), so an unchanged page costs a `304` and no body — where the server sends an `ETag`. Instatus and incident.io do not, so every poll of those downloads the document and is counted as `updated` in the [summary](#knowing-the-poller-is-alive).
+
+A document that does not match its `kind` fails the poll with `response does not decode as <kind>: …` (`Atlassian Statuspage`, `Instatus`, `incident.io`, `Datadog Status Pages` or `custom JSON`) — this is logged, not fatal, and retried on the next interval.
+
+Scheduled maintenances are never forwarded, for any kind: Statuspage's `incidents.json` does not list them, and the maintenance sections of the other documents are not read.
 
 A feed is read up to a hard 8 MB ceiling and refused past it with `status page body exceeded 8388608 bytes`. Real feeds measure 40-300 KB, so this only fires on a page that has gone wrong: responses are gzip-encoded, and gzip lets a small download expand into an arbitrarily large buffer, so the limit is on what is decompressed rather than on what is transferred. Like every other polling failure it is logged and retried on the next interval.
 
-The unit of notification is an **incident update**, not an incident: `Investigating → Identified → Monitoring → Resolved` produces four messages, each a separate post rather than an edit of the first. `min_impact` drops incidents below the given severity; an incident whose severity Statuspage reports with a value chime does not recognise is always forwarded rather than silently dropped.
+#### Per-kind notes
+
+- **`statuspage`** — `incidents.json` holds the 50 most recent incidents with every update.
+- **`instatus`** — the v3 summary lists only active and recently resolved incidents, and only each incident's latest update, so several updates between two polls arrive as the last one. A recently resolved incident is posted as `Resolved` with no text. Instatus severities map as `MAJOROUTAGE` → `critical`, `PARTIALOUTAGE` → `major`, `DEGRADEDPERFORMANCE` → `minor`, `UNDERMAINTENANCE` → `maintenance`.
+- **`incidentio`** — the page's public Atom feed, one entry per incident with its latest update. The feed carries **no severity**, so `Impact` is always `Unknown` and **`min_impact` has no effect**: an unknown severity is always forwarded. The `Status: …` line and the `Affected components` list in each entry become the `Status` and `Components` fields. incident.io's widget API is not used: it is opt-in per page, and its URL and schema are shown only in the page's admin settings.
+- **`datadog`** — `config.json` is the document the Datadog-hosted page itself renders from; Datadog documents no public API for it. It holds the page's **entire** incident history, so it can reach a megabyte or more (within the 8 MB ceiling); it supports conditional requests, so that is paid only when the page changes. The severity is the worst component state recorded during the incident (`major_outage` → `critical`, `partial_outage` → `major`, `degraded` → `minor`), so a resolved incident still shows how bad it was. The embed links to `<url>/<incident id>`.
+- **`custom`** — see below.
+
+UptimeRobot is not supported: its status pages publish no public incident feed. The API needs an account key, announcements reach subscribers by e-mail only, and the event feed its page script reads is undocumented and carries only monitor up/down events, with no stable id and locale-formatted times.
+
+#### `custom`
+
+`mapping` names, by [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901) JSON pointers, where the incidents are and which fields of each one chime reads. Every pointer must start with `/`, and `mapping` is required with `kind = "custom"` and rejected with any other kind.
+
+```toml
+[[status_pages]]
+name = "my-service"
+kind = "custom"
+url = "https://status.example.com/incidents.json"
+webhook = "team"
+mapping = { incidents = "/incidents", id = "/id", title = "/title", status = "/state", body = "/message", updated_at = "/updated_at", link = "/url", impact = "/severity" }
+```
+
+| Key | | Meaning |
+|---|---|---|
+| `incidents` | optional | The array of incidents, from the document root. Omit it when the document itself is the array. |
+| `id` | required | The incident's id. |
+| `title` | required | The embed title. |
+| `status` | optional | `investigating` / `identified` / `monitoring` / `resolved` / `postmortem`, any case; anything else shows as `Update`. |
+| `body` | optional | The embed text. |
+| `updated_at` | optional | When the incident last changed, as an RFC 3339 timestamp. |
+| `link` | optional | The URL the embed title links to. |
+| `impact` | optional | `none` / `maintenance` / `minor` / `major` / `critical`, any case; anything else is `Unknown`. |
+
+Every key but `incidents` is a pointer **into one incident**, so `/id` reads the `id` of each element and `/meta/0/id` reaches deeper. Values must be strings or integers, as for a [`json` watch](#json). An incident is reported again whenever its `updated_at` changes; without `updated_at`, whenever its `status` changes; without either, only when it first appears. Without `updated_at` the embed is timed when chime saw the change. Each incident is one update: an array of updates nested inside an incident is not read.
+
+A mapping that does not fit the document — an `id` or `title` that is missing or empty, a value that is an object or a fractional number, an `incidents` pointer that is not an array, an `updated_at` that is not RFC 3339 — fails the whole poll with a `warn` rather than skipping the incident, so a mistake in the mapping is visible on every poll instead of silently dropping incidents. A field that is absent, `null` or empty in one incident is just absent.
+
+The unit of notification is an **incident update**, not an incident: `Investigating → Identified → Monitoring → Resolved` produces four messages, each a separate post rather than an edit of the first. `min_impact` drops incidents below the given severity; an incident whose severity is missing, or reported with a value chime does not recognise, is always forwarded rather than silently dropped.
 
 #### What it looks like in Discord
 
@@ -216,7 +278,7 @@ Each update is one embed. The colour bar is the severity at a glance:
 | `minor` | yellow | ↑ |
 | `none`, or an unrecognised severity | grey | ↑ |
 
-A resolved incident is green regardless of how severe it was, so "this is fixed" never arrives wearing a red bar. The embed carries the incident title (linked to the Statuspage short link), the latest update's text, `Status` / `Impact` / `Components` fields, the status page host as the footer, and the update's own timestamp — which is when Statuspage published it, not when chime posted it.
+A resolved incident is green regardless of how severe it was, so "this is fixed" never arrives wearing a red bar. The embed carries the incident title (linked to the incident page — the Statuspage short link, for instance), the latest update's text, `Status` / `Impact` / `Components` fields, the status page host as the footer, and the update's own timestamp — which is when the page published it, not when chime posted it. The exceptions are an update whose document carries no time (a `custom` page without `updated_at`, an undated incident.io entry), which is timed when chime first saw it.
 
 The `Status` field of one real incident renders as `✅ Resolved`, `Impact` as `Minor`, and the message is attributed to `display_name` so several status pages can share one Discord channel and still be told apart.
 
@@ -266,7 +328,7 @@ chime does not know the shape of the document: `pointer` ([RFC 6901](https://www
 | Node.js | `https://nodejs.org/dist/index.json` | `/0/version` |
 | A GitHub repository | `https://api.github.com/repos/{owner}/{repo}/releases/latest` | `/tag_name` |
 
-A pointer that does not match the document is not caught at startup: like a status page URL that is not a Statuspage instance, it fails at the first poll with a `warn` and keeps failing each interval.
+A pointer that does not match the document is not caught at startup: like a status page URL that does not match its `kind`, it fails at the first poll with a `warn` and keeps failing each interval.
 
 #### Notification semantics
 
@@ -345,6 +407,8 @@ The `webhook` field is a logical name, not a URL. At startup chime derives an en
 
 Non-alphanumeric characters are mapped to `_` and the result is uppercased. For each env key chime tries `<KEY>_FILE` first (for Docker secrets) and falls back to `<KEY>`. The value must be a valid URL after trimming.
 
+An entry that sets `thread_id` posts into that thread instead of the channel: chime adds `thread_id=<id>` to the resolved webhook URL, Discord's [Execute Webhook `thread_id` parameter](https://docs.discord.com/developers/resources/webhook). The thread must belong to the webhook's channel, and an archived thread is unarchived by Discord when the message arrives. Other query parameters already in the env URL are kept; a `thread_id` already in it is replaced by the entry's, so one webhook can serve entries that post to different threads. The value is a snowflake written as a **quoted** string of digits — `thread_id = "1234567890123456789"`, not `thread_id = 1234567890123456789`.
+
 ### Validation
 
 All of the following are rejected at startup with a descriptive error and a non-zero exit code — chime never partially starts:
@@ -359,9 +423,13 @@ All of the following are rejected at startup with a descriptive error and a non-
 - A reminder specifying neither or both of `days` / `day_of_month`
 - Empty `message`
 - Webhook env var unset, empty, or not a valid URL
+- `thread_id` that is empty, not all digits, zero or beyond 64 bits (or written as a TOML integer)
 - Neither reminders, status pages, watches nor rss feeds defined
 - Duplicate or empty status page `name`
 - Status page `url` or `avatar_url` that is not `https`, or has no host
+- Status page `kind` that is not one of `statuspage` / `instatus` / `incidentio` / `datadog` / `custom`
+- `custom` status page without `mapping`, or `mapping` on a page of any other kind
+- `mapping` without `id` or `title`, with an unknown key, or with a pointer that does not start with `/`
 - `poll_interval_sec` outside `60..=3600`
 - `min_impact` that is not one of `none` / `maintenance` / `minor` / `major` / `critical`
 - Duplicate or empty watch `name`
@@ -385,12 +453,12 @@ chime is a long-running process, not a one-shot cron job. The main loop:
 
 Status page polling follows the same rules as reminders:
 
-- **The first poll after startup is silent.** `incidents.json` returns the 50 most recent incidents, so chime records them as a baseline and reports nothing. Only what changes *afterwards* is forwarded. A restart therefore re-baselines — it never replays history into the channel, in the same spirit as "a missed minute is a missed notification".
+- **The first poll after startup is silent.** Every document lists incidents that are already known — Statuspage's `incidents.json` the 50 most recent, Datadog's `config.json` the whole history, Instatus the active and recently resolved ones — so chime records them as a baseline and reports nothing. Only what changes *afterwards* is forwarded. A restart therefore re-baselines — it never replays history into the channel, in the same spirit as "a missed minute is a missed notification".
 - The seen-record is written **before** the Discord request, so a failed send is not retried on the next poll.
 - A status page being unreachable is logged at `warn` and retried on its own interval. chime never posts about its own polling failures.
-- Because polling happens on the tick, an update is forwarded up to `poll_interval_sec` after Statuspage published it. The embed timestamp always shows the real publication time.
+- Because polling happens on the tick, an update is forwarded up to `poll_interval_sec` after the page published it. The embed timestamp shows the real publication time wherever the document carries one.
 - **One page, watch or feed is polled per tick**, so a tick costs a single request no matter how many are configured — a set of unreachable endpoints cannot stall the loop long enough for `chime health` to call the heartbeat stale. Each entry takes `tick_interval_sec / poll_interval_sec` of that budget — with `tick_interval_sec = 60`, a page at 300 takes a fifth, a feed at 900 a fifteenth and a watch at 3600 a sixtieth — and every one stays on its nominal interval as long as the shares of all pages, watches and feeds add up to at most 1; beyond that they simply poll less often. Watches sharing a URL count once, at their shared interval.
-- Requests are conditional (`If-None-Match`) and compressed (`Accept-Encoding: gzip`), so a page with no news usually costs a 304 with no body at all. An instance that returns **no `ETag`** — some Statuspage-compatible feeds are served from other infrastructure and do not — cannot be validated, so every poll downloads the whole feed — as do Chrome watches and most RSS feeds. gzip keeps that in the single-digit kilobytes; nothing else is needed.
+- Requests are conditional (`If-None-Match`) and compressed (`Accept-Encoding: gzip`), so a page with no news usually costs a 304 with no body at all. An instance that returns **no `ETag`** — Instatus and incident.io pages, and some Statuspage-compatible feeds served from other infrastructure — cannot be validated, so every poll downloads the whole feed — as do Chrome watches and most RSS feeds. gzip keeps that in the single-digit kilobytes; nothing else is needed.
 
 ### Knowing the poller is alive
 

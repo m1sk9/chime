@@ -16,7 +16,7 @@ const COLOR_ENTRY: u32 = 0xEB459E;
 
 /// Ordered by preference; `*/*` last so a server that only knows `text/html`
 /// still answers rather than 406-ing, and the parser reports the real problem.
-const FEED_ACCEPT: &str = "application/rss+xml, application/atom+xml, application/feed+json, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.1";
+pub(crate) const FEED_ACCEPT: &str = "application/rss+xml, application/atom+xml, application/feed+json, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.1";
 
 /// Only the decode error lives here: fetch errors are handled by the scheduler
 /// before parsing, exactly as `poll_feed` does. A `Fetch` variant would be dead
