@@ -17,7 +17,7 @@ use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 
 use crate::config::{Config, LogLevel};
-use crate::fetch::HttpSource;
+use crate::fetch::{HttpSource, https_redirects};
 use crate::heartbeat::{check_liveness, heartbeat_path};
 use crate::notifier::Discord;
 use crate::runtime::resolve;
@@ -111,6 +111,7 @@ async fn run_daemon() -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent(USER_AGENT)
+        .redirect(https_redirects())
         .build()
         .context("failed to build HTTP client")?;
     let notifier = Discord::new(client.clone());

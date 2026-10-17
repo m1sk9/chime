@@ -11,7 +11,7 @@ layout: doc
 - TOML 内の任意の場所にある未知のフィールド
 - `1..=60` の範囲外の `tick_interval_sec`
 - 未知の IANA タイムゾーン
-- 未設定，空，または有効な URL ではない webhook env 変数
+- 未設定，空，または有効な `https` の URL ではない webhook env 変数
 - 空，数字のみでない，0，64 ビットを超える，または TOML の整数として書かれた `thread_id`
 - リマインダー，ステータスページ，watch，rss フィードのいずれも定義されていない
 - `60..=3600` の範囲外の `poll_interval_sec`

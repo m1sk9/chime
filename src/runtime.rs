@@ -28,6 +28,8 @@ pub enum WebhookError {
     Empty,
     #[error(transparent)]
     Url(#[from] url::ParseError),
+    #[error("webhook URL must be https, not {0}")]
+    Scheme(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -321,6 +323,9 @@ fn resolve_webhook(
         return Err(WebhookError::Empty);
     }
     let mut url = Url::parse(trimmed)?;
+    if url.scheme() != "https" {
+        return Err(WebhookError::Scheme(url.scheme().to_string()));
+    }
     if let Some(id) = thread_id {
         // Why replace rather than append: one webhook name may serve entries that
         // post to different threads, so the entry's `thread_id` has to win over one
@@ -1149,6 +1154,19 @@ thread_id = "4"
             run.rss[0].webhook_url.as_str(),
             "https://example.com/hook?thread_id=4"
         );
+    }
+
+    #[test]
+    fn resolve_webhook_rejects_a_non_https_url() {
+        let _g = EnvGuard::set(
+            "CHIME_WEBHOOK_TEST_HTTP",
+            "http://discord.com/api/webhooks/1/a",
+        );
+        let r = WebhookRef::try_from("test-http".to_string()).unwrap();
+        assert!(matches!(
+            resolve_webhook(&r, None),
+            Err(WebhookError::Scheme(scheme)) if scheme == "http"
+        ));
     }
 
     #[test]
