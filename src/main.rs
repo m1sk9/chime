@@ -17,7 +17,7 @@ use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 
 use crate::config::{Config, LogLevel};
-use crate::fetch::{HttpSource, https_redirects};
+use crate::fetch::{HttpSource, https_redirects, poll_client_builder};
 use crate::heartbeat::{check_liveness, heartbeat_path};
 use crate::notifier::Discord;
 use crate::runtime::resolve;
@@ -114,9 +114,14 @@ async fn run_daemon() -> Result<()> {
         .redirect(https_redirects())
         .build()
         .context("failed to build HTTP client")?;
-    let notifier = Discord::new(client.clone());
-    let feeds = HttpSource::new(client.clone());
-    let source = StatusEndpoint::new(client);
+    let poll_client = poll_client_builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent(USER_AGENT)
+        .build()
+        .context("failed to build HTTP client")?;
+    let notifier = Discord::new(client);
+    let feeds = HttpSource::new(poll_client.clone());
+    let source = StatusEndpoint::new(poll_client);
     let scheduler = Scheduler::new(run_cfg, notifier, source, feeds);
     scheduler
         .run()
