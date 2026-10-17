@@ -105,9 +105,14 @@ pub struct RssEntry {
 
 /// Pure. `url` is the base for relative links and for the id of an entry that has
 /// a title but no link (feed-rs would otherwise mint a random UUID per parse).
+/// Why not `url` as is: a relative link keeps the base's `user:pass@`, and the
+/// link is posted to Discord.
 pub fn parse_feed(body: &[u8], url: &Url) -> Result<Vec<FeedEntry>, RssError> {
+    let mut base = url.clone();
+    let _ = base.set_username("");
+    let _ = base.set_password(None);
     let feed = feed_rs::parser::Builder::new()
-        .base_uri(Some(url.as_str()))
+        .base_uri(Some(base.as_str()))
         .id_generator(stable_id)
         .build()
         .parse(body)
@@ -753,6 +758,19 @@ second line</summary></entry></feed>"#;
         let atom = r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>t</title><id>f</id><updated>2026-09-25T12:00:00Z</updated>
 <entry><title>rel</title><id>e</id><updated>2026-09-25T12:00:00Z</updated><link href="posts/1"/></entry></feed>"#;
         let entries = parse(atom);
+        assert_eq!(
+            entries[0].link.as_deref(),
+            Some("https://code.claude.com/docs/en/changelog/posts/1")
+        );
+    }
+
+    #[test]
+    fn a_relative_entry_link_does_not_carry_the_feed_url_credentials() {
+        let atom = r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>t</title><id>f</id><updated>2026-09-25T12:00:00Z</updated>
+<entry><title>rel</title><id>e</id><updated>2026-09-25T12:00:00Z</updated><link href="posts/1"/></entry></feed>"#;
+        let url =
+            Url::parse("https://bot:secret@code.claude.com/docs/en/changelog/rss.xml").unwrap();
+        let entries = parse_feed(atom.as_bytes(), &url).unwrap();
         assert_eq!(
             entries[0].link.as_deref(),
             Some("https://code.claude.com/docs/en/changelog/posts/1")
