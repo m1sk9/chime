@@ -1,7 +1,7 @@
 import { inBrowser, type Theme } from 'vitepress';
 import DefaultTheme from 'vitepress/theme';
+import CopyOrDownloadAsMarkdownButtons from 'vitepress-plugin-llms/vitepress-components/CopyOrDownloadAsMarkdownButtons.vue';
 import { h } from 'vue';
-import PageActions from './components/PageActions.vue';
 import './custom.css';
 
 const LOCALE_REDIRECT_FLAG = 'chime-locale-redirected';
@@ -24,7 +24,7 @@ export default {
   extends: DefaultTheme,
   Layout: () =>
     h(DefaultTheme.Layout, null, {
-      'doc-before': () => h(PageActions),
+      'doc-before': () => h(CopyOrDownloadAsMarkdownButtons),
     }),
   enhanceApp() {
     redirectByBrowserLanguage();

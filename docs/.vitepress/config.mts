@@ -40,7 +40,8 @@ export default defineConfig({
     plugins: [
       llmstxt({
         domain: 'https://chime.m1sk9.dev',
-        ignoreFiles: ['index.md', 'ja/index.md'],
+        // Keep the English site only: the Japanese pages would double llms-full.txt.
+        ignoreFiles: ['index.md', 'ja/**'],
       }),
     ],
   },
