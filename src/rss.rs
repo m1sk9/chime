@@ -3,10 +3,8 @@ use std::collections::HashSet;
 use chrono::{DateTime, Utc};
 use feed_rs::model::{Entry, FeedType, Link, Text};
 use feed_rs::parser::ParseFeedError;
-use reqwest::Client;
 use url::Url;
 
-use crate::fetch::{FetchError, Fetched, fetch_conditional};
 use crate::notifier::{DiscordMessage, Embed};
 use crate::runtime::RunRss;
 
@@ -439,28 +437,6 @@ pub fn build_message(
         .with_footer(&feed.host)
         .with_timestamp(&detected_at.to_rfc3339());
     DiscordMessage::embed(embed).with_identity(&feed.display_name, feed.avatar_url.as_deref())
-}
-
-#[allow(async_fn_in_trait)]
-pub(crate) trait RssSource {
-    async fn fetch(&self, url: &Url, etag: Option<&str>) -> Result<Fetched<Vec<u8>>, FetchError>;
-}
-
-#[derive(Debug, Clone)]
-pub struct FeedEndpoint {
-    client: Client,
-}
-
-impl FeedEndpoint {
-    pub fn new(client: Client) -> Self {
-        FeedEndpoint { client }
-    }
-}
-
-impl RssSource for FeedEndpoint {
-    async fn fetch(&self, url: &Url, etag: Option<&str>) -> Result<Fetched<Vec<u8>>, FetchError> {
-        fetch_conditional(&self.client, url, etag, FEED_ACCEPT).await
-    }
 }
 
 #[cfg(test)]

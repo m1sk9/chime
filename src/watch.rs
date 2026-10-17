@@ -1,10 +1,8 @@
 use chrono::{DateTime, Utc};
-use reqwest::Client;
 use serde::Deserialize;
 use url::Url;
 
 use crate::config::{ChromeChannel, ChromePlatform, ChromeRollout, FirefoxChannel, WatchKind};
-use crate::fetch::{FetchError, Fetched, fetch_json};
 use crate::notifier::{DiscordMessage, Embed};
 use crate::runtime::RunWatch;
 use crate::status::parse_time;
@@ -18,6 +16,8 @@ const FIREFOX_NIGHTLY_NOTES: &str = "https://www.firefox.com/firefox/nightly/not
 
 /// Discord blurple. A release has no severity, so every kind shares one colour.
 const COLOR_RELEASE: u32 = 0x5865F2;
+
+pub(crate) const WATCH_ACCEPT: &str = "application/json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum WatchError {
@@ -502,28 +502,6 @@ fn rollout_percent(fraction: f64) -> String {
     // Clamped so one-decimal rounding never shows a partial rollout as `100.0%`
     // or a started one as `0.0%`.
     format!("{:.1}%", (fraction * 100.0).clamp(0.1, 99.9))
-}
-
-#[allow(async_fn_in_trait)]
-pub(crate) trait WatchSource {
-    async fn fetch(&self, url: &Url, etag: Option<&str>) -> Result<Fetched<Vec<u8>>, FetchError>;
-}
-
-#[derive(Debug, Clone)]
-pub struct JsonEndpoint {
-    client: Client,
-}
-
-impl JsonEndpoint {
-    pub fn new(client: Client) -> Self {
-        JsonEndpoint { client }
-    }
-}
-
-impl WatchSource for JsonEndpoint {
-    async fn fetch(&self, url: &Url, etag: Option<&str>) -> Result<Fetched<Vec<u8>>, FetchError> {
-        fetch_json(&self.client, url, etag).await
-    }
 }
 
 #[cfg(test)]

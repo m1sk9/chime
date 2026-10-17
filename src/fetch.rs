@@ -38,13 +38,38 @@ pub enum Fetched<T> {
     Modified { value: T, etag: Option<String> },
 }
 
-/// Conditional GET of a JSON endpoint (`Accept: application/json`).
-pub(crate) async fn fetch_json(
-    client: &Client,
-    url: &Url,
-    etag: Option<&str>,
-) -> Result<Fetched<Vec<u8>>, FetchError> {
-    fetch_conditional(client, url, etag, "application/json").await
+/// The raw-body fetch behind watch and rss feeds. A trait so scheduler tests can
+/// serve canned bodies.
+#[allow(async_fn_in_trait)]
+pub(crate) trait BodySource {
+    async fn fetch(
+        &self,
+        url: &Url,
+        etag: Option<&str>,
+        accept: &'static str,
+    ) -> Result<Fetched<Vec<u8>>, FetchError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpSource {
+    client: Client,
+}
+
+impl HttpSource {
+    pub fn new(client: Client) -> Self {
+        HttpSource { client }
+    }
+}
+
+impl BodySource for HttpSource {
+    async fn fetch(
+        &self,
+        url: &Url,
+        etag: Option<&str>,
+        accept: &'static str,
+    ) -> Result<Fetched<Vec<u8>>, FetchError> {
+        fetch_conditional(&self.client, url, etag, accept).await
+    }
 }
 
 /// Conditional GET with the body capped at `MAX_BODY`. `accept` is sent verbatim.
