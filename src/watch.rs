@@ -503,7 +503,7 @@ pub fn build_message(
     embed = embed
         .with_footer(&watch.host)
         .with_timestamp(&detected_at.to_rfc3339());
-    DiscordMessage::embed(embed).with_identity(&watch.display_name, watch.avatar_url.as_deref())
+    watch.identity.apply(DiscordMessage::embed(embed))
 }
 
 fn chrome_milestone(version: &str) -> Option<u32> {

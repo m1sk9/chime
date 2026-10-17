@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use url::Url;
 
-use crate::config::{CustomMapping, Impact, StatusKind};
+use crate::config::{CustomMapping, Impact, StatusProvider};
 use crate::fetch::{FetchError, Fetched, fetch_conditional};
 use crate::notifier::{DiscordMessage, Embed};
 use crate::rss::{FEED_ACCEPT, RssError};
@@ -72,16 +72,8 @@ pub enum DecodeError {
     Mapping(#[from] custom::MappingError),
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum SourceError {
-    #[error(transparent)]
-    Url(#[from] url::ParseError),
-    #[error("kind `custom` requires `mapping`")]
-    MissingMapping,
-}
-
 /// How a fetched body becomes incidents. Adding a provider is a new variant here
-/// plus the `StatusKind` that selects it; the poller never learns the difference.
+/// plus the `StatusProvider` that selects it; the poller never learns the difference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decoder {
     Statuspage,
@@ -139,40 +131,38 @@ pub struct SourceSpec {
     pub decoder: Decoder,
 }
 
-pub fn resolve_source(
-    kind: StatusKind,
-    url: &Url,
-    mapping: Option<&CustomMapping>,
-) -> Result<SourceSpec, SourceError> {
-    let (path, decoder) = match kind {
-        StatusKind::Statuspage => (STATUSPAGE_PATH, Decoder::Statuspage),
-        StatusKind::Instatus => (INSTATUS_PATH, Decoder::Instatus),
-        StatusKind::Incidentio => (INCIDENTIO_PATH, Decoder::IncidentIo),
-        StatusKind::Datadog => (DATADOG_PATH, Decoder::Datadog),
-        StatusKind::Custom => {
-            let mapping = mapping.ok_or(SourceError::MissingMapping)?;
-            return Ok(SourceSpec {
+pub fn resolve_source(provider: &StatusProvider, url: &Url) -> SourceSpec {
+    let (path, decoder) = match provider {
+        StatusProvider::Statuspage => (STATUSPAGE_PATH, Decoder::Statuspage),
+        StatusProvider::Instatus => (INSTATUS_PATH, Decoder::Instatus),
+        StatusProvider::Incidentio => (INCIDENTIO_PATH, Decoder::IncidentIo),
+        StatusProvider::Datadog => (DATADOG_PATH, Decoder::Datadog),
+        StatusProvider::Custom(mapping) => {
+            return SourceSpec {
                 api_url: url.clone(),
                 decoder: Decoder::Custom(mapping.clone()),
-            });
+            };
         }
     };
-    Ok(SourceSpec {
-        api_url: join_base(url, path)?,
+    SourceSpec {
+        api_url: join_base(url, path),
         decoder,
-    })
+    }
 }
 
-/// `url` with `path` appended below it, whether or not `url` ends in `/`.
-pub fn join_base(url: &Url, path: &str) -> Result<Url, url::ParseError> {
-    // `Url::join` replaces the final path segment unless the base path ends in `/`,
-    // which would turn `https://x.example/status` into `https://x.example/api/...`.
-    let mut base = url.clone();
-    if !base.path().ends_with('/') {
-        let dir = format!("{}/", base.path());
-        base.set_path(&dir);
-    }
-    base.join(path)
+/// `url` with the relative `path` appended below it, whether or not `url` ends in
+/// `/`. The query and fragment are dropped, as resolving a relative path would.
+///
+/// Why not `Url::join`: it replaces the final path segment unless the base path
+/// ends in `/` (`https://x.example/status` would become `https://x.example/api/...`),
+/// and it is fallible for what, with fixed provider paths, cannot fail.
+pub fn join_base(url: &Url, path: &str) -> Url {
+    let dir = url.path().strip_suffix('/').unwrap_or(url.path());
+    let mut joined = url.clone();
+    joined.set_path(&format!("{dir}/{path}"));
+    joined.set_query(None);
+    joined.set_fragment(None);
+    joined
 }
 
 /// Parses a wire timestamp; `None` drops the update it belongs to.
@@ -413,7 +403,7 @@ pub fn build_message(page: &RunStatusPage, event: &StatusEvent) -> DiscordMessag
         .with_footer(&page.host)
         .with_timestamp(&event.occurred_at.to_rfc3339());
 
-    DiscordMessage::embed(embed).with_identity(&page.display_name, page.avatar_url.as_deref())
+    page.identity.apply(DiscordMessage::embed(embed))
 }
 
 #[cfg(test)]
@@ -745,7 +735,7 @@ mod tests {
     fn join_base_adds_the_missing_slash() {
         let url = Url::parse("https://status.claude.com").unwrap();
         assert_eq!(
-            join_base(&url, STATUSPAGE_PATH).unwrap().as_str(),
+            join_base(&url, STATUSPAGE_PATH).as_str(),
             "https://status.claude.com/api/v2/incidents.json"
         );
     }
@@ -755,11 +745,20 @@ mod tests {
         for base in ["https://x.example/status", "https://x.example/status/"] {
             let url = Url::parse(base).unwrap();
             assert_eq!(
-                join_base(&url, DATADOG_PATH).unwrap().as_str(),
+                join_base(&url, DATADOG_PATH).as_str(),
                 "https://x.example/status/config.json",
                 "{base}"
             );
         }
+    }
+
+    #[test]
+    fn join_base_drops_the_query_and_fragment_of_the_page_url() {
+        let url = Url::parse("https://x.example/status?lang=en#top").unwrap();
+        assert_eq!(
+            join_base(&url, STATUSPAGE_PATH).as_str(),
+            "https://x.example/status/api/v2/incidents.json"
+        );
     }
 
     #[test]
