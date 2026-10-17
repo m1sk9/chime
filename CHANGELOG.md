@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.0](https://github.com/m1sk9/chime/compare/chime-v0.7.0...chime-v0.8.0) (2026-10-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* a status page, watch or feed URL that answers 3xx now fails every poll with a warn log instead of being followed. Configure the final URL the redirect points to.
+
+### Bug Fixes
+
+* stop following redirects when polling and keep credentials out of logs and embeds ([#87](https://github.com/m1sk9/chime/issues/87)) ([4a4ceed](https://github.com/m1sk9/chime/commit/4a4ceed13ad586a21859931ac5d36370b6987c7e))
+
 ## [0.7.0](https://github.com/m1sk9/chime/compare/chime-v0.6.0...chime-v0.7.0) (2026-10-17)
 
 
