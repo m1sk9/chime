@@ -9,6 +9,8 @@ time = "09:30"
 days = ["mon", "tue", "wed", "thu", "fri"]
 message = "Time for the daily standup."
 webhook = "team"
+thread_id = "1234567890123456789"       # optional; a thread in the webhook's channel.
+                                        # Quote it: a snowflake is a string, not a number.
 
 [[reminders]]
 name = "weekly-review"
@@ -32,6 +34,7 @@ webhook = "team"
 name = "claude"                         # non-empty, unique within the file
 url = "https://status.claude.com"       # https only; the page's base URL
 webhook = "team"                        # logical name — resolved via env, as above
+thread_id = "1234567890123456789"       # optional; same as for reminders
 display_name = "Claude Status"          # optional; shown as the Discord username
                                         # (default: the `name` above)
 

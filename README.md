@@ -122,6 +122,9 @@ days = ["mon", "tue", "wed", "thu", "fri"]
                             # sun/mon/tue/wed/thu/fri/sat, or ["every"]
 message = "Time for standup."
 webhook = "team"            # logical name — resolved via env (see below)
+thread_id = "1234567890123456789"
+                            # optional; post into this thread of the webhook's
+                            # channel (quoted digits, see below)
 
 [[reminders]]
 name = "salary-day"
@@ -135,6 +138,8 @@ name = "claude"             # non-empty, unique within the file
 url = "https://status.claude.com"
                             # https only; the status page's base URL
 webhook = "team"            # logical name — resolved via env, same as reminders
+thread_id = "1234567890123456789"
+                            # optional; same as for reminders
 display_name = "Claude Status"
                             # optional; the Discord username on the message
                             # (default: the `name` above)
@@ -147,6 +152,8 @@ min_impact = "minor"        # optional; none | maintenance | minor | major | cri
 [[watches]]
 name = "firefox"            # non-empty, unique within [[watches]]
 webhook = "team"            # logical name — resolved via env, same as reminders
+thread_id = "1234567890123456789"
+                            # optional; same as for reminders
 source = { kind = "firefox" }
                             # channel: release | esr | beta | devedition | nightly
                             # (default: release)
@@ -180,6 +187,8 @@ name = "claude-code-changelog"
 url = "https://code.claude.com/docs/en/changelog/rss.xml"
                             # https only; the feed URL itself
 webhook = "team"            # logical name — resolved via env, same as reminders
+thread_id = "1234567890123456789"
+                            # optional; same as for reminders
 display_name = "Claude Code Changelog"
                             # optional; the Discord username on the message
                             # (default: the `name` above)
@@ -345,6 +354,8 @@ The `webhook` field is a logical name, not a URL. At startup chime derives an en
 
 Non-alphanumeric characters are mapped to `_` and the result is uppercased. For each env key chime tries `<KEY>_FILE` first (for Docker secrets) and falls back to `<KEY>`. The value must be a valid URL after trimming.
 
+An entry that sets `thread_id` posts into that thread instead of the channel: chime adds `thread_id=<id>` to the resolved webhook URL, Discord's [Execute Webhook `thread_id` parameter](https://docs.discord.com/developers/resources/webhook). The thread must belong to the webhook's channel, and an archived thread is unarchived by Discord when the message arrives. Other query parameters already in the env URL are kept; a `thread_id` already in it is replaced by the entry's, so one webhook can serve entries that post to different threads. The value is a snowflake written as a **quoted** string of digits — `thread_id = "1234567890123456789"`, not `thread_id = 1234567890123456789`.
+
 ### Validation
 
 All of the following are rejected at startup with a descriptive error and a non-zero exit code — chime never partially starts:
@@ -359,6 +370,7 @@ All of the following are rejected at startup with a descriptive error and a non-
 - A reminder specifying neither or both of `days` / `day_of_month`
 - Empty `message`
 - Webhook env var unset, empty, or not a valid URL
+- `thread_id` that is empty or not all digits (or written as a TOML integer)
 - Neither reminders, status pages, watches nor rss feeds defined
 - Duplicate or empty status page `name`
 - Status page `url` or `avatar_url` that is not `https`, or has no host

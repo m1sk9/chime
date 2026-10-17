@@ -99,6 +99,12 @@ pub enum JsonPointerError {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub enum ThreadIdError {
+    #[error("thread_id must be a Discord snowflake (digits only), got {0:?}")]
+    NotSnowflake(String),
+}
+
+#[derive(Debug, thiserror::Error)]
 #[error("{0} must be non-empty")]
 pub struct EmptyFieldError(pub &'static str);
 
@@ -262,6 +268,32 @@ impl WebhookRef {
             }
         }
         s
+    }
+}
+
+/// A Discord thread inside the webhook's channel.
+///
+/// Why a string, not an integer: a snowflake is a `u64` and a TOML integer is an
+/// `i64`, and Discord itself carries snowflakes as JSON strings. A quoted value
+/// keeps overflow out of the config type altogether.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct ThreadId(String);
+
+impl ThreadId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ThreadId {
+    type Error = ThreadIdError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ThreadIdError::NotSnowflake(s));
+        }
+        Ok(ThreadId(trimmed.to_string()))
     }
 }
 
@@ -469,6 +501,7 @@ pub struct Reminder {
     pub day_of_month: Option<DayOfMonthSet>,
     pub message: Message,
     pub webhook: WebhookRef,
+    pub thread_id: Option<ThreadId>,
 }
 
 impl Reminder {
@@ -494,6 +527,7 @@ pub struct StatusPage {
     pub name: StatusPageName,
     pub url: StatusUrl,
     pub webhook: WebhookRef,
+    pub thread_id: Option<ThreadId>,
     #[serde(default = "default_poll_interval")]
     pub poll_interval_sec: PollInterval,
     #[serde(default)]
@@ -647,6 +681,7 @@ fn default_watch_poll_interval() -> PollInterval {
 pub struct Watch {
     pub name: WatchName,
     pub webhook: WebhookRef,
+    pub thread_id: Option<ThreadId>,
     pub source: WatchKind,
     #[serde(default = "default_watch_poll_interval")]
     pub poll_interval_sec: PollInterval,
@@ -666,6 +701,7 @@ pub struct Rss {
     pub name: RssName,
     pub url: HttpsUrl,
     pub webhook: WebhookRef,
+    pub thread_id: Option<ThreadId>,
     #[serde(default = "default_rss_poll_interval")]
     pub poll_interval_sec: PollInterval,
     pub display_name: Option<DisplayName>,
@@ -1761,5 +1797,74 @@ webhook = "team"
         .unwrap();
         assert_eq!(cfg.watches.len(), 1);
         assert_eq!(cfg.rss.len(), 1);
+    }
+
+    #[test]
+    fn thread_id_accepts_a_digit_string() {
+        let id = ThreadId::try_from(" 1234567890123456789 ".to_string()).unwrap();
+        assert_eq!(id.as_str(), "1234567890123456789");
+    }
+
+    #[test]
+    fn thread_id_rejects_empty_and_non_digits() {
+        for bad in ["", " ", "abc", "12 34", "-1", "12a"] {
+            assert!(
+                matches!(
+                    ThreadId::try_from(bad.to_string()),
+                    Err(ThreadIdError::NotSnowflake(_))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thread_id_as_toml_integer_is_rejected() {
+        let r = Config::from_toml(&format!(
+            "{SYSTEM}[[rss]]\nname = \"a\"\nurl = \"https://a.example/rss.xml\"\nwebhook = \"team\"\nthread_id = 1234\n"
+        ));
+        assert!(matches!(r, Err(ConfigError::Toml(_))));
+    }
+
+    #[test]
+    fn every_webhook_section_accepts_thread_id() {
+        let cfg = Config::from_toml(&format!(
+            r#"{SYSTEM}
+[[reminders]]
+name = "standup"
+time = "09:30"
+days = ["mon"]
+message = "Standup!"
+webhook = "team"
+thread_id = "1"
+
+[[status_pages]]
+name = "claude"
+url = "https://status.claude.com"
+webhook = "team"
+thread_id = "2"
+
+[[watches]]
+name = "firefox"
+webhook = "team"
+source = {{ kind = "firefox" }}
+thread_id = "3"
+
+[[rss]]
+name = "changelog"
+url = "https://example.com/rss.xml"
+webhook = "team"
+thread_id = "4"
+"#
+        ))
+        .unwrap();
+        let ids = [
+            cfg.reminders[0].thread_id.as_ref(),
+            cfg.status_pages[0].thread_id.as_ref(),
+            cfg.watches[0].thread_id.as_ref(),
+            cfg.rss[0].thread_id.as_ref(),
+        ]
+        .map(|t| t.map(ThreadId::as_str));
+        assert_eq!(ids, [Some("1"), Some("2"), Some("3"), Some("4")]);
     }
 }
