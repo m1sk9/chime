@@ -28,16 +28,6 @@ pub enum ConfigError {
         name: String,
         platform: &'static str,
     },
-    #[error("status page `{0}`: kind `custom` requires `mapping`")]
-    CustomMappingMissing(String),
-    #[error("status page `{0}`: `mapping` is only allowed with kind `custom`")]
-    MappingNotCustom(String),
-    #[error("reminder `{name}`: {source}")]
-    Schedule {
-        name: String,
-        #[source]
-        source: ScheduleError,
-    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +62,22 @@ pub enum ScheduleError {
     Missing,
     #[error("`days` and `day_of_month` are mutually exclusive")]
     Conflict,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("reminder `{name}`: {source}")]
+pub struct ReminderError {
+    name: String,
+    #[source]
+    source: ScheduleError,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StatusPageError {
+    #[error("status page `{0}`: kind `custom` requires `mapping`")]
+    CustomMappingMissing(String),
+    #[error("status page `{0}`: `mapping` is only allowed with kind `custom`")]
+    MappingNotCustom(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -213,8 +219,8 @@ impl TryFrom<Vec<i64>> for DayOfMonthSet {
 }
 
 /// A reminder fires on either weekdays or days of the month, never both.
-/// The exclusivity is resolved once via `Reminder::schedule` so the runtime
-/// carries a value that is correct by construction.
+/// The exclusivity is resolved while deserializing a `Reminder`, so no reminder
+/// exists without exactly one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Schedule {
     Weekly(WeekdaySet),
@@ -473,25 +479,50 @@ pub struct System {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawReminder")]
 pub struct Reminder {
     pub name: ReminderName,
     pub time: TimeOfDay,
-    pub days: Option<WeekdaySet>,
-    pub day_of_month: Option<DayOfMonthSet>,
+    pub schedule: Schedule,
     pub message: Message,
     pub webhook: WebhookRef,
     pub thread_id: Option<ThreadId>,
 }
 
-impl Reminder {
-    pub fn schedule(&self) -> Result<Schedule, ScheduleError> {
-        match (self.days, self.day_of_month) {
+/// The TOML shape of a `Reminder`: `days` and `day_of_month` are separate keys.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawReminder {
+    name: ReminderName,
+    time: TimeOfDay,
+    days: Option<WeekdaySet>,
+    day_of_month: Option<DayOfMonthSet>,
+    message: Message,
+    webhook: WebhookRef,
+    thread_id: Option<ThreadId>,
+}
+
+impl TryFrom<RawReminder> for Reminder {
+    type Error = ReminderError;
+    fn try_from(r: RawReminder) -> Result<Self, Self::Error> {
+        let schedule = match (r.days, r.day_of_month) {
             (Some(w), None) => Ok(Schedule::Weekly(w)),
             (None, Some(d)) => Ok(Schedule::Monthly(d)),
             (None, None) => Err(ScheduleError::Missing),
             (Some(_), Some(_)) => Err(ScheduleError::Conflict),
         }
+        .map_err(|source| ReminderError {
+            name: r.name.as_str().to_string(),
+            source,
+        })?;
+        Ok(Reminder {
+            name: r.name,
+            time: r.time,
+            schedule,
+            message: r.message,
+            webhook: r.webhook,
+            thread_id: r.thread_id,
+        })
     }
 }
 
@@ -505,7 +536,7 @@ fn default_poll_interval() -> PollInterval {
 // configs keep their top-level `url` unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum StatusKind {
+enum StatusKind {
     #[default]
     Statuspage,
     Instatus,
@@ -530,24 +561,84 @@ pub struct CustomMapping {
     pub impact: Option<JsonPointer>,
 }
 
+/// The software serving a status page, with what that software needs: only
+/// `custom` carries a mapping, so no page can be `custom` without one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusProvider {
+    Statuspage,
+    Instatus,
+    Incidentio,
+    Datadog,
+    Custom(CustomMapping),
+}
+
 /// A status page to watch. Incidents are pulled from a public document chosen by
 /// `kind`; chime never receives an inbound webhook.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawStatusPage")]
 pub struct StatusPage {
     pub name: StatusPageName,
-    #[serde(default)]
-    pub kind: StatusKind,
+    pub provider: StatusProvider,
     pub url: HttpsUrl,
-    pub mapping: Option<CustomMapping>,
     pub webhook: WebhookRef,
     pub thread_id: Option<ThreadId>,
-    #[serde(default = "default_poll_interval")]
     pub poll_interval_sec: PollInterval,
-    #[serde(default)]
     pub min_impact: Impact,
     pub display_name: Option<DisplayName>,
     pub avatar_url: Option<HttpsUrl>,
+}
+
+/// The TOML shape of a `StatusPage`: `kind` and `mapping` are separate keys.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStatusPage {
+    name: StatusPageName,
+    #[serde(default)]
+    kind: StatusKind,
+    url: HttpsUrl,
+    mapping: Option<CustomMapping>,
+    webhook: WebhookRef,
+    thread_id: Option<ThreadId>,
+    #[serde(default = "default_poll_interval")]
+    poll_interval_sec: PollInterval,
+    #[serde(default)]
+    min_impact: Impact,
+    display_name: Option<DisplayName>,
+    avatar_url: Option<HttpsUrl>,
+}
+
+impl TryFrom<RawStatusPage> for StatusPage {
+    type Error = StatusPageError;
+    fn try_from(p: RawStatusPage) -> Result<Self, Self::Error> {
+        let provider = match (p.kind, p.mapping) {
+            (StatusKind::Statuspage, None) => StatusProvider::Statuspage,
+            (StatusKind::Instatus, None) => StatusProvider::Instatus,
+            (StatusKind::Incidentio, None) => StatusProvider::Incidentio,
+            (StatusKind::Datadog, None) => StatusProvider::Datadog,
+            (StatusKind::Custom, Some(mapping)) => StatusProvider::Custom(mapping),
+            (StatusKind::Custom, None) => {
+                return Err(StatusPageError::CustomMappingMissing(
+                    p.name.as_str().to_string(),
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(StatusPageError::MappingNotCustom(
+                    p.name.as_str().to_string(),
+                ));
+            }
+        };
+        Ok(StatusPage {
+            name: p.name,
+            provider,
+            url: p.url,
+            webhook: p.webhook,
+            thread_id: p.thread_id,
+            poll_interval_sec: p.poll_interval_sec,
+            min_impact: p.min_impact,
+            display_name: p.display_name,
+            avatar_url: p.avatar_url,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -751,10 +842,6 @@ impl Config {
             if !seen.insert(r.name.as_str()) {
                 return Err(ConfigError::DuplicateName(r.name.as_str().to_string()));
             }
-            r.schedule().map_err(|source| ConfigError::Schedule {
-                name: r.name.as_str().to_string(),
-                source,
-            })?;
         }
         let mut seen_pages = HashSet::new();
         for p in &cfg.status_pages {
@@ -762,17 +849,6 @@ impl Config {
                 return Err(ConfigError::DuplicateStatusPageName(
                     p.name.as_str().to_string(),
                 ));
-            }
-            match (p.kind, &p.mapping) {
-                (StatusKind::Custom, None) => {
-                    return Err(ConfigError::CustomMappingMissing(
-                        p.name.as_str().to_string(),
-                    ));
-                }
-                (kind, Some(_)) if kind != StatusKind::Custom => {
-                    return Err(ConfigError::MappingNotCustom(p.name.as_str().to_string()));
-                }
-                _ => {}
             }
         }
         let mut seen_watches = HashSet::new();
@@ -1294,10 +1370,7 @@ message = "Payday!"
 webhook = "team"
 "#;
         let cfg = Config::from_toml(t).unwrap();
-        assert!(matches!(
-            cfg.reminders[0].schedule(),
-            Ok(Schedule::Monthly(_))
-        ));
+        assert!(matches!(cfg.reminders[0].schedule, Schedule::Monthly(_)));
     }
 
     #[test]
@@ -1313,13 +1386,11 @@ time = "09:30"
 message = "a"
 webhook = "team"
 "#;
-        assert!(matches!(
-            Config::from_toml(t),
-            Err(ConfigError::Schedule {
-                source: ScheduleError::Missing,
-                ..
-            })
-        ));
+        let err = Config::from_toml(t).unwrap_err().to_string();
+        assert!(
+            err.contains("reminder `x`: must specify exactly one of `days` or `day_of_month`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1337,13 +1408,11 @@ day_of_month = [1]
 message = "a"
 webhook = "team"
 "#;
-        assert!(matches!(
-            Config::from_toml(t),
-            Err(ConfigError::Schedule {
-                source: ScheduleError::Conflict,
-                ..
-            })
-        ));
+        let err = Config::from_toml(t).unwrap_err().to_string();
+        assert!(
+            err.contains("reminder `x`: `days` and `day_of_month` are mutually exclusive"),
+            "{err}"
+        );
     }
 
     const SYSTEM: &str = r#"
@@ -1926,28 +1995,28 @@ url = "https://status.claude.com"
 webhook = "team"
 "#,
         );
-        assert_eq!(page.kind, StatusKind::Statuspage);
-        assert!(page.mapping.is_none());
+        assert_eq!(page.provider, StatusProvider::Statuspage);
     }
 
     #[test]
     fn status_page_accepts_each_kind() {
-        for (name, kind) in [
-            ("statuspage", StatusKind::Statuspage),
-            ("instatus", StatusKind::Instatus),
-            ("incidentio", StatusKind::Incidentio),
-            ("datadog", StatusKind::Datadog),
+        for (name, provider) in [
+            ("statuspage", StatusProvider::Statuspage),
+            ("instatus", StatusProvider::Instatus),
+            ("incidentio", StatusProvider::Incidentio),
+            ("datadog", StatusProvider::Datadog),
         ] {
             let page = first_status_page(&format!(
                 "[[status_pages]]\nname = \"x\"\nkind = \"{name}\"\nurl = \"https://x.example\"\nwebhook = \"team\"\n"
             ));
-            assert_eq!(page.kind, kind, "{name}");
+            assert_eq!(page.provider, provider, "{name}");
         }
         let page = first_status_page(&format!(
             "[[status_pages]]\nname = \"x\"\nkind = \"custom\"\nurl = \"https://x.example/i.json\"\nwebhook = \"team\"\n{MAPPING}\n"
         ));
-        assert_eq!(page.kind, StatusKind::Custom);
-        let mapping = page.mapping.unwrap();
+        let StatusProvider::Custom(mapping) = page.provider else {
+            panic!("expected custom, got {:?}", page.provider);
+        };
         assert_eq!(mapping.incidents.unwrap().as_str(), "/incidents");
         assert_eq!(mapping.id.as_str(), "/id");
         assert!(mapping.status.is_none());
@@ -1968,7 +2037,11 @@ webhook = "team"
         let r = Config::from_toml(&format!(
             "{SYSTEM}[[status_pages]]\nname = \"mine\"\nkind = \"custom\"\nurl = \"https://x.example/i.json\"\nwebhook = \"team\"\n"
         ));
-        assert!(matches!(r, Err(ConfigError::CustomMappingMissing(n)) if n == "mine"));
+        let err = r.unwrap_err().to_string();
+        assert!(
+            err.contains("status page `mine`: kind `custom` requires `mapping`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1977,9 +2050,10 @@ webhook = "team"
             let r = Config::from_toml(&format!(
                 "{SYSTEM}[[status_pages]]\nname = \"mine\"\n{kind}url = \"https://x.example\"\nwebhook = \"team\"\n{MAPPING}\n"
             ));
+            let err = r.unwrap_err().to_string();
             assert!(
-                matches!(&r, Err(ConfigError::MappingNotCustom(n)) if n == "mine"),
-                "{kind:?}: {r:?}"
+                err.contains("status page `mine`: `mapping` is only allowed with kind `custom`"),
+                "{kind:?}: {err}"
             );
         }
     }

@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use url::Url;
 
-use crate::config::{CustomMapping, Impact, StatusKind};
+use crate::config::{CustomMapping, Impact, StatusProvider};
 use crate::fetch::{FetchError, Fetched, fetch_conditional};
 use crate::notifier::{DiscordMessage, Embed};
 use crate::rss::{FEED_ACCEPT, RssError};
@@ -72,16 +72,8 @@ pub enum DecodeError {
     Mapping(#[from] custom::MappingError),
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum SourceError {
-    #[error(transparent)]
-    Url(#[from] url::ParseError),
-    #[error("kind `custom` requires `mapping`")]
-    MissingMapping,
-}
-
 /// How a fetched body becomes incidents. Adding a provider is a new variant here
-/// plus the `StatusKind` that selects it; the poller never learns the difference.
+/// plus the `StatusProvider` that selects it; the poller never learns the difference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decoder {
     Statuspage,
@@ -139,18 +131,13 @@ pub struct SourceSpec {
     pub decoder: Decoder,
 }
 
-pub fn resolve_source(
-    kind: StatusKind,
-    url: &Url,
-    mapping: Option<&CustomMapping>,
-) -> Result<SourceSpec, SourceError> {
-    let (path, decoder) = match kind {
-        StatusKind::Statuspage => (STATUSPAGE_PATH, Decoder::Statuspage),
-        StatusKind::Instatus => (INSTATUS_PATH, Decoder::Instatus),
-        StatusKind::Incidentio => (INCIDENTIO_PATH, Decoder::IncidentIo),
-        StatusKind::Datadog => (DATADOG_PATH, Decoder::Datadog),
-        StatusKind::Custom => {
-            let mapping = mapping.ok_or(SourceError::MissingMapping)?;
+pub fn resolve_source(provider: &StatusProvider, url: &Url) -> Result<SourceSpec, url::ParseError> {
+    let (path, decoder) = match provider {
+        StatusProvider::Statuspage => (STATUSPAGE_PATH, Decoder::Statuspage),
+        StatusProvider::Instatus => (INSTATUS_PATH, Decoder::Instatus),
+        StatusProvider::Incidentio => (INCIDENTIO_PATH, Decoder::IncidentIo),
+        StatusProvider::Datadog => (DATADOG_PATH, Decoder::Datadog),
+        StatusProvider::Custom(mapping) => {
             return Ok(SourceSpec {
                 api_url: url.clone(),
                 decoder: Decoder::Custom(mapping.clone()),

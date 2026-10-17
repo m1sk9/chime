@@ -5,11 +5,9 @@ use chrono::{DateTime, Datelike, Timelike};
 use chrono_tz::Tz;
 use url::Url;
 
-use crate::config::{
-    Config, Impact, LogLevel, Message, Schedule, ScheduleError, ThreadId, TimeOfDay, WebhookRef,
-};
+use crate::config::{Config, Impact, LogLevel, Message, Schedule, ThreadId, TimeOfDay, WebhookRef};
 use crate::heartbeat::heartbeat_path;
-use crate::status::{Decoder, SourceError};
+use crate::status::Decoder;
 use crate::watch::{Extractor, resolve_source};
 
 #[derive(Debug, thiserror::Error)]
@@ -36,12 +34,6 @@ pub enum ResolveError {
         #[source]
         source: WebhookError,
     },
-    #[error("reminder `{name}`: {source}")]
-    Schedule {
-        name: String,
-        #[source]
-        source: ScheduleError,
-    },
     #[error("status page `{name}`: {source}")]
     StatusPageWebhook {
         name: String,
@@ -52,7 +44,7 @@ pub enum ResolveError {
     StatusPageSource {
         name: String,
         #[source]
-        source: SourceError,
+        source: url::ParseError,
     },
     #[error("watch `{name}`: {source}")]
     WatchWebhook {
@@ -194,10 +186,6 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
     let mut reminders = Vec::with_capacity(cfg.reminders.len());
     for r in cfg.reminders {
         let name = r.name.as_str().to_string();
-        let schedule = r.schedule().map_err(|source| ResolveError::Schedule {
-            name: name.clone(),
-            source,
-        })?;
         let webhook_url = resolve_webhook(&r.webhook, r.thread_id.as_ref()).map_err(|source| {
             ResolveError::Webhook {
                 name: name.clone(),
@@ -207,7 +195,7 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
         reminders.push(RunReminder {
             name,
             time: r.time,
-            schedule,
+            schedule: r.schedule,
             message: take_string(r.message),
             webhook_url,
         });
@@ -221,10 +209,12 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
                 source,
             }
         })?;
-        let spec = crate::status::resolve_source(p.kind, p.url.as_url(), p.mapping.as_ref())
-            .map_err(|source| ResolveError::StatusPageSource {
-                name: name.clone(),
-                source,
+        let spec =
+            crate::status::resolve_source(&p.provider, p.url.as_url()).map_err(|source| {
+                ResolveError::StatusPageSource {
+                    name: name.clone(),
+                    source,
+                }
             })?;
         let display_name = p
             .display_name
@@ -583,31 +573,6 @@ webhook = "resolve-nohook"
     }
 
     #[test]
-    fn resolve_reports_schedule_error_with_reminder_name() {
-        // `from_toml` normally rejects a reminder with no schedule; clearing the
-        // fields afterwards exercises `resolve`'s own defensive check.
-        let toml = r#"
-[system]
-tick_interval_sec = 30
-timezone = "Asia/Tokyo"
-
-[[reminders]]
-name = "orphan"
-time = "09:30"
-days = ["mon"]
-message = "hi"
-webhook = "team"
-"#;
-        let mut cfg = Config::from_toml(toml).unwrap();
-        cfg.reminders[0].days = None;
-        cfg.reminders[0].day_of_month = None;
-        assert!(matches!(
-            resolve(cfg),
-            Err(ResolveError::Schedule { name, .. }) if name == "orphan"
-        ));
-    }
-
-    #[test]
     fn resolve_builds_the_status_page_api_url() {
         let _g = EnvGuard::set("CHIME_WEBHOOK_STATUS_TEAM", "https://example.com/hook");
         let toml = r#"
@@ -707,37 +672,6 @@ webhook = "status-team"
             "https://x.example/api/incidents.json?limit=5"
         );
         assert!(matches!(page.decoder, Decoder::Custom(_)));
-    }
-
-    #[test]
-    fn resolve_reports_a_custom_page_without_mapping_by_name() {
-        // `from_toml` rejects this first; clearing the field afterwards exercises
-        // `resolve`'s own defensive check, as for reminder schedules.
-        let toml = r#"
-[system]
-tick_interval_sec = 30
-timezone = "Asia/Tokyo"
-
-[[status_pages]]
-name = "mine"
-kind = "custom"
-url = "https://x.example/i.json"
-webhook = "status-kind-nomapping"
-mapping = { id = "/id", title = "/title" }
-"#;
-        let _g = EnvGuard::set(
-            "CHIME_WEBHOOK_STATUS_KIND_NOMAPPING",
-            "https://example.com/hook",
-        );
-        let mut cfg = Config::from_toml(toml).unwrap();
-        cfg.status_pages[0].mapping = None;
-        assert!(matches!(
-            resolve(cfg),
-            Err(ResolveError::StatusPageSource {
-                name,
-                source: SourceError::MissingMapping,
-            }) if name == "mine"
-        ));
     }
 
     #[test]
