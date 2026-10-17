@@ -1667,6 +1667,7 @@ mod tests {
         let mut w = mk_run_watch(name);
         w.extractor = crate::watch::Extractor::JsonPointer {
             pointer: pointer.to_string(),
+            link: None,
         };
         w
     }

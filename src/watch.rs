@@ -107,8 +107,8 @@ struct ChromeServing {
 }
 
 /// One observed release: only what the fetched body said. What the watch's own
-/// config already determines (channel, platform, link) is read from `RunWatch`
-/// when the message is built.
+/// config already determines (channel, platform, link) is read from its
+/// `Extractor` when the message is built.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Release {
     /// The dedup key; everything else is display.
@@ -133,8 +133,9 @@ pub enum ReleaseDetail {
     Plain,
 }
 
-/// How a version is read out of a fetched body. Adding a source is a new variant
-/// here plus the `WatchKind` that selects it; the poller never learns the difference.
+/// How a version is read out of a fetched body, and what the source's config adds
+/// to its embed. Adding a source is a new variant here plus the `WatchKind` that
+/// selects it; neither the poller nor `build_message` learns the difference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Extractor {
     Firefox {
@@ -146,6 +147,7 @@ pub enum Extractor {
     },
     JsonPointer {
         pointer: String,
+        link: Option<String>,
     },
 }
 
@@ -155,7 +157,29 @@ impl Extractor {
         match self {
             Extractor::Firefox { channel } => extract_firefox(*channel, body),
             Extractor::Chrome { .. } => extract_chrome(body),
-            Extractor::JsonPointer { pointer } => extract_pointer(pointer, body),
+            Extractor::JsonPointer { pointer, .. } => extract_pointer(pointer, body),
+        }
+    }
+
+    /// Where the embed title links for `version`: derived for the presets, the
+    /// configured `link` for `json`.
+    fn link(&self, version: &str) -> Option<String> {
+        match self {
+            Extractor::Firefox { channel } => Some(firefox_release_notes(*channel, version)),
+            Extractor::Chrome { channel, .. } => Some(chrome_channel_link(*channel)),
+            Extractor::JsonPointer { link, .. } => link.clone(),
+        }
+    }
+
+    /// The `(name, value)` embed fields the watch's config fixes.
+    fn fields(&self) -> Vec<(&'static str, &'static str)> {
+        match self {
+            Extractor::Firefox { channel } => vec![("Channel", channel.label())],
+            Extractor::Chrome { platform, channel } => vec![
+                ("Channel", channel.label()),
+                ("Platform", platform.as_api_str()),
+            ],
+            Extractor::JsonPointer { .. } => Vec::new(),
         }
     }
 }
@@ -284,24 +308,12 @@ fn chrome_channel_link(channel: ChromeChannel) -> String {
     format!("{CHROME_RELEASES_BLOG}search/label/{label}")
 }
 
-/// Where the embed title links for `version`: derived for the presets, the
-/// configured `link` for `json`.
-fn release_link(watch: &RunWatch, version: &str) -> Option<String> {
-    match watch.extractor {
-        Extractor::Firefox { channel } => Some(firefox_release_notes(channel, version)),
-        Extractor::Chrome { channel, .. } => Some(chrome_channel_link(channel)),
-        Extractor::JsonPointer { .. } => watch.link.clone(),
-    }
-}
-
 /// Everything the poller needs, derived from one `WatchKind` at resolve time.
 #[derive(Debug, Clone)]
 pub struct SourceSpec {
     pub label: String,
     pub url: Url,
     pub extractor: Extractor,
-    /// Only `json` has one; the presets derive theirs from the version.
-    pub link: Option<String>,
 }
 
 /// Called from `runtime::resolve`. The only fallible step is `Url::parse` of the
@@ -316,7 +328,6 @@ pub fn resolve_source(name: &str, kind: &WatchKind) -> Result<SourceSpec, url::P
             },
             url: Url::parse(FIREFOX_VERSIONS_URL)?,
             extractor: Extractor::Firefox { channel: *channel },
-            link: None,
         }),
         WatchKind::Chrome {
             platform,
@@ -339,7 +350,6 @@ pub fn resolve_source(name: &str, kind: &WatchKind) -> Result<SourceSpec, url::P
                     platform: *platform,
                     channel: *channel,
                 },
-                link: None,
             })
         }
         WatchKind::Json { url, pointer, link } => Ok(SourceSpec {
@@ -347,8 +357,8 @@ pub fn resolve_source(name: &str, kind: &WatchKind) -> Result<SourceSpec, url::P
             url: url.as_url().clone(),
             extractor: Extractor::JsonPointer {
                 pointer: pointer.as_str().to_string(),
+                link: link.as_ref().map(|l| l.as_url().to_string()),
             },
-            link: link.as_ref().map(|l| l.as_url().to_string()),
         }),
     }
 }
@@ -445,20 +455,11 @@ pub fn build_message(
         COLOR_RELEASE,
     )
     .with_field("Previous", &event.previous, true);
-    if let Some(link) = release_link(watch, &release.version) {
+    if let Some(link) = watch.extractor.link(&release.version) {
         embed = embed.with_url(&link);
     }
-
-    match watch.extractor {
-        Extractor::Firefox { channel } => {
-            embed = embed.with_field("Channel", channel.label(), true);
-        }
-        Extractor::Chrome { platform, channel } => {
-            embed = embed
-                .with_field("Channel", channel.label(), true)
-                .with_field("Platform", platform.as_api_str(), true);
-        }
-        Extractor::JsonPointer { .. } => {}
+    for (name, value) in watch.extractor.fields() {
+        embed = embed.with_field(name, value, true);
     }
 
     match &release.detail {
@@ -614,6 +615,7 @@ mod tests {
     fn pointer(p: &str) -> Extractor {
         Extractor::JsonPointer {
             pointer: p.to_string(),
+            link: None,
         }
     }
 
@@ -648,7 +650,6 @@ mod tests {
             assert_eq!(spec.label, label);
             assert_eq!(spec.url.as_str(), FIREFOX_VERSIONS_URL);
             assert_eq!(spec.extractor, firefox(channel));
-            assert!(spec.link.is_none(), "derived from the version instead");
         }
     }
 
@@ -708,11 +709,8 @@ mod tests {
             spec.extractor,
             Extractor::JsonPointer {
                 pointer: "/0/version".to_string(),
+                link: Some("https://nodejs.org/en/blog/release".to_string()),
             }
-        );
-        assert_eq!(
-            spec.link.as_deref(),
-            Some("https://nodejs.org/en/blog/release")
         );
     }
 
@@ -1126,7 +1124,10 @@ mod tests {
     #[test]
     fn plain_message_carries_only_previous_and_link() {
         let mut watch = mk_run_watch("node");
-        watch.link = Some("https://nodejs.org/en/blog/release".to_string());
+        watch.extractor = Extractor::JsonPointer {
+            pointer: "/version".to_string(),
+            link: Some("https://nodejs.org/en/blog/release".to_string()),
+        };
         let ev = event_from(&watch.extractor, r#"{"version": "v24.9.0"}"#, "v24.8.0");
         let msg = build_message(&watch, &ev, ts("2026-09-27T01:02:03Z"));
 

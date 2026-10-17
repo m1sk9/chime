@@ -124,8 +124,6 @@ pub struct RunWatch {
     /// Shown in the embed footer, e.g. `product-details.mozilla.org`.
     pub host: String,
     pub extractor: Extractor,
-    /// The configured `link` of a `json` watch; the presets derive theirs.
-    pub link: Option<String>,
     pub webhook_url: Url,
     pub display_name: String,
     pub avatar_url: Option<String>,
@@ -270,7 +268,6 @@ pub fn resolve(cfg: Config) -> Result<RunConfig, ResolveError> {
             host: host_of(&spec.url),
             label: spec.label,
             extractor: spec.extractor,
-            link: spec.link,
             webhook_url,
             display_name,
             avatar_url: w.avatar_url.map(|a| a.into_string()),
@@ -436,8 +433,8 @@ mod test_support {
             host: format!("watch.{name}.example"),
             extractor: Extractor::JsonPointer {
                 pointer: "/version".to_string(),
+                link: None,
             },
-            link: None,
             webhook_url: Url::parse("https://discord.example/webhook").unwrap(),
             display_name: format!("{name} Releases"),
             avatar_url: None,
@@ -877,6 +874,7 @@ avatar_url = "https://example.com/node.png"
             w.extractor,
             Extractor::JsonPointer {
                 pointer: "/0/version".to_string(),
+                link: None,
             }
         );
     }
