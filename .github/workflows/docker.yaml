@@ -1,0 +1,41 @@
+name: Docker
+
+on:
+  pull_request:
+    paths:
+      - "docker/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/docker.yaml"
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            cache-scope: buildx-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            cache-scope: buildx-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Reads the release workflow's cache but never writes it, so a PR cannot
+      # evict the layers the next release build depends on.
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          push: false
+          platforms: ${{ matrix.platform }}
+          file: ./docker/Dockerfile
+          cache-from: type=gha,scope=${{ matrix.cache-scope }}

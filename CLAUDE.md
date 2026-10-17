@@ -70,6 +70,8 @@ Three jobs in `.github/workflows/ci.yaml` must pass before merge:
 
 1. `check` — `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --verbose`.
 2. `coverage` — `cargo llvm-cov` → Codecov (`fail_ci_if_error: true`).
-3. `build` — matrix build for `x86_64-unknown-linux-gnu` and `x86_64-unknown-linux-musl` (the musl build uses `cross`).
+3. `build` — matrix build for `x86_64-unknown-linux-gnu` and `x86_64-unknown-linux-musl` (the musl build is plain `cargo` with `musl-tools`).
+
+`.github/workflows/docker.yaml` also builds the image for amd64 and arm64 (no push) on PRs touching `docker/**`, `Cargo.*` or `rust-toolchain.toml`, so a Dockerfile break surfaces before release-please tags a release.
 
 Run `cargo fmt --all && cargo clippy --all-targets --all-features -- -D warnings && cargo test` locally before pushing.
