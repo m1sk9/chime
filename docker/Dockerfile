@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.28
 
-FROM lukemathwalker/cargo-chef:latest-rust-1-bookworm AS chef
+FROM lukemathwalker/cargo-chef:0.1.78-rust-1-bookworm AS chef
 WORKDIR /build
 
 # aws-lc-sys (reqwest rustls backend) needs cmake + make to build its C sources;
