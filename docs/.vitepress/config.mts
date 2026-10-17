@@ -1,5 +1,6 @@
 import { execSync } from 'node:child_process';
 import { defineConfig } from 'vitepress';
+import llmstxt from 'vitepress-plugin-llms';
 import { en } from './config/en';
 import { ja } from './config/ja';
 
@@ -35,6 +36,14 @@ export default defineConfig({
   },
   title: 'chime',
   titleTemplate: 'chime',
+  vite: {
+    plugins: [
+      llmstxt({
+        domain: 'https://chime.m1sk9.dev',
+        ignoreFiles: ['index.md', 'ja/index.md'],
+      }),
+    ],
+  },
   themeConfig: {
     socialLinks: [{ icon: 'github', link: 'https://github.com/m1sk9/chime' }],
   },

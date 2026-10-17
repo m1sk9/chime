@@ -88,3 +88,29 @@
   border: none;
   border-top: 1px solid var(--vp-c-divider);
 }
+
+/* ── Page actions: copy / view the page as Markdown ── */
+.page-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.page-actions-button {
+  padding: 4px 12px;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 8px;
+  background: var(--vp-c-bg-soft);
+  color: var(--vp-c-text-2);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 24px;
+  cursor: pointer;
+  transition: color 0.2s, border-color 0.2s;
+}
+
+.page-actions-button:hover {
+  border-color: var(--vp-c-brand-1);
+  color: var(--vp-c-brand-1);
+}

@@ -1,5 +1,7 @@
 import { inBrowser, type Theme } from 'vitepress';
 import DefaultTheme from 'vitepress/theme';
+import { h } from 'vue';
+import PageActions from './components/PageActions.vue';
 import './custom.css';
 
 const LOCALE_REDIRECT_FLAG = 'chime-locale-redirected';
@@ -20,6 +22,10 @@ function redirectByBrowserLanguage() {
 
 export default {
   extends: DefaultTheme,
+  Layout: () =>
+    h(DefaultTheme.Layout, null, {
+      'doc-before': () => h(PageActions),
+    }),
   enhanceApp() {
     redirectByBrowserLanguage();
   },
