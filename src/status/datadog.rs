@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use serde::Deserialize;
 use url::Url;
 
-use super::{DecodeError, Incident, IncidentState, IncidentUpdate, join_base, parse_time};
+use super::{DecodeError, Incident, IncidentState, IncidentUpdate, parse_time};
 use crate::config::Impact;
 
 // Why `incidents` is required: it is what tells this document from other JSON.
@@ -85,7 +85,7 @@ impl WireIncident {
             })
             .collect();
         Incident {
-            link: join_base(page_url, &self.id).ok().map(String::from),
+            link: incident_link(page_url, &self.id),
             id: self.id,
             name: self.title,
             impact,
@@ -93,6 +93,16 @@ impl WireIncident {
             updates,
         }
     }
+}
+
+/// Why not `Url::join`: it reads the id as a relative reference, so an id holding
+/// `:`, `?`, `#` or `..` would leave the page; a pushed segment is percent-encoded.
+fn incident_link(page_url: &Url, id: &str) -> Option<String> {
+    let mut url = page_url.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    url.path_segments_mut().ok()?.pop_if_empty().push(id);
+    Some(url.into())
 }
 
 fn component_impact(status: &str) -> Option<Impact> {
@@ -246,6 +256,27 @@ mod tests {
             Some(
                 "https://demo-status-page.statuspage.datadoghq.com/3db838fd-93e6-4f48-8be5-788e67121f37"
             )
+        );
+    }
+
+    #[test]
+    fn link_keeps_a_page_path_and_encodes_the_id() {
+        for base in ["https://x.example/status", "https://x.example/status/"] {
+            let url = Url::parse(base).unwrap();
+            assert_eq!(
+                incident_link(&url, "abc").as_deref(),
+                Some("https://x.example/status/abc"),
+                "{base}"
+            );
+        }
+        let url = page_url();
+        assert_eq!(
+            incident_link(&url, "a?b#c").as_deref(),
+            Some("https://demo-status-page.statuspage.datadoghq.com/a%3Fb%23c")
+        );
+        assert_eq!(
+            incident_link(&url, "https://evil.example").as_deref(),
+            Some("https://demo-status-page.statuspage.datadoghq.com/https:%2F%2Fevil.example")
         );
     }
 

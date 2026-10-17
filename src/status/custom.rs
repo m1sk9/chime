@@ -4,36 +4,6 @@ use serde_json::Value;
 use super::{DecodeError, Incident, IncidentState, IncidentUpdate, parse_time};
 use crate::config::{CustomMapping, Impact, JsonPointer};
 
-/// `CustomMapping` with its pointers as plain strings, the form `Value::pointer`
-/// takes. `incidents` is `""` (the whole document) when the config omits it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Mapping {
-    incidents: String,
-    id: String,
-    title: String,
-    status: Option<String>,
-    body: Option<String>,
-    updated_at: Option<String>,
-    link: Option<String>,
-    impact: Option<String>,
-}
-
-impl From<&CustomMapping> for Mapping {
-    fn from(m: &CustomMapping) -> Self {
-        let own = |p: &Option<JsonPointer>| p.as_ref().map(|p| p.as_str().to_string());
-        Mapping {
-            incidents: own(&m.incidents).unwrap_or_default(),
-            id: m.id.as_str().to_string(),
-            title: m.title.as_str().to_string(),
-            status: own(&m.status),
-            body: own(&m.body),
-            updated_at: own(&m.updated_at),
-            link: own(&m.link),
-            impact: own(&m.impact),
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum MappingError {
     #[error("nothing at JSON pointer `{0}`")]
@@ -56,30 +26,36 @@ pub enum MappingError {
 /// mapping is the user's own config, and a pointer that misses has to show up as
 /// a `warn` on every poll, as a `json` watch's pointer does, not as silence.
 pub(super) fn decode(
-    mapping: &Mapping,
+    mapping: &CustomMapping,
     body: &[u8],
     now: DateTime<Utc>,
 ) -> Result<Vec<Incident>, DecodeError> {
     let doc: Value = serde_json::from_slice(body)?;
+    // `""` addresses the whole document.
+    let pointer = mapping.incidents.as_ref().map_or("", JsonPointer::as_str);
     let items = doc
-        .pointer(&mapping.incidents)
-        .ok_or_else(|| MappingError::Missing(mapping.incidents.clone()))?
+        .pointer(pointer)
+        .ok_or_else(|| MappingError::Missing(pointer.to_string()))?
         .as_array()
-        .ok_or_else(|| MappingError::NotArray(mapping.incidents.clone()))?;
+        .ok_or_else(|| MappingError::NotArray(pointer.to_string()))?;
     Ok(items
         .iter()
         .map(|item| incident(mapping, item, now))
         .collect::<Result<_, _>>()?)
 }
 
-fn incident(mapping: &Mapping, item: &Value, now: DateTime<Utc>) -> Result<Incident, MappingError> {
+fn incident(
+    mapping: &CustomMapping,
+    item: &Value,
+    now: DateTime<Utc>,
+) -> Result<Incident, MappingError> {
     let id = required(item, &mapping.id)?;
     let title = required(item, &mapping.title)?;
-    let status = optional(item, mapping.status.as_deref())?;
-    let updated_at = optional(item, mapping.updated_at.as_deref())?;
+    let status = optional(item, mapping.status.as_ref())?;
+    let updated_at = optional(item, mapping.updated_at.as_ref())?;
     let created_at = match (&updated_at, &mapping.updated_at) {
         (Some(raw), Some(pointer)) => {
-            parse_time(raw).ok_or_else(|| MappingError::Timestamp(pointer.clone()))?
+            parse_time(raw).ok_or_else(|| MappingError::Timestamp(pointer.as_str().to_string()))?
         }
         _ => now,
     };
@@ -89,22 +65,23 @@ fn incident(mapping: &Mapping, item: &Value, now: DateTime<Utc>) -> Result<Incid
     Ok(Incident {
         id,
         name: title,
-        impact: optional(item, mapping.impact.as_deref())?
+        impact: optional(item, mapping.impact.as_ref())?
             .and_then(|i| Impact::from_wire(&i.to_ascii_lowercase())),
-        link: optional(item, mapping.link.as_deref())?,
+        link: optional(item, mapping.link.as_ref())?,
         components: Vec::new(),
         updates: vec![IncidentUpdate {
             id: update_id,
             state: status
                 .as_deref()
                 .map_or(IncidentState::Unknown, IncidentState::from_wire),
-            body: optional(item, mapping.body.as_deref())?.unwrap_or_default(),
+            body: optional(item, mapping.body.as_ref())?.unwrap_or_default(),
             created_at,
         }],
     })
 }
 
-fn required(item: &Value, pointer: &str) -> Result<String, MappingError> {
+fn required(item: &Value, pointer: &JsonPointer) -> Result<String, MappingError> {
+    let pointer = pointer.as_str();
     match scalar(item, pointer)? {
         None => Err(MappingError::Missing(pointer.to_string())),
         Some(s) if s.is_empty() => Err(MappingError::Empty(pointer.to_string())),
@@ -114,11 +91,11 @@ fn required(item: &Value, pointer: &str) -> Result<String, MappingError> {
 
 /// An unset pointer, a missing value, `null` and `""` all read as absent: an
 /// incident that has not been resolved yet may well have no `resolved_at`.
-fn optional(item: &Value, pointer: Option<&str>) -> Result<Option<String>, MappingError> {
+fn optional(item: &Value, pointer: Option<&JsonPointer>) -> Result<Option<String>, MappingError> {
     let Some(pointer) = pointer else {
         return Ok(None);
     };
-    Ok(scalar(item, pointer)?.filter(|s| !s.is_empty()))
+    Ok(scalar(item, pointer.as_str())?.filter(|s| !s.is_empty()))
 }
 
 /// Same rule as a `json` watch: strings and integers only, because a fractional
@@ -138,17 +115,17 @@ mod tests {
     use super::*;
     use crate::status::ts;
 
-    fn mapping(toml_inline: &str) -> Mapping {
+    fn mapping(toml_inline: &str) -> CustomMapping {
         #[derive(serde::Deserialize)]
         struct Wrap {
             mapping: CustomMapping,
         }
         let wrap: Wrap = toml::from_str(&format!("mapping = {toml_inline}")).unwrap();
-        Mapping::from(&wrap.mapping)
+        wrap.mapping
     }
 
     /// The mapping shown in the README.
-    fn documented() -> Mapping {
+    fn documented() -> CustomMapping {
         mapping(
             r#"{ incidents = "/incidents", id = "/id", title = "/title", status = "/state", body = "/message", updated_at = "/updated_at", link = "/url", impact = "/severity" }"#,
         )
@@ -158,7 +135,7 @@ mod tests {
         ts("2026-10-17T14:00:00Z")
     }
 
-    fn decode_with(m: &Mapping, json: &str) -> Result<Vec<Incident>, DecodeError> {
+    fn decode_with(m: &CustomMapping, json: &str) -> Result<Vec<Incident>, DecodeError> {
         decode(m, json.as_bytes(), now())
     }
 

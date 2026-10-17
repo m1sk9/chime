@@ -88,7 +88,7 @@ pub enum Decoder {
     Instatus,
     IncidentIo,
     Datadog,
-    Custom(custom::Mapping),
+    Custom(CustomMapping),
 }
 
 impl Decoder {
@@ -153,7 +153,7 @@ pub fn resolve_source(
             let mapping = mapping.ok_or(SourceError::MissingMapping)?;
             return Ok(SourceSpec {
                 api_url: url.clone(),
-                decoder: Decoder::Custom(custom::Mapping::from(mapping)),
+                decoder: Decoder::Custom(mapping.clone()),
             });
         }
     };

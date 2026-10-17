@@ -1158,8 +1158,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_body_that_fails_to_decode_leaves_the_etag_unstored() {
-        // Holds for every decoder: `StatusEndpoint` turns a decode failure into an
-        // `Err`, and only an `Ok` body may replace the stored ETag.
+        // Covers the scheduler half only: an `Err` from the source must not replace
+        // the stored ETag. That `StatusEndpoint` reports a decode failure as `Err`
+        // is its own contract, not exercised by this fake.
         let cfg = cfg_with(
             "decode_fail",
             vec![],

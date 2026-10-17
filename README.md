@@ -278,7 +278,7 @@ Each update is one embed. The colour bar is the severity at a glance:
 | `minor` | yellow | ↑ |
 | `none`, or an unrecognised severity | grey | ↑ |
 
-A resolved incident is green regardless of how severe it was, so "this is fixed" never arrives wearing a red bar. The embed carries the incident title (linked to the incident page — the Statuspage short link, for instance), the latest update's text, `Status` / `Impact` / `Components` fields, the status page host as the footer, and the update's own timestamp — which is when the page published it, not when chime posted it.
+A resolved incident is green regardless of how severe it was, so "this is fixed" never arrives wearing a red bar. The embed carries the incident title (linked to the incident page — the Statuspage short link, for instance), the latest update's text, `Status` / `Impact` / `Components` fields, the status page host as the footer, and the update's own timestamp — which is when the page published it, not when chime posted it. The exceptions are an update whose document carries no time (a `custom` page without `updated_at`, an undated incident.io entry), which is timed when chime first saw it.
 
 The `Status` field of one real incident renders as `✅ Resolved`, `Impact` as `Minor`, and the message is attributed to `display_name` so several status pages can share one Discord channel and still be told apart.
 
@@ -423,7 +423,7 @@ All of the following are rejected at startup with a descriptive error and a non-
 - A reminder specifying neither or both of `days` / `day_of_month`
 - Empty `message`
 - Webhook env var unset, empty, or not a valid URL
-- `thread_id` that is empty or not all digits (or written as a TOML integer)
+- `thread_id` that is empty, not all digits, zero or beyond 64 bits (or written as a TOML integer)
 - Neither reminders, status pages, watches nor rss feeds defined
 - Duplicate or empty status page `name`
 - Status page `url` or `avatar_url` that is not `https`, or has no host
@@ -456,7 +456,7 @@ Status page polling follows the same rules as reminders:
 - **The first poll after startup is silent.** Every document lists incidents that are already known — Statuspage's `incidents.json` the 50 most recent, Datadog's `config.json` the whole history, Instatus the active and recently resolved ones — so chime records them as a baseline and reports nothing. Only what changes *afterwards* is forwarded. A restart therefore re-baselines — it never replays history into the channel, in the same spirit as "a missed minute is a missed notification".
 - The seen-record is written **before** the Discord request, so a failed send is not retried on the next poll.
 - A status page being unreachable is logged at `warn` and retried on its own interval. chime never posts about its own polling failures.
-- Because polling happens on the tick, an update is forwarded up to `poll_interval_sec` after the page published it. The embed timestamp always shows the real publication time.
+- Because polling happens on the tick, an update is forwarded up to `poll_interval_sec` after the page published it. The embed timestamp shows the real publication time wherever the document carries one.
 - **One page, watch or feed is polled per tick**, so a tick costs a single request no matter how many are configured — a set of unreachable endpoints cannot stall the loop long enough for `chime health` to call the heartbeat stale. Each entry takes `tick_interval_sec / poll_interval_sec` of that budget — with `tick_interval_sec = 60`, a page at 300 takes a fifth, a feed at 900 a fifteenth and a watch at 3600 a sixtieth — and every one stays on its nominal interval as long as the shares of all pages, watches and feeds add up to at most 1; beyond that they simply poll less often. Watches sharing a URL count once, at their shared interval.
 - Requests are conditional (`If-None-Match`) and compressed (`Accept-Encoding: gzip`), so a page with no news usually costs a 304 with no body at all. An instance that returns **no `ETag`** — Instatus and incident.io pages, and some Statuspage-compatible feeds served from other infrastructure — cannot be validated, so every poll downloads the whole feed — as do Chrome watches and most RSS feeds. gzip keeps that in the single-digit kilobytes; nothing else is needed.
 

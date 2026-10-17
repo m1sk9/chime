@@ -74,6 +74,21 @@ pub(super) fn decode(body: &[u8]) -> Result<Vec<Incident>, DecodeError> {
         .collect())
 }
 
+/// Why not the resolution time as the id of a resolved update: an active entry
+/// times it by `lastUpdate.createdAt` and a recently resolved one by `resolved`,
+/// two fields that need not agree, so one resolution moving between the lists
+/// would be posted twice. A reopened incident still reports, since its next
+/// update is keyed by time.
+const RESOLVED_UPDATE_ID: &str = "resolved";
+
+fn update_id(state: IncidentState, at: String) -> String {
+    if state == IncidentState::Resolved {
+        RESOLVED_UPDATE_ID.to_string()
+    } else {
+        at
+    }
+}
+
 impl WireActive {
     /// The summary carries only the latest update, so its time is the update's id:
     /// several updates between two polls are forwarded as the last one.
@@ -82,18 +97,19 @@ impl WireActive {
             Some(u) => (u.message, u.created_at),
             None => (None, None),
         };
-        let at = last_at.or(self.updated_at).or(self.started);
-        let updates = at
-            .and_then(|at| {
-                Some(IncidentUpdate {
-                    created_at: parse_time(&at)?,
-                    id: at,
-                    state: self
-                        .status
-                        .as_deref()
-                        .map_or(IncidentState::Unknown, IncidentState::from_wire),
-                    body: message.unwrap_or_default(),
-                })
+        let state = self
+            .status
+            .as_deref()
+            .map_or(IncidentState::Unknown, IncidentState::from_wire);
+        let updates = [last_at, self.updated_at, self.started]
+            .into_iter()
+            .flatten()
+            .find_map(|at| Some((parse_time(&at)?, at)))
+            .map(|(created_at, at)| IncidentUpdate {
+                created_at,
+                id: update_id(state, at),
+                state,
+                body: message.unwrap_or_default(),
             })
             .into_iter()
             .collect();
@@ -112,13 +128,12 @@ impl WireResolved {
     fn normalize(self) -> Incident {
         let updates = self
             .resolved
-            .and_then(|at| {
-                Some(IncidentUpdate {
-                    created_at: parse_time(&at)?,
-                    id: at,
-                    state: IncidentState::Resolved,
-                    body: String::new(),
-                })
+            .and_then(|at| parse_time(&at))
+            .map(|created_at| IncidentUpdate {
+                created_at,
+                id: RESOLVED_UPDATE_ID.to_string(),
+                state: IncidentState::Resolved,
+                body: String::new(),
             })
             .into_iter()
             .collect();
@@ -147,7 +162,7 @@ fn impact(s: &str) -> Option<Impact> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::status::ts;
+    use crate::status::{PageState, diff, ts};
 
     /// The v3 example from Instatus's `/public-api` page.
     const SUMMARY: &str = r#"{
@@ -180,7 +195,7 @@ mod tests {
           "id": "cl4a8m6xk0612qtmzq2b1v8de",
           "name": "Slow dashboard loading",
           "started": "2022-06-11T09:12:00Z",
-          "resolved": "2022-06-11T10:40:00Z",
+          "resolved": "2022-06-11T09:58:00Z",
           "impact": "DEGRADEDPERFORMANCE",
           "url": "https://testing-widget.instatus.com/incident/cl4a8m6xk0612qtmzq2b1v8de"
         }
@@ -230,10 +245,53 @@ mod tests {
         assert_eq!(incident.id, "cl4a8m6xk0612qtmzq2b1v8de");
         assert_eq!(incident.impact, Some(Impact::Minor));
         let update = &incident.updates[0];
-        assert_eq!(update.id, "2022-06-11T10:40:00Z");
+        assert_eq!(update.id, RESOLVED_UPDATE_ID);
         assert_eq!(update.state, IncidentState::Resolved);
         assert_eq!(update.body, "");
-        assert_eq!(update.created_at, ts("2022-06-11T10:40:00Z"));
+        assert_eq!(update.created_at, ts("2022-06-11T09:58:00Z"));
+    }
+
+    #[test]
+    fn a_resolution_moving_between_the_lists_is_posted_once() {
+        let mut state = PageState::default();
+        let active = |status: &str, at: &str| {
+            format!(
+                r#"{{"page":{{"status":"HASISSUES"}},"activeIncidents":[{{"id":"x","name":"n","status":"{status}","lastUpdate":{{"message":"m","createdAt":"{at}"}}}}]}}"#
+            )
+        };
+        let poll = |state: &mut PageState, body: &str| {
+            diff(state, &decode(body.as_bytes()).unwrap(), Impact::None).len()
+        };
+        assert_eq!(
+            poll(&mut state, &active("MONITORING", "2022-06-11T10:00:00Z")),
+            0
+        );
+        assert_eq!(
+            poll(&mut state, &active("RESOLVED", "2022-06-11T10:40:00.123Z")),
+            1
+        );
+        // `resolved` disagrees with the `lastUpdate` that announced it.
+        let resolved = r#"{"page":{"status":"UP"},"recentlyResolvedIncidents":[{"id":"x","name":"n","resolved":"2022-06-11T10:40:00Z"}]}"#;
+        assert_eq!(poll(&mut state, resolved), 0);
+        assert_eq!(
+            poll(&mut state, &active("INVESTIGATING", "2022-06-11T11:00:00Z")),
+            1,
+            "a reopened incident reports again"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_last_update_time_falls_back_to_the_next_field() {
+        let incident = decode(
+            br#"{"page":{"status":"HASISSUES"},"activeIncidents":[
+              {"id":"a","name":"n","status":"IDENTIFIED","updatedAt":"2022-06-11T19:00:00Z",
+               "lastUpdate":{"message":"m","createdAt":"yesterday"}}
+            ]}"#,
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(incident.updates[0].id, "2022-06-11T19:00:00Z");
+        assert_eq!(incident.updates[0].body, "m");
     }
 
     #[test]

@@ -104,7 +104,7 @@ pub enum JsonPointerError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ThreadIdError {
-    #[error("thread_id must be a Discord snowflake (digits only), got {0:?}")]
+    #[error("thread_id must be a Discord snowflake (non-zero digits within 64 bits), got {0:?}")]
     NotSnowflake(String),
 }
 
@@ -294,7 +294,11 @@ impl TryFrom<String> for ThreadId {
     type Error = ThreadIdError;
     fn try_from(s: String) -> Result<Self, Self::Error> {
         let trimmed = s.trim();
-        if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        // Why the digit check on top of `parse`: `u64::from_str` also accepts a
+        // leading `+`, which Discord would reject.
+        let is_snowflake = trimmed.bytes().all(|b| b.is_ascii_digit())
+            && trimmed.parse::<u64>().is_ok_and(|n| n != 0);
+        if !is_snowflake {
             return Err(ThreadIdError::NotSnowflake(s));
         }
         Ok(ThreadId(trimmed.to_string()))
@@ -1551,10 +1555,16 @@ min_impact = "major"
 
     #[test]
     fn json_watch_url_requires_https_and_is_not_slash_normalized() {
-        assert!(matches!(
-            HttpsUrl::try_from("http://x.example/api/v.json".to_string()),
-            Err(HttpsUrlError::Scheme(_))
-        ));
+        for bad in ["http://x.example/api/v.json", "ftp://x.example/v.json"] {
+            assert!(
+                matches!(
+                    HttpsUrl::try_from(bad.to_string()),
+                    Err(HttpsUrlError::Scheme(_))
+                ),
+                "{bad}"
+            );
+        }
+        assert!(HttpsUrl::try_from("not a url".to_string()).is_err());
         let w = first_watch(
             r#"
 [[watches]]
@@ -1819,7 +1829,24 @@ webhook = "team"
 
     #[test]
     fn thread_id_rejects_empty_and_non_digits() {
-        for bad in ["", " ", "abc", "12 34", "-1", "12a"] {
+        for bad in ["", " ", "abc", "12 34", "-1", "+1", "12a"] {
+            assert!(
+                matches!(
+                    ThreadId::try_from(bad.to_string()),
+                    Err(ThreadIdError::NotSnowflake(_))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thread_id_rejects_zero_and_values_beyond_u64() {
+        for bad in [
+            "0",
+            "18446744073709551616",
+            "123456789012345678901234567890",
+        ] {
             assert!(
                 matches!(
                     ThreadId::try_from(bad.to_string()),
