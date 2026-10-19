@@ -10,7 +10,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-use crate::fetch::{BodySource, Fetched};
+use crate::fetch::{BodySource, ErrorChain, Fetched};
 use crate::notifier::{DiscordMessage, Notifier, NotifyError};
 use crate::rss::{self, FEED_ACCEPT, RssState};
 use crate::runtime::{RunConfig, RunFeed, RunRss, RunStatusPage};
@@ -218,7 +218,9 @@ impl<N: Notifier, S: StatusSource, B: BodySource> Scheduler<N, S, B> {
             let payload = DiscordMessage::text(&r.message);
             match notifier.send(&r.webhook_url, &payload).await {
                 Ok(()) => info!(reminder = %r.name, "reminder fired"),
-                Err(e) => error!(reminder = %r.name, error = %e, "failed to send reminder"),
+                Err(e) => {
+                    error!(reminder = %r.name, error = %ErrorChain(&e), "failed to send reminder")
+                }
             }
         }
     }
@@ -389,7 +391,7 @@ fn write_heartbeat(path: &Path) {
     if let Err(e) = std::fs::write(path, body) {
         warn!(
             path = %path.display(),
-            error = %e,
+            error = %ErrorChain(&e),
             "failed to write heartbeat"
         );
     }
@@ -426,7 +428,7 @@ async fn poll_page<N: Notifier, S: StatusSource>(
         Err(e) => {
             // A status page being unreachable is not chime's outage to report:
             // log it and try again next interval, never notify Discord.
-            warn!(status_page = %page.name, error = %e, "failed to poll status page");
+            warn!(status_page = %page.name, error = %ErrorChain(&e), "failed to poll status page");
             return PollOutcome::Failed;
         }
     };
@@ -455,7 +457,7 @@ async fn poll_page<N: Notifier, S: StatusSource>(
             Err(e) => error!(
                 status_page = %page.name,
                 incident = %event.incident_id,
-                error = %e,
+                error = %ErrorChain(&e),
                 "failed to forward status update"
             ),
         }
@@ -473,7 +475,7 @@ async fn poll_feed<N: Notifier, B: BodySource>(
     let fetched = match source.fetch(&feed.url, state.etag(), WATCH_ACCEPT).await {
         Ok(f) => f,
         Err(e) => {
-            warn!(watch = %feed.names(), error = %e, "failed to poll watch");
+            warn!(watch = %feed.names(), error = %ErrorChain(&e), "failed to poll watch");
             return PollOutcome::Failed;
         }
     };
@@ -492,7 +494,7 @@ async fn poll_feed<N: Notifier, B: BodySource>(
         let event = match result {
             Err(e) => {
                 unreadable = true;
-                warn!(watch = %w.name, error = %e, "failed to read release from watch");
+                warn!(watch = %w.name, error = %ErrorChain(&e), "failed to read release from watch");
                 continue;
             }
             Ok(Diff::Baseline(version)) => {
@@ -518,7 +520,7 @@ async fn poll_feed<N: Notifier, B: BodySource>(
             Err(e) => error!(
                 watch = %w.name,
                 version = %event.release.version,
-                error = %e,
+                error = %ErrorChain(&e),
                 "failed to forward release"
             ),
         }
@@ -540,7 +542,7 @@ async fn poll_rss<N: Notifier, B: BodySource>(
     let fetched = match source.fetch(&feed.url, state.etag(), FEED_ACCEPT).await {
         Ok(f) => f,
         Err(e) => {
-            warn!(rss = %feed.name, error = %e, "failed to poll rss feed");
+            warn!(rss = %feed.name, error = %ErrorChain(&e), "failed to poll rss feed");
             return PollOutcome::Failed;
         }
     };
@@ -554,7 +556,7 @@ async fn poll_rss<N: Notifier, B: BodySource>(
     let entries = match rss::read_feed(state, &body, &feed.url, etag) {
         Ok(entries) => entries,
         Err(e) => {
-            warn!(rss = %feed.name, error = %e, "failed to parse rss feed");
+            warn!(rss = %feed.name, error = %ErrorChain(&e), "failed to parse rss feed");
             return PollOutcome::Failed;
         }
     };
@@ -575,7 +577,7 @@ async fn poll_rss<N: Notifier, B: BodySource>(
             Err(e) => error!(
                 rss = %feed.name,
                 entry = %entry.id,
-                error = %e,
+                error = %ErrorChain(&e),
                 "failed to forward rss entry"
             ),
         }
