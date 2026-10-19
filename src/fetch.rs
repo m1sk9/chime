@@ -1,3 +1,5 @@
+use std::error::Error;
+use std::fmt;
 use std::time::Duration;
 
 use reqwest::header::{ACCEPT, ETAG, IF_NONE_MATCH};
@@ -67,6 +69,31 @@ pub enum FetchError {
     Status { status: u16, body: String },
     #[error("body exceeded {limit} bytes")]
     TooLarge { limit: usize },
+}
+
+/// Displays an error followed by its `source()` chain, `: `-separated, for logging.
+///
+/// Why not `%e` alone: reqwest prints only its outermost message ("error sending
+/// request"), and the cause (timeout, DNS, TLS, connection reset) is further down
+/// the chain. The chain below `without_url` carries no URL, so it reveals no secret.
+pub(crate) struct ErrorChain<'a>(pub(crate) &'a (dyn Error + 'static));
+
+impl fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut shown = self.0.to_string();
+        let mut source = self.0.source();
+        while let Some(e) = source {
+            let msg = e.to_string();
+            // Skipped rather than printed twice: some messages already embed their
+            // source (`StatusError::Decode`), and those messages are documented.
+            if !shown.ends_with(&msg) {
+                shown.push_str(": ");
+                shown.push_str(&msg);
+            }
+            source = e.source();
+        }
+        f.write_str(&shown)
+    }
 }
 
 /// Outcome of a conditional GET. `T` is whatever the caller decodes the body into:
@@ -264,6 +291,58 @@ mod tests {
         assert!(inner.url().is_none());
         assert!(!err.to_string().contains("secret"), "{err}");
         assert!(!format!("{err:?}").contains("secret"), "{err:?}");
+        let chain = ErrorChain(&err).to_string();
+        assert!(!chain.contains("secret"), "{chain}");
+    }
+
+    #[tokio::test]
+    async fn a_logged_request_error_names_its_cause() {
+        // Bind then drop, so the port refuses connections.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/feed")).unwrap();
+
+        let err = HttpSource::new(client())
+            .fetch(&url, None, "application/json")
+            .await
+            .unwrap_err();
+
+        let chain = ErrorChain(&err).to_string();
+        assert!(chain.starts_with(&err.to_string()), "{chain}");
+        assert!(chain.to_lowercase().contains("connect"), "{chain}");
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("outer")]
+    struct Outer(#[source] Middle);
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("middle")]
+    struct Middle(#[source] std::io::Error);
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("wrapped: {0}")]
+    struct Embedding(#[source] std::io::Error);
+
+    #[test]
+    fn error_chain_joins_every_source_in_order() {
+        let err = Outer(Middle(std::io::Error::other("inner")));
+        assert_eq!(ErrorChain(&err).to_string(), "outer: middle: inner");
+    }
+
+    #[test]
+    fn error_chain_does_not_repeat_a_source_the_message_already_embeds() {
+        let err = Embedding(std::io::Error::other("inner"));
+        assert_eq!(ErrorChain(&err).to_string(), "wrapped: inner");
+    }
+
+    #[test]
+    fn error_chain_of_an_error_without_source_is_its_message() {
+        let err = FetchError::TooLarge { limit: 6 };
+        assert_eq!(ErrorChain(&err).to_string(), err.to_string());
     }
 
     #[test]
