@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.28
 
-FROM lukemathwalker/cargo-chef:0.1.78-rust-1-bookworm AS chef
+FROM lukemathwalker/cargo-chef:0.1.78-rust-1-trixie AS chef
 WORKDIR /build
 
 # aws-lc-sys (reqwest rustls backend) needs cmake + make to build its C sources;
@@ -37,7 +37,7 @@ COPY . .
 RUN cargo build --release --target "$(cat /tmp/target)" \
     && cp "target/$(cat /tmp/target)/release/chime" /build/chime
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian13:nonroot
 COPY --from=builder /build/chime /usr/local/bin/chime
 LABEL org.opencontainers.image.source=https://github.com/m1sk9/chime
 USER nonroot:nonroot
