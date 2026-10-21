@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.8.1](https://github.com/m1sk9/chime/compare/chime-v0.8.0...chime-v0.8.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* **docker:** move base images to Debian 13 distroless ([#95](https://github.com/m1sk9/chime/issues/95)) ([d84e089](https://github.com/m1sk9/chime/commit/d84e0895fe756b982648558cd9a4f6094afc76ad))
+* log the cause of request errors instead of only "error sending request" ([#89](https://github.com/m1sk9/chime/issues/89)) ([a39a077](https://github.com/m1sk9/chime/commit/a39a0770cede3efda41616235de71e813fce7eab))
+
+
+### Miscellaneous
+
+* **deps:** update dependency wrangler to v4.151.2 ([#91](https://github.com/m1sk9/chime/issues/91)) ([2149e40](https://github.com/m1sk9/chime/commit/2149e404cbbe4eb33a691f566f651c819f23811c))
+* **deps:** update dependency wrangler to v4.151.3 ([#92](https://github.com/m1sk9/chime/issues/92)) ([d166630](https://github.com/m1sk9/chime/commit/d166630e5e1b8057b750dbe9d5095e6999cea2ee))
+* **deps:** update rust crate tokio to v1.54.0 ([#94](https://github.com/m1sk9/chime/issues/94)) ([3699718](https://github.com/m1sk9/chime/commit/3699718eba0c2d6d7da14fe979f508ec308b7ef8))
+* **deps:** update swatinem/rust-cache action to v2.9.3 ([#93](https://github.com/m1sk9/chime/issues/93)) ([fcea15f](https://github.com/m1sk9/chime/commit/fcea15f57659392e28ef543da429b35f83c9078f))
+
 ## [0.8.0](https://github.com/m1sk9/chime/compare/chime-v0.7.0...chime-v0.8.0) (2026-10-17)
 
 
