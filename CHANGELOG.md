@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.8.2](https://github.com/m1sk9/chime/compare/chime-v0.8.1...chime-v0.8.2) (2026-10-22)
+
+
+### Miscellaneous
+
+* **deps:** update dependency @biomejs/biome to v2.6.2 ([#96](https://github.com/m1sk9/chime/issues/96)) ([99d940f](https://github.com/m1sk9/chime/commit/99d940f9817b8b49e9a71b759e6a6b5cf9f5eda3))
+* **deps:** update dependency bun to v1.4.4 ([#100](https://github.com/m1sk9/chime/issues/100)) ([3df882f](https://github.com/m1sk9/chime/commit/3df882faed662a47369cf9daf7291f5d4d375cc0))
+* **deps:** update dependency wrangler to v4.152.0 ([#101](https://github.com/m1sk9/chime/issues/101)) ([246c6cd](https://github.com/m1sk9/chime/commit/246c6cdab4ece9d67b7d9cd4f17ff909da5a043f))
+* **deps:** update rust crate tokio to v1.54.1 ([#99](https://github.com/m1sk9/chime/issues/99)) ([bb54c85](https://github.com/m1sk9/chime/commit/bb54c8535724d2e546b3e6db9b42dc8a81282d0a))
+
 ## [0.8.1](https://github.com/m1sk9/chime/compare/chime-v0.8.0...chime-v0.8.1) (2026-10-21)
 
 
