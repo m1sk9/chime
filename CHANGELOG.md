@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.8.2](https://github.com/m1sk9/chime/compare/chime-v0.8.1...chime-v0.8.2) (2026-11-05)
+
+
+### Miscellaneous
+
+* **deps:** Bump rustls from 0.23.45 to 0.23.46 ([#109](https://github.com/m1sk9/chime/issues/109)) ([7fc9bbe](https://github.com/m1sk9/chime/commit/7fc9bbe8d06c9d5de3299416e57448bf5b34dfa2))
+* **deps:** update actions/checkout action to v7 ([#103](https://github.com/m1sk9/chime/issues/103)) ([26ea31e](https://github.com/m1sk9/chime/commit/26ea31e7164b96a8e6a406a5f41ac4c62e686f7b))
+* **deps:** update codecov/codecov-action action to v7 ([#104](https://github.com/m1sk9/chime/issues/104)) ([30a417f](https://github.com/m1sk9/chime/commit/30a417f953dea34a0eb3010a19f205cba2dd5283))
+* **deps:** update dependency @biomejs/biome to v2.6.2 ([#96](https://github.com/m1sk9/chime/issues/96)) ([99d940f](https://github.com/m1sk9/chime/commit/99d940f9817b8b49e9a71b759e6a6b5cf9f5eda3))
+* **deps:** update dependency @biomejs/biome to v2.6.3 ([#106](https://github.com/m1sk9/chime/issues/106)) ([655ce8d](https://github.com/m1sk9/chime/commit/655ce8d363b08164a3f9b12944c1740231ea9876))
+* **deps:** update dependency @biomejs/biome to v2.6.4 ([#111](https://github.com/m1sk9/chime/issues/111)) ([960b632](https://github.com/m1sk9/chime/commit/960b6320125b17a8c75db10892e3c5e5dd270711))
+* **deps:** update dependency @biomejs/biome to v2.6.5 ([#117](https://github.com/m1sk9/chime/issues/117)) ([d1244d4](https://github.com/m1sk9/chime/commit/d1244d48c8591c435e0e6123cb3d585cb294a232))
+* **deps:** update dependency bun to v1.4.4 ([#100](https://github.com/m1sk9/chime/issues/100)) ([3df882f](https://github.com/m1sk9/chime/commit/3df882faed662a47369cf9daf7291f5d4d375cc0))
+* **deps:** update dependency ubuntu to v26 ([#105](https://github.com/m1sk9/chime/issues/105)) ([087dd28](https://github.com/m1sk9/chime/commit/087dd28f184cbe161bf2ddc6f90fbdd353df1af8))
+* **deps:** update dependency wrangler to v4.152.0 ([#101](https://github.com/m1sk9/chime/issues/101)) ([246c6cd](https://github.com/m1sk9/chime/commit/246c6cdab4ece9d67b7d9cd4f17ff909da5a043f))
+* **deps:** update dependency wrangler to v4.153.0 ([#108](https://github.com/m1sk9/chime/issues/108)) ([3545ae0](https://github.com/m1sk9/chime/commit/3545ae07d0dfadd068563ccced4ab6d67bcf36c4))
+* **deps:** update dependency wrangler to v4.155.0 ([#110](https://github.com/m1sk9/chime/issues/110)) ([c13ed4c](https://github.com/m1sk9/chime/commit/c13ed4cae9267ba20b67b32ef25b618c41eb81ae))
+* **deps:** update dependency wrangler to v4.156.0 ([#112](https://github.com/m1sk9/chime/issues/112)) ([a33279f](https://github.com/m1sk9/chime/commit/a33279f7d872f92986c8e2824bcbfa7005e91643))
+* **deps:** update dependency wrangler to v4.156.1 ([#113](https://github.com/m1sk9/chime/issues/113)) ([ede540d](https://github.com/m1sk9/chime/commit/ede540d3bbd69bc4727adc1c55412fc2329243cd))
+* **deps:** update dependency wrangler to v4.156.2 ([#114](https://github.com/m1sk9/chime/issues/114)) ([cded990](https://github.com/m1sk9/chime/commit/cded9901e296e38a980d16d6eb46693ed0a7c222))
+* **deps:** update dependency wrangler to v4.157.0 ([#115](https://github.com/m1sk9/chime/issues/115)) ([5e5116a](https://github.com/m1sk9/chime/commit/5e5116a8885685862a0ff21c94f2dccb2b157c0c))
+* **deps:** update rust crate tokio to v1.54.1 ([#99](https://github.com/m1sk9/chime/issues/99)) ([bb54c85](https://github.com/m1sk9/chime/commit/bb54c8535724d2e546b3e6db9b42dc8a81282d0a))
+* **deps:** update rust crate toml to v1.2.0 ([#116](https://github.com/m1sk9/chime/issues/116)) ([97c660d](https://github.com/m1sk9/chime/commit/97c660d8d0cdcf6ff07365d4948bcd8d9f1e1c36))
+* **deps:** update taiki-e/install-action digest to c509219 ([#98](https://github.com/m1sk9/chime/issues/98)) ([6098a7f](https://github.com/m1sk9/chime/commit/6098a7f7b0f8572f9369ad94e7a0947f5803ca7f))
+* drop wrangler from local toolchain and docs dependencies ([#107](https://github.com/m1sk9/chime/issues/107)) ([0082942](https://github.com/m1sk9/chime/commit/0082942a4154e5dbe3f95915496aa26dc642d49b))
+
 ## [0.8.1](https://github.com/m1sk9/chime/compare/chime-v0.8.0...chime-v0.8.1) (2026-10-21)
 
 
