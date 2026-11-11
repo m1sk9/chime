@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.28
+# syntax=docker/dockerfile:1.29
 
 FROM lukemathwalker/cargo-chef:0.1.78-rust-1-trixie AS chef
 WORKDIR /build
