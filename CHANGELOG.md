@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.4](https://github.com/m1sk9/chime/compare/chime-v0.8.3...chime-v0.8.4) (2026-11-13)
+
+
+### Miscellaneous
+
+* **deps:** update dependency @biomejs/biome to v2.6.7 ([#127](https://github.com/m1sk9/chime/issues/127)) ([2d9af8c](https://github.com/m1sk9/chime/commit/2d9af8cc1ed7ed039a3fe83842f62a13bc63f2c6))
+* **deps:** update dependency wrangler to v4.160.0 ([#124](https://github.com/m1sk9/chime/issues/124)) ([3d5a073](https://github.com/m1sk9/chime/commit/3d5a07362aea2c25aa56cef5befa5c2b619f0da3))
+* **deps:** update dependency wrangler to v4.160.1 ([#126](https://github.com/m1sk9/chime/issues/126)) ([22e0013](https://github.com/m1sk9/chime/commit/22e001387ecb758782fe74b5bf39476a3cf6c62f))
+* **deps:** update dependency wrangler to v4.161.0 ([#129](https://github.com/m1sk9/chime/issues/129)) ([50a9a7c](https://github.com/m1sk9/chime/commit/50a9a7cb1d3ae59b581cf06dc504da09e77d4adb))
+* **deps:** update dependency wrangler to v4.162.0 ([#130](https://github.com/m1sk9/chime/issues/130)) ([1d1b258](https://github.com/m1sk9/chime/commit/1d1b258146579ec8db830b0d8c09740ee4ed8072))
+* **deps:** update docker/dockerfile docker tag to v1.29 ([#128](https://github.com/m1sk9/chime/issues/128)) ([e79a1ae](https://github.com/m1sk9/chime/commit/e79a1ae7b02bd68fbee70b152c7f9c5d74024075))
+
 ## [0.8.3](https://github.com/m1sk9/chime/compare/chime-v0.8.2...chime-v0.8.3) (2026-11-10)
 
 
