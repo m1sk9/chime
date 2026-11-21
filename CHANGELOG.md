@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.8.5](https://github.com/m1sk9/chime/compare/chime-v0.8.4...chime-v0.8.5) (2026-11-21)
+
+
+### Miscellaneous
+
+* **deps:** update dependency @biomejs/biome to v2.6.8 ([#132](https://github.com/m1sk9/chime/issues/132)) ([4dfca7d](https://github.com/m1sk9/chime/commit/4dfca7dfeb3b3a5098ac4f318c373c955d2c2044))
+* **deps:** update dependency bun to v1.4.5 ([#137](https://github.com/m1sk9/chime/issues/137)) ([fb28e59](https://github.com/m1sk9/chime/commit/fb28e59fc38bf528e303c0e905b60581a798a783))
+* **deps:** update dependency wrangler to v4.163.0 ([#134](https://github.com/m1sk9/chime/issues/134)) ([022f73a](https://github.com/m1sk9/chime/commit/022f73acd5bb5fe0cfaaaf4b08642378888dd3e1))
+* **deps:** update dependency wrangler to v4.164.0 ([#135](https://github.com/m1sk9/chime/issues/135)) ([fb47baa](https://github.com/m1sk9/chime/commit/fb47baae1e63d0787b463210f4fc3d5c6628c309))
+* **deps:** update dependency wrangler to v4.165.0 ([#136](https://github.com/m1sk9/chime/issues/136)) ([1d9cf96](https://github.com/m1sk9/chime/commit/1d9cf969d55d8494c624e0e5431a69ac1d458620))
+* **deps:** update dependency wrangler to v4.166.0 ([#138](https://github.com/m1sk9/chime/issues/138)) ([34a5924](https://github.com/m1sk9/chime/commit/34a5924d303af280a26fa8b6f5bf55b79253ebf8))
+* **deps:** update rust crate toml to v1.2.2 ([#140](https://github.com/m1sk9/chime/issues/140)) ([0cfd685](https://github.com/m1sk9/chime/commit/0cfd685b051397896fbad9386241ff686e1c9a63))
+* **deps:** update rust crate url to v2.5.9 ([#139](https://github.com/m1sk9/chime/issues/139)) ([e90af89](https://github.com/m1sk9/chime/commit/e90af891db7e78eab8e960a5931596f92236d204))
+* **deps:** update taiki-e/install-action digest to 75a7c0f ([#131](https://github.com/m1sk9/chime/issues/131)) ([cb20b74](https://github.com/m1sk9/chime/commit/cb20b744bb41426a18beddbb322b74c81fbc4720))
+
 ## [0.8.4](https://github.com/m1sk9/chime/compare/chime-v0.8.3...chime-v0.8.4) (2026-11-13)
 
 
